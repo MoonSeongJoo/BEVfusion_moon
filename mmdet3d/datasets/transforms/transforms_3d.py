@@ -1000,6 +1000,50 @@ class ObjectNameFilter(BaseTransform):
         repr_str += f'(classes={self.classes})'
         return repr_str
 
+@TRANSFORMS.register_module()
+class CustomPointsRangeFilter(PointsRangeFilter):
+    """
+    기본 'points'와 더불어 사용자가 지정한 추가적인 포인트 클라우드 키들도
+    일관성 있게 필터링하는 커스텀 클래스.
+    """
+    # 처리할 추가적인 포인트 클라우드 키 목록
+    EXTRA_POINTS_KEYS = [
+        'points_original',
+        'perturbed_points'  # <-- 'perturbed_points' 추가
+    ]
+
+    def transform(self, input_dict: dict) -> dict:
+        """
+        기본 'points'와 더불어 EXTRA_POINTS_KEYS에 정의된 모든 포인트 클라우드를
+        동일한 마스크로 필터링합니다.
+        """
+        # 1. 메인 포인트 클라우드('points')를 기준으로 필터링할 마스크를 생성합니다.
+        points = input_dict['points']
+        points_mask = points.in_range_3d(self.pcd_range)
+
+        # 2. 이 마스크를 사용해 메인 포인트 클라우드를 필터링합니다.
+        input_dict['points'] = points[points_mask]
+
+        # 3. 동일한 마스크를 사용해 우리가 지정한 추가 키들도 모두 필터링합니다.
+        for key in self.EXTRA_POINTS_KEYS:
+            if key in input_dict and input_dict[key] is not None:
+                extra_points = input_dict[key]
+                # extra_points도 LiDARPoints 객체라고 가정
+                if len(extra_points) == len(points_mask):
+                    input_dict[key] = extra_points[points_mask]
+                else:
+                    # 혹시 모를 불일치 상황에 대한 경고
+                    print(f"Warning: Length of '{key}' ({len(extra_points)}) does not match "
+                          f"points_mask length ({len(points_mask)}). Skipping filtering for this key.")
+
+        # 4. (선택적) 마스크 데이터도 동일하게 필터링합니다.
+        points_mask_np = points_mask.numpy()
+        if 'pts_instance_mask' in input_dict and input_dict['pts_instance_mask'] is not None:
+            input_dict['pts_instance_mask'] = input_dict['pts_instance_mask'][points_mask_np]
+        if 'pts_semantic_mask' in input_dict and input_dict['pts_semantic_mask'] is not None:
+            input_dict['pts_semantic_mask'] = input_dict['pts_semantic_mask'][points_mask_np]
+
+        return input_dict
 
 @TRANSFORMS.register_module()
 class PointSample(BaseTransform):

@@ -260,3 +260,44 @@ class Pack3DDetInputs(BaseTransform):
         repr_str += f'(keys={self.keys})'
         repr_str += f'(meta_keys={self.meta_keys})'
         return repr_str
+
+@TRANSFORMS.register_module()
+class CustomPack3DDetInputs(Pack3DDetInputs):
+    """
+    The definitive version of the custom packer. It handles all custom keys,
+    label formats, and manually stacks multi-view 'img_original'.
+    """
+
+    def __init__(self, class_names: list, **kwargs):
+        super().__init__(**kwargs)
+        self.name_to_idx = {name: i for i, name in enumerate(class_names)}
+        self.INPUTS_KEYS.extend(['img_original', 'points_original'])
+        self.INSTANCEDATA_2D_KEYS.append('gt_labels')
+
+    def transform(self, results: dict) -> dict:
+        # ✨ 1. 'img_original'을 수동으로 스태킹하여 단일 텐서로 변환 ✨
+        # 이 로직은 부모 클래스가 'img' 키에 대해 수행하는 로직과 동일합니다.
+        if 'img_original' in results:
+            img_list = results['img_original']
+            if isinstance(img_list, list):
+                # 6개 뷰(numpy array)를 하나의 array로 합침
+                stacked_imgs = np.stack(img_list, axis=0)
+                # (V, H, W, C) -> (V, C, H, W) 형태로 변환 후 텐서로 만듦
+                if stacked_imgs.flags.c_contiguous:
+                    tensor_imgs = to_tensor(stacked_imgs).permute(0, 3, 1, 2).contiguous()
+                else:
+                    tensor_imgs = to_tensor(np.ascontiguousarray(stacked_imgs.transpose(0, 3, 1, 2)))
+                results['img_original'] = tensor_imgs
+
+        # 2. 문자열 라벨을 숫자 인덱스로 변환
+        if 'gt_labels' in results and len(results['gt_labels']) > 0 and isinstance(results['gt_labels'][0], str):
+            results['gt_labels'] = np.array(
+                [self.name_to_idx.get(name, -1) for name in results['gt_labels']],
+                dtype=np.int64)
+        if 'gt_labels_3d' in results and len(results['gt_labels_3d']) > 0 and isinstance(results['gt_labels_3d'][0], str):
+             results['gt_labels_3d'] = np.array(
+                [self.name_to_idx.get(name, -1) for name in results['gt_labels_3d']],
+                dtype=np.int64)
+
+        # 3. 모든 데이터가 준비되었으므로, 모든 패킹 작업을 부모 클래스에 위임
+        return super().transform(results)

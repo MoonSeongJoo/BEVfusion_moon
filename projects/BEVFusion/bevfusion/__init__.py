@@ -9,6 +9,9 @@ from .transforms_3d import (BEVFusionGlobalRotScaleTrans,
 from .transfusion_head import ConvFuser, TransFusionHead
 from .utils import (BBoxBEVL1Cost, HeuristicAssigner3D, HungarianAssigner3D,
                     IoU3DCost)
+from .my_collate import custom_collate
+from .custom_data_preprocessor import CustomDet3DDataPreprocessor
+from .cotr import COTR
 
 __all__ = [
     'BEVFusion', 'TransFusionHead', 'ConvFuser', 'ImageAug3D', 'GridMask',
@@ -16,5 +19,5 @@ __all__ = [
     'HeuristicAssigner3D', 'DepthLSSTransform', 'LSSTransform',
     'BEVLoadMultiViewImageFromFiles', 'BEVFusionSparseEncoder',
     'TransformerDecoderLayer', 'BEVFusionRandomFlip3D',
-    'BEVFusionGlobalRotScaleTrans'
+    'BEVFusionGlobalRotScaleTrans' ,'custom_collate', 'CustomDet3DDataPreprocessor','COTR'
 ]

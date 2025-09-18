@@ -13,6 +13,18 @@ from mmengine.fileio import get
 from mmdet3d.registry import TRANSFORMS
 from mmdet3d.structures.bbox_3d import get_box_type
 from mmdet3d.structures.points import BasePoints, get_points_type
+from mmdet3d.structures import LiDARPoints 
+
+import torch
+import matplotlib.pyplot as plt
+from .image_display import (points2depthmap_cpu,points2depthmap_gpu,
+                                                             add_calibration,add_calibration_adv,add_mis_calibration_ori,add_calibration_adv2,
+                                                             add_mis_calibration,add_mis_calibration_cpu,add_mis_calibration_adv,
+                                                             dense_map_gpu_optimized,distance_adaptive_depth_completion,
+                                                             colormap,preprocess_points,edge_aware_bilateral_filter,
+                                                             visualize_depth_maps,trim_corrs,find_exact_correspondences,
+                                                             enhanced_geometric_propagation,direction_aware_completion,direction_aware_bilateral_filter,
+                                                             )
 
 
 @TRANSFORMS.register_module()
@@ -1043,17 +1055,43 @@ class LoadAnnotations3D(LoadAnnotations):
         """
         results['gt_bboxes_labels'] = results['ann_info']['gt_bboxes_labels']
 
+    # def transform(self, results: dict) -> dict:
+    #     """Function to load multiple types annotations.
+
+    #     Args:
+    #         results (dict): Result dict from :obj:`mmdet3d.CustomDataset`.
+
+    #     Returns:
+    #         dict: The dict containing loaded 3D bounding box, label, mask and
+    #         semantic segmentation annotations.
+    #     """
+    #     results = super().transform(results)
+    #     if self.with_bbox_3d:
+    #         results = self._load_bboxes_3d(results)
+    #     if self.with_bbox_depth:
+    #         results = self._load_bboxes_depth(results)
+    #     if self.with_label_3d:
+    #         results = self._load_labels_3d(results)
+    #     if self.with_attr_label:
+    #         results = self._load_attr_labels(results)
+    #     if self.with_panoptic_3d:
+    #         results = self._load_panoptic_3d(results)
+    #     if self.with_mask_3d:
+    #         results = self._load_masks_3d(results)
+    #     if self.with_seg_3d:
+    #         results = self._load_semantic_seg_3d(results)
+    #     return results
+    
+# LoadAnnotations3D.py 파일의 transform 메서드를 교체하세요.
+
     def transform(self, results: dict) -> dict:
-        """Function to load multiple types annotations.
-
-        Args:
-            results (dict): Result dict from :obj:`mmdet3d.CustomDataset`.
-
-        Returns:
-            dict: The dict containing loaded 3D bounding box, label, mask and
-            semantic segmentation annotations.
         """
-        results = super().transform(results)
+        Function to load multiple types of annotations.
+        This version is modified to load 3D annotations from 'ann_info'
+        and handle the new multi-view 2D annotation structure from
+        'ann_info_2d_per_cam'.
+        """
+        # 1. 3D 정보 로드는 기존과 동일하게 수행합니다.
         if self.with_bbox_3d:
             results = self._load_bboxes_3d(results)
         if self.with_bbox_depth:
@@ -1068,6 +1106,22 @@ class LoadAnnotations3D(LoadAnnotations):
             results = self._load_masks_3d(results)
         if self.with_seg_3d:
             results = self._load_semantic_seg_3d(results)
+
+        # 2. ✨ 새로운 Multi-view 2D Annotation 구조를 처리합니다. ✨
+        #    'ann_info_2d_per_cam' 키가 있는지 확인합니다.
+        if 'ann_info_2d_per_cam' in results:
+            # 대표값으로 정면 카메라(CAM_FRONT)의 2D GT를 최상위 키에 할당합니다.
+            # 이는 다른 파이프라인 단계와의 호환성을 위함입니다.
+            ann_info_2d_front = results['ann_info_2d_per_cam']['CAM_FRONT']
+            
+            if self.with_bbox:
+                results['gt_bboxes'] = ann_info_2d_front['gt_bboxes']
+            if self.with_label:
+                results['gt_labels'] = ann_info_2d_front['gt_labels']
+            
+            # 'ann_info_2d_per_cam' 딕셔너리 자체는 results에 그대로 남아
+            # 나중에 metainfo를 통해 loss 함수까지 전달됩니다.
+
         return results
 
     def __repr__(self) -> str:
@@ -1298,3 +1352,171 @@ class MultiModalityDet3DInferencerLoader(BaseTransform):
         multi_modality_inputs.update(imgs_inputs)
 
         return multi_modality_inputs
+
+@TRANSFORMS.register_module()
+class CopyImageToKey(BaseTransform):  # <-- 2. BaseTransform 상속
+    def __init__(self, key='img', new_key='img_original'):
+        self.key = key
+        self.new_key = new_key
+
+    def transform(self, results: dict) -> dict:
+        results[self.new_key] = [img.copy() for img in results[self.key]]
+        return results
+
+@TRANSFORMS.register_module()
+class PointToMultiViewDepth(object):
+    def __init__(self, grid_config, downsample=1, resize_img=False):
+        self.downsample = downsample
+        self.grid_config = grid_config
+        self.num_points = 900
+        self.grid_size = 30
+
+    def __call__(self, results: dict) -> dict:
+        # --- 1. 초기 데이터 준비 ---
+        # img_aug_matrices = results['img_aug_matrix']
+        lidar_aug_matrix = results.get('lidar_aug_matrix')
+        points_augmented = results['points']
+
+        # --- 2. Extrinsic 예측을 위한 원본 포인트 복원 ---
+        if lidar_aug_matrix is not None:
+            # [수정] .rotate() 대신 직접 4x4 행렬 변환 수행
+            try:
+                lidar_aug_matrix_inv = np.linalg.inv(lidar_aug_matrix)
+            except np.linalg.LinAlgError:
+                lidar_aug_matrix_inv = np.eye(4)
+            
+            # 1. 증강된 포인트를 NumPy 배열로 추출 (x, y, z, intensity, ...)
+            aug_points_np = points_augmented.tensor.numpy()
+            
+            # 2. 동차 좌표계로 변환 (x,y,z) -> (x,y,z,1)
+            points_xyz = aug_points_np[:, :3]
+            points_hom = np.hstack((points_xyz, np.ones((points_xyz.shape[0], 1), dtype=points_xyz.dtype)))
+
+            # 3. 역변환 행렬을 적용
+            transformed_points_hom = points_hom @ lidar_aug_matrix_inv.T
+            
+            # 4. 다시 (x,y,z) 형태로 변환하고, 나머지 정보(intensity 등)와 결합
+            points_original_xyz = transformed_points_hom[:, :3]
+            points_original_np = np.hstack((points_original_xyz, aug_points_np[:, 3:]))
+            
+            # 5. 새로운 LiDARPoints 객체로 생성
+            points_original = LiDARPoints(
+                points_original_np,
+                points_dim=points_original_np.shape[-1]
+            )
+            results['points_original'] = points_original
+        else:
+            results['points_original'] = points_augmented.clone()
+
+        # --- 3. 각 카메라 뷰에 대한 처리 루프 ---
+        point2img_gt =[]
+        lidar_depth_map_mis=[]
+        lidar_depth_map_gt =[]
+        list_gt_KT ,list_mis_RT ,list_mis_KT = [] ,[] ,[]
+        matched_uvset_list = []
+        
+        # raw_points_lidar= results['points_original']
+        points_lidar = results['points_original'].tensor[:, :4].clone().to(dtype=torch.float32)
+        
+        for cid in range(len(results['lidar2img'])):
+            # [수정] 시각화 및 처리를 위해 원본/증강 이미지를 명확히 구분
+            # aug_img_np = results['img'][cid] # 증강된 이미지는 Detector 학습용
+            raw_img_np = results['img_original'][cid] # 원본 이미지는 Extrinsic 예측 및 시각화용
+
+            lidar2img = torch.from_numpy(results['lidar2img'][cid]).to(dtype=torch.float32)
+            lidar2cam = torch.from_numpy(results['lidar2cam'][cid]).to(dtype=torch.float32)
+            cam2img = torch.from_numpy(results['cam2img'][cid]).to(dtype=torch.float32)
+            
+            img_height, img_width, _ = raw_img_np.shape
+
+            points2img = add_calibration(lidar2img,points_lidar)
+            miscalibrated_points2img ,perturbed_points, extrinsic_perturb, lidar2img_original ,lidar2img_mis = add_mis_calibration_adv(
+                                                                                    lidar2img,lidar2cam,cam2img, points_lidar, max_r=2.0,max_t=0.5)
+            
+            depth_gt, gt_uv,gt_z, valid_indices_gt,original_gt_idx= points2depthmap_gpu(points2img, img_height ,img_width,self.grid_config,downsample=1)
+            # lidarOnImage_gt = torch.cat((gt_uv, gt_z.unsqueeze(1)), dim=1)
+            # pts = lidarOnImage_gt.T
+            # dense_depth_img_gt = dense_map_gpu_optimized(pts , img_width, img_height, 4)
+            # dense_depth_img_gt = dense_depth_img_gt.to(dtype=torch.uint8)
+            # dense_depth_img_color_gt = colormap(dense_depth_img_gt)
+
+            depth_mis, uv,z,valid_indices,original_mis_idx= points2depthmap_gpu(miscalibrated_points2img, img_height ,img_width,self.grid_config,downsample=1)
+            # lidarOnImage_mis = torch.cat((uv, z.unsqueeze(1)), dim=1)
+            # pts_mis = lidarOnImage_mis.T
+            # dense_depth_img_mis = dense_map_gpu_optimized(pts_mis , img_width, img_height, 4)
+            # dense_depth_img_mis = dense_depth_img_mis.to(dtype=torch.uint8)
+            # dense_depth_img_color_mis = colormap(dense_depth_img_mis)
+
+            matched_uv_set= find_exact_correspondences(original_gt_idx,original_mis_idx,gt_uv,uv)
+            trim_matched_uv_set=trim_corrs(matched_uv_set,num_kp=10000)
+            
+            # --- 3C. 결과 저장 및 시각화 ---
+            point2img_gt.append(points2img) # lidar coordination 3d
+            list_mis_RT.append(extrinsic_perturb) # lidar coordination 3d mis-calibration
+            list_gt_KT.append(lidar2img)
+            list_mis_KT.append(lidar2img_mis)
+            lidar_depth_map_mis.append(depth_mis)
+            lidar_depth_map_gt.append(depth_gt)
+            matched_uvset_list.append(trim_matched_uv_set)
+
+            # ###### input display ######
+            # # img_np = raw_img_np
+            # # aug_img_np = aug_img_np
+            # # 이미지 데이터가 float 타입인 경우 0과 1 사이로 정규화
+            # if raw_img_np.dtype == np.float32 or raw_img_np.dtype == np.float64:
+            #     raw_img_np = (raw_img_np - raw_img_np.min()) / (raw_img_np.max() - raw_img_np.min())
+            # plt.figure(figsize=(20, 20))
+            # plt.subplot(4,1,1)
+            # plt.imshow(raw_img_np)
+            # plt.scatter(gt_uv[:, 0], gt_uv[:, 1], c=gt_z, s=1.0 ,alpha=0.8)
+            # plt.title("raw img display", fontsize=10)
+
+            # plt.subplot(4,1,2)
+            # plt.imshow(raw_img_np)
+            # plt.scatter(uv[:, 0], uv[:, 1], c=z, s=1.0 ,alpha=0.8)
+            # plt.title("raw img display 2", fontsize=10)
+
+            # disp_gt2 = dense_depth_img_color_gt.detach().cpu().numpy()
+            # plt.subplot(4,1,3)
+            # plt.imshow(disp_gt2, cmap='magma' ,alpha=1)
+            # plt.title("gt display", fontsize=10)
+            # plt.axis('off')
+
+            # disp_mis2 = dense_depth_img_color_mis.detach().cpu().numpy()
+            # plt.subplot(4,1,4)
+            # plt.imshow(disp_mis2, cmap='magma',alpha=1)
+            # plt.title("mis display", fontsize=10)
+            # plt.axis('off')
+
+            # # gt_gray = dense_depth_img_color_mis_adv.detach().cpu().numpy()
+            # # plt.subplot(5,1,5)
+            # # plt.imshow(gt_gray, cmap='magma_r')
+            # # plt.title("other mis display", fontsize=10)
+            # # plt.axis('off')
+
+            # # mis_gray = dense_depth_img_mis.detach().cpu().numpy()
+            # # plt.subplot(3,2,6)
+            # # plt.imshow(mis_gray, cmap='magma_r')
+            # # plt.title("mis gray display", fontsize=10)
+            # # plt.axis('off')
+            
+            # # 전체 그림 저장
+            # plt.tight_layout()
+            # plt.savefig('load_pipeline.jpg', dpi=300, bbox_inches='tight')
+            # plt.close()
+            # print ("end of print")
+        
+        last_feature_from_original = results['points_original'].tensor[:, 4].unsqueeze(1)
+        perturbed_points_full = torch.cat([perturbed_points, last_feature_from_original], dim=1)
+
+        # --- 4. 최종 데이터 통합 및 반환 ---
+        results['gt_KT'] = torch.stack(list_gt_KT)
+        results['mis_RT'] = torch.stack(list_mis_RT)
+        results['mis_KT'] = torch.stack(list_mis_KT)
+        results['lidar_depth_gt'] = torch.stack(lidar_depth_map_gt)
+        results['lidar_depth_mis'] = torch.stack(lidar_depth_map_mis)
+        results['matched_uvset'] = torch.stack(matched_uvset_list)
+        # results['perturbed_points'] = trim_corrs(perturbed_points)
+        results['perturbed_points'] = perturbed_points_full
+        
+        return results

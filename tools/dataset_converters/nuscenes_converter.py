@@ -143,6 +143,144 @@ def get_available_scenes(nusc):
     return available_scenes
 
 
+# def _fill_trainval_infos(nusc,
+#                          train_scenes,
+#                          val_scenes,
+#                          test=False,
+#                          max_sweeps=10):
+#     """Generate the train/val infos from the raw data.
+
+#     Args:
+#         nusc (:obj:`NuScenes`): Dataset class in the nuScenes dataset.
+#         train_scenes (list[str]): Basic information of training scenes.
+#         val_scenes (list[str]): Basic information of validation scenes.
+#         test (bool, optional): Whether use the test mode. In test mode, no
+#             annotations can be accessed. Default: False.
+#         max_sweeps (int, optional): Max number of sweeps. Default: 10.
+
+#     Returns:
+#         tuple[list[dict]]: Information of training set and validation set
+#             that will be saved to the info file.
+#     """
+#     train_nusc_infos = []
+#     val_nusc_infos = []
+
+#     for sample in mmengine.track_iter_progress(nusc.sample):
+#         lidar_token = sample['data']['LIDAR_TOP']
+#         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+#         cs_record = nusc.get('calibrated_sensor',
+#                              sd_rec['calibrated_sensor_token'])
+#         pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
+#         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
+
+#         mmengine.check_file_exist(lidar_path)
+
+#         info = {
+#             'lidar_path': lidar_path,
+#             'num_features': 5,
+#             'token': sample['token'],
+#             'sweeps': [],
+#             'cams': dict(),
+#             'lidar2ego_translation': cs_record['translation'],
+#             'lidar2ego_rotation': cs_record['rotation'],
+#             'ego2global_translation': pose_record['translation'],
+#             'ego2global_rotation': pose_record['rotation'],
+#             'timestamp': sample['timestamp'],
+#         }
+
+#         l2e_r = info['lidar2ego_rotation']
+#         l2e_t = info['lidar2ego_translation']
+#         e2g_r = info['ego2global_rotation']
+#         e2g_t = info['ego2global_translation']
+#         l2e_r_mat = Quaternion(l2e_r).rotation_matrix
+#         e2g_r_mat = Quaternion(e2g_r).rotation_matrix
+
+#         # obtain 6 image's information per frame
+#         camera_types = [
+#             'CAM_FRONT',
+#             'CAM_FRONT_RIGHT',
+#             'CAM_FRONT_LEFT',
+#             'CAM_BACK',
+#             'CAM_BACK_LEFT',
+#             'CAM_BACK_RIGHT',
+#         ]
+#         for cam in camera_types:
+#             cam_token = sample['data'][cam]
+#             cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
+#             cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
+#                                          e2g_t, e2g_r_mat, cam)
+#             cam_info.update(cam_intrinsic=cam_intrinsic)
+#             info['cams'].update({cam: cam_info})
+
+#         # obtain sweeps for a single key-frame
+#         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+#         sweeps = []
+#         while len(sweeps) < max_sweeps:
+#             if not sd_rec['prev'] == '':
+#                 sweep = obtain_sensor2top(nusc, sd_rec['prev'], l2e_t,
+#                                           l2e_r_mat, e2g_t, e2g_r_mat, 'lidar')
+#                 sweeps.append(sweep)
+#                 sd_rec = nusc.get('sample_data', sd_rec['prev'])
+#             else:
+#                 break
+#         info['sweeps'] = sweeps
+#         # obtain annotation
+#         if not test:
+#             annotations = [
+#                 nusc.get('sample_annotation', token)
+#                 for token in sample['anns']
+#             ]
+#             locs = np.array([b.center for b in boxes]).reshape(-1, 3)
+#             dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+#             rots = np.array([b.orientation.yaw_pitch_roll[0]
+#                              for b in boxes]).reshape(-1, 1)
+#             velocity = np.array(
+#                 [nusc.box_velocity(token)[:2] for token in sample['anns']])
+#             valid_flag = np.array(
+#                 [(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0
+#                  for anno in annotations],
+#                 dtype=bool).reshape(-1)
+#             # convert velo from global to lidar
+#             for i in range(len(boxes)):
+#                 velo = np.array([*velocity[i], 0.0])
+#                 velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(
+#                     l2e_r_mat).T
+#                 velocity[i] = velo[:2]
+
+#             names = [b.name for b in boxes]
+#             for i in range(len(names)):
+#                 if names[i] in NuScenesNameMapping:
+#                     names[i] = NuScenesNameMapping[names[i]]
+#             names = np.array(names)
+#             # we need to convert box size to
+#             # the format of our lidar coordinate system
+#             # which is x_size, y_size, z_size (corresponding to l, w, h)
+#             gt_boxes = np.concatenate([locs, dims[:, [1, 0, 2]], rots], axis=1)
+#             assert len(gt_boxes) == len(
+#                 annotations), f'{len(gt_boxes)}, {len(annotations)}'
+#             info['gt_boxes'] = gt_boxes
+#             info['gt_names'] = names
+#             info['gt_velocity'] = velocity.reshape(-1, 2)
+#             info['num_lidar_pts'] = np.array(
+#                 [a['num_lidar_pts'] for a in annotations])
+#             info['num_radar_pts'] = np.array(
+#                 [a['num_radar_pts'] for a in annotations])
+#             info['valid_flag'] = valid_flag
+
+#             if 'lidarseg' in nusc.table_names:
+#                 info['pts_semantic_mask_path'] = osp.join(
+#                     nusc.dataroot,
+#                     nusc.get('lidarseg', lidar_token)['filename'])
+
+#         if sample['scene_token'] in train_scenes:
+#             train_nusc_infos.append(info)
+#         else:
+#             val_nusc_infos.append(info)
+
+#     return train_nusc_infos, val_nusc_infos
+
+# 기존 _fill_trainval_infos 함수를 이 코드로 전체 교체하세요.
+
 def _fill_trainval_infos(nusc,
                          train_scenes,
                          val_scenes,
@@ -189,9 +327,9 @@ def _fill_trainval_infos(nusc,
         }
 
         l2e_r = info['lidar2ego_rotation']
-        l2e_t = info['lidar2ego_translation']
+        l2e_t = np.array(info['lidar2ego_translation'])  # <-- np.array()로 감싸주세요
         e2g_r = info['ego2global_rotation']
-        e2g_t = info['ego2global_translation']
+        e2g_t = np.array(info['ego2global_translation'])  # <-- np.array()로 감싸주세요
         l2e_r_mat = Quaternion(l2e_r).rotation_matrix
         e2g_r_mat = Quaternion(e2g_r).rotation_matrix
 
@@ -211,7 +349,7 @@ def _fill_trainval_infos(nusc,
                                          e2g_t, e2g_r_mat, cam)
             cam_info.update(cam_intrinsic=cam_intrinsic)
             info['cams'].update({cam: cam_info})
-
+            
         # obtain sweeps for a single key-frame
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
         sweeps = []
@@ -224,12 +362,43 @@ def _fill_trainval_infos(nusc,
             else:
                 break
         info['sweeps'] = sweeps
+        
         # obtain annotation
         if not test:
             annotations = [
                 nusc.get('sample_annotation', token)
                 for token in sample['anns']
             ]
+            
+            # --- [수정 1] 3D 박스를 정면 카메라(CAM_FRONT)에 투영하여 2D 박스 생성 ---
+            cam_front_info = info['cams']['CAM_FRONT']
+            cam_intrinsic = cam_front_info['cam_intrinsic']
+            sensor2lidar_rt = np.eye(4)
+            sensor2lidar_rt[:3, :3] = cam_front_info['sensor2lidar_rotation']
+            sensor2lidar_rt[:3, 3] = cam_front_info['sensor2lidar_translation']
+            lidar2sensor_rt = np.linalg.inv(sensor2lidar_rt)
+
+            gt_bboxes_2d = []
+            for box in boxes:
+                box_cam = box.copy()
+                # global -> lidar -> camera
+                # .transform(lidar2sensor_rt)를 아래 두 줄로 분해합니다.
+                # 1. lidar2sensor_rt 행렬에서 회전(3x3) 부분만 추출하여 회전 적용
+                box_cam.rotate(Quaternion(matrix=lidar2sensor_rt[:3, :3]))
+                # 2. lidar2sensor_rt 행렬에서 이동(3x1) 부분만 추출하여 이동 적용
+                box_cam.translate(lidar2sensor_rt[:3, 3])
+                
+                # 이미지 평면에 투영하고 유효한 박스만 추가
+                if box_cam.center[2] > 0.1:
+                    corners_2d = view_points(box_cam.corners(), cam_intrinsic, True)[:2, :]
+                    min_uv = np.min(corners_2d, axis=1)
+                    max_uv = np.max(corners_2d, axis=1)
+                    bbox_2d = np.concatenate([min_uv, max_uv])
+                    gt_bboxes_2d.append(bbox_2d)
+                else:
+                    gt_bboxes_2d.append([-1, -1, -1, -1]) # 이미지 뒤에 있는 경우
+            # --------------------------------------------------------------------
+
             locs = np.array([b.center for b in boxes]).reshape(-1, 3)
             dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
             rots = np.array([b.orientation.yaw_pitch_roll[0]
@@ -240,7 +409,7 @@ def _fill_trainval_infos(nusc,
                 [(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0
                  for anno in annotations],
                 dtype=bool).reshape(-1)
-            # convert velo from global to lidar
+            
             for i in range(len(boxes)):
                 velo = np.array([*velocity[i], 0.0])
                 velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(
@@ -252,25 +421,35 @@ def _fill_trainval_infos(nusc,
                 if names[i] in NuScenesNameMapping:
                     names[i] = NuScenesNameMapping[names[i]]
             names = np.array(names)
-            # we need to convert box size to
-            # the format of our lidar coordinate system
-            # which is x_size, y_size, z_size (corresponding to l, w, h)
-            gt_boxes = np.concatenate([locs, dims[:, [1, 0, 2]], rots], axis=1)
-            assert len(gt_boxes) == len(
-                annotations), f'{len(gt_boxes)}, {len(annotations)}'
-            info['gt_boxes'] = gt_boxes
+
+            gt_boxes_3d = np.concatenate([locs, dims[:, [1, 0, 2]], rots], axis=1)
+            
+            # --- [수정 2] 키 이름 변경 및 2D 정보 추가 ---
+            assert len(gt_boxes_3d) == len(annotations), f'{len(gt_boxes_3d)}, {len(annotations)}'
+            
+            # # 3D 정보에 대한 키 이름 변경 (gt_boxes -> gt_bboxes_3d)
+            # info['gt_bboxes_3d'] = gt_boxes_3d
+            # info['gt_labels_3d'] = names
+            # info['gt_velocity'] = velocity.reshape(-1, 2)
+            
+            # # 2D 정보 추가
+            # info['gt_bboxes'] = np.array(gt_bboxes_2d)
+            # info['gt_labels'] = names # 2D와 3D 라벨은 동일
+
+            # 3D 정보에 대한 키 이름을 구 버전(gt_boxes)으로 유지
+            info['gt_boxes'] = gt_boxes_3d
             info['gt_names'] = names
             info['gt_velocity'] = velocity.reshape(-1, 2)
-            info['num_lidar_pts'] = np.array(
-                [a['num_lidar_pts'] for a in annotations])
-            info['num_radar_pts'] = np.array(
-                [a['num_radar_pts'] for a in annotations])
-            info['valid_flag'] = valid_flag
+            
+            # 2D 정보 추가 (이 키들은 LoadAnnotations3D에서 사용하지 않으므로 괜찮음)
+            # 하지만 호환성을 위해 LoadAnnotations3D에서 사용하는 이름으로 변경
+            info['gt_bboxes_2d'] = np.array(gt_bboxes_2d)
+            info['gt_labels_2d'] = names
+            # -----------------------------------------------
 
-            if 'lidarseg' in nusc.table_names:
-                info['pts_semantic_mask_path'] = osp.join(
-                    nusc.dataroot,
-                    nusc.get('lidarseg', lidar_token)['filename'])
+            info['num_lidar_pts'] = np.array([a['num_lidar_pts'] for a in annotations])
+            info['num_radar_pts'] = np.array([a['num_radar_pts'] for a in annotations])
+            info['valid_flag'] = valid_flag
 
         if sample['scene_token'] in train_scenes:
             train_nusc_infos.append(info)
@@ -278,7 +457,6 @@ def _fill_trainval_infos(nusc,
             val_nusc_infos.append(info)
 
     return train_nusc_infos, val_nusc_infos
-
 
 def obtain_sensor2top(nusc,
                       sensor_token,

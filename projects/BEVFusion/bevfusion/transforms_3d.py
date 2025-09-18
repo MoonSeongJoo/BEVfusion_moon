@@ -107,6 +107,23 @@ class ImageAug3D(BaseTransform):
         data['img_aug_matrix'] = transforms
         return data
 
+@TRANSFORMS.register_module()
+class CustomImageAug3D(ImageAug3D):
+    """
+    기존 ImageAug3D를 실행하면서 'img_original' 키를 보존하는 래퍼 클래스.
+    """
+    def transform(self, results: dict) -> dict:
+        # 1. 'img_original' 키가 있다면 잠시 빼서 보관합니다.
+        img_original = results.get('img_original', None)
+
+        # 2. 부모 클래스(ImageAug3D)의 증강 로직을 그대로 실행합니다.
+        augmented_results = super().transform(results)
+
+        # 3. 증강된 결과에 보관해두었던 'img_original'을 다시 넣어줍니다.
+        if img_original is not None:
+            augmented_results['img_original'] = img_original
+        
+        return augmented_results
 
 @TRANSFORMS.register_module()
 class BEVFusionRandomFlip3D:
