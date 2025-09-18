@@ -9,6 +9,7 @@ from mmengine.logging import print_log
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
+import torch
 from mmdet3d.utils import replace_ceph_backend
 
 
@@ -142,4 +143,5 @@ def main():
 
 
 if __name__ == '__main__':
+    torch.set_printoptions(precision=4, sci_mode=False)
     main()

@@ -10,7 +10,7 @@ from torch import Tensor
 from torch.nn import functional as F
 from torchvision.transforms import functional as tvtf
 from mmengine.structures import InstanceData
-from mmdet.structures.bbox import bbox_overlaps 
+from mmdet.structures.bbox import bbox_overlaps ,bbox2roi
 
 from mmdet3d.models import Base3DDetector
 from mmdet3d.registry import MODELS
@@ -44,7 +44,8 @@ class BEVFusion(Base3DDetector):
         pts_neck: Optional[dict] = None,
         bbox_head: Optional[dict] = None,
         img_bbox_head: Optional[dict] = None,
-        cotr: Optional[dict] = None,
+        corr: Optional[dict] = None,
+        z_estimator: Optional[dict] = None,
         init_cfg: OptMultiConfig = None,
         seg_head: Optional[dict] = None,
         train_cfg=None,  
@@ -74,13 +75,14 @@ class BEVFusion(Base3DDetector):
         self.pts_backbone = MODELS.build(pts_backbone)
         self.pts_neck = MODELS.build(pts_neck)
 
-        self.bbox_head = MODELS.build(bbox_head)
-        self.img_bbox_head = MODELS.build(img_bbox_head)
-        self.cotr = MODELS.build(cotr)
-
         self.init_weights()
 
-        # 이 부분이 이미 있다면 그대로 두고, 없다면 추가하세요.
+        # modified by sjmoon
+        self.bbox_head = MODELS.build(bbox_head)
+        self.img_bbox_head = MODELS.build(img_bbox_head)
+        self.corr = MODELS.build(corr)
+        self.z_estimator = MODELS.build(z_estimator)
+        
         self.class_names = class_names
         self.name_to_idx = {name: i for i, name in enumerate(self.class_names)}
 
@@ -151,44 +153,7 @@ class BEVFusion(Base3DDetector):
         """bool: Whether the detector has a segmentation head.
         """
         return hasattr(self, 'seg_head') and self.seg_head is not None
-
-    # def extract_img_feat(
-    #     self,
-    #     x,
-    #     points,
-    #     lidar2image,
-    #     camera_intrinsics,
-    #     camera2lidar,
-    #     img_aug_matrix,
-    #     lidar_aug_matrix,
-    #     img_metas,
-    # ) -> torch.Tensor:
-    #     B, N, C, H, W = x.size()
-    #     x = x.view(B * N, C, H, W).contiguous()
-
-    #     x = self.img_backbone(x)
-    #     x = self.img_neck(x)
-
-    #     if not isinstance(x, torch.Tensor):
-    #         x = x[0]
-
-    #     BN, C, H, W = x.size()
-    #     x = x.view(B, int(BN / B), C, H, W)
-    #     img_feature = x.clone()
-
-    #     with torch.autocast(device_type='cuda', dtype=torch.float32):
-    #         x = self.view_transform(
-    #             x,
-    #             points,
-    #             lidar2image,
-    #             camera_intrinsics,
-    #             camera2lidar,
-    #             img_aug_matrix,
-    #             lidar_aug_matrix,
-    #             img_metas,
-    #         )
-    #     return x ,img_feature
-    
+   
     def extract_img_feat(
         self,
         x,
@@ -367,6 +332,7 @@ class BEVFusion(Base3DDetector):
         self,
         batch_inputs_dict,
         batch_input_metas,
+        visualize=False,
         **kwargs,
     ):
         imgs = batch_inputs_dict.get('img_original', None)
@@ -402,11 +368,12 @@ class BEVFusion(Base3DDetector):
             sbs_img = tvtf.normalize(sbs_img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
             sbs_img = sbs_img.view(N, V, C, 192, 640*2)
 
-            # # ############## input display ##########################
-            # display_depth_maps(imgs,dense_depth_img_color_mis,sbs_img)
-            # print("input dispaly end")
+            # ############## input display ##########################
+            if visualize and sbs_img is not None:
+                display_depth_maps(imgs,dense_depth_img_color_mis,sbs_img)
+                print("input dispaly end")
         
-        return sbs_img, points
+        return sbs_img, points ,dense_depth_map
     
     def box_iou(self, bboxes1, bboxes2):
         """
@@ -669,13 +636,255 @@ class BEVFusion(Base3DDetector):
             )
             
         return detections_2d
+    
+    def _generate_rois_from_detections(self, detections_2d: List[torch.Tensor]) -> tuple:
+        """
+        탐지 결과 리스트를 RoI 텐서와 proposal 리스트로 변환합니다.
+        - RoI 텐서에 object_index를 추가합니다.
+        - 빈 탐지 예외 처리를 포함합니다.
+        """
+        proposal_list = detections_2d
+        
+        # 빈 탐지 예외 처리
+        if sum([len(p) for p in proposal_list]) == 0:
+            dummy_det = torch.tensor(
+                [[0.0, 0.0, 100.0, 100.0, 1.0, 0.0]],
+                dtype=proposal_list[0].dtype,
+                device=proposal_list[0].device
+            )
+            proposal_list[0] = dummy_det
+
+        # --- ✨ Object Index 추가 로직 시작 ✨ ---
+        
+        proposals_with_obj_idx = []
+        for p in proposal_list:
+            # 각 텐서(이미지)의 박스 개수만큼 [0, 1, 2, ...] 인덱스 생성
+            # shape: [num_boxes, 1]
+            obj_indices = torch.arange(
+                len(p), dtype=p.dtype, device=p.device).unsqueeze(1)
+            
+            # 기존 proposal 텐서(num_boxes, 6) 앞에 인덱스 텐서(num_boxes, 1)를 합침
+            # 결과 shape: [num_boxes, 7] -> (obj_idx, x1, y1, x2, y2, score, label)
+            proposals_with_obj_idx.append(torch.cat([obj_indices, p], dim=1))
+        
+        # --- Object Index 추가 로직 끝 ---
+
+        # object_index가 추가된 새로운 리스트를 bbox2roi에 전달
+        rois = bbox2roi(proposals_with_obj_idx)
+
+        # rois와 (더미가 추가될 수 있는) 원본 형식의 proposal_list를 반환
+        return rois, proposal_list
+    
+    def get_center_points(self, rois_with_indices):
+        """
+        Args:
+            rois_with_indices: Tensor of shape [num_obj, 6] (cam_id, obj_id, x_min, y_min, x_max, y_max)
+        Returns:
+            center_points: Tensor of shape [num_obj, 4] (cam_id, obj_id, center_x, center_y)
+        """
+        cam_ids = rois_with_indices[:, 0]
+        obj_ids = rois_with_indices[:, 1]
+        x_min = rois_with_indices[:, 2]
+        y_min = rois_with_indices[:, 3]
+        x_max = rois_with_indices[:, 4]
+        y_max = rois_with_indices[:, 5]
+        score = rois_with_indices[:, 6]
+        cls_lable = rois_with_indices[:, 7]
+
+        center_x = (x_min + x_max) / 2.0
+        center_y = (y_min + y_max) / 2.0
+
+        center_points = torch.stack([cam_ids, obj_ids, center_x, center_y], dim=1)
+        return center_points
+    
+    def batch_rois_center_by_cam_id(self, rois_center, batch_size=100):
+        """
+        rois_center 텐서에서 직접 카메라 ID를 읽어, 존재하는 카메라에 대해서만
+        데이터를 배치(batch) 형태로 변환합니다.
+        """
+        device = rois_center.device
+        
+        # 입력 텐서가 비어있는 경우, 빈 텐서를 반환
+        if rois_center.shape[0] == 0:
+            # num_cams를 알 수 없으므로 기본값 6으로 설정하거나, 호출하는 쪽에서 처리
+            return torch.zeros((6, batch_size, 4), device=device)
+
+        # 1. rois_center의 0열에서 모든 카메라 인덱스를 추출합니다.
+        cam_indices_tensor = rois_center[:, 0]
+        
+        # 2. 존재하는 고유한 카메라 ID 목록을 찾습니다.
+        unique_cam_ids = torch.unique(cam_indices_tensor).long().cpu().tolist()
+        
+        # 3. 최대 카메라 ID를 기반으로 출력 텐서의 크기를 결정합니다.
+        #    예: [0, 1, 5]가 있다면, 크기가 6인 텐서 (0~5)를 생성합니다.
+        max_cam_id = int(torch.max(cam_indices_tensor).item())
+        num_total_cams = max_cam_id + 1
+        
+        batched_centers = torch.zeros((num_total_cams, batch_size, 4), device=device)
+        
+        # 원본 객체 ID 저장 (검증 로직은 그대로 유지)
+        original_obj_ids = rois_center[:, 1].cpu().numpy()
+        
+        # 4. 하드코딩된 range(num_cams) 대신, 실제 존재하는 카메라 ID들을 순회합니다.
+        for cam_id in unique_cam_ids:
+            cam_mask = (rois_center[:, 0] == cam_id)
+            cam_centers = rois_center[cam_mask]
+            n = cam_centers.size(0)
+            
+            if n == 0:
+                continue
+                
+            # --- (내부 샘플링 로직은 기존과 동일) ---
+            obj_ids = cam_centers[:, 1].cpu().numpy()
+            unique_obj_ids = np.unique(obj_ids)
+            num_unique_objs = len(unique_obj_ids)
+            
+            if num_unique_objs <= batch_size:
+                if n < batch_size:
+                    repeat_factor = (batch_size + n - 1) // n
+                    cam_centers = cam_centers.repeat(repeat_factor, 1)[:batch_size]
+            else:
+                selected_indices = []
+                for obj_id in unique_obj_ids:
+                    obj_indices = np.where(obj_ids == obj_id)[0]
+                    selected_idx = np.random.choice(obj_indices)
+                    selected_indices.append(selected_idx)
+                    
+                if len(selected_indices) < batch_size:
+                    remaining = batch_size - len(selected_indices)
+                    all_indices = np.arange(n)
+                    # 이미 선택된 인덱스를 제외하고 남은 풀에서 추가 선택
+                    pool = np.setdiff1d(all_indices, selected_indices)
+                    # 만약 풀이 부족하면 복원 추출 허용
+                    replace = len(pool) < remaining
+                    extra_indices = np.random.choice(
+                        pool,
+                        size=remaining,
+                        replace=replace
+                    )
+                    selected_indices.extend(extra_indices)
+                    
+                selected_indices = torch.tensor(selected_indices, device=device, dtype=torch.long)
+                cam_centers = cam_centers[selected_indices]
+            
+            batched_centers[cam_id, :cam_centers.size(0)] = cam_centers[:batch_size]
+        
+        return batched_centers
+    
+    def remove_duplicate_objs(self,corrs_pred_with_obj):
+        """
+        객체 ID 기준 중복 제거 및 결과 포맷 변환
+        - PyTorch 버전 호환성 해결
+        - 객체 ID 연속성 체크 추가
+        - 텐서 크기 불일치 해결
+        
+        Args:
+            corrs_pred_with_obj: [num_cams, batch_size, 3] 텐서 
+                (obj_id, center_pred_x, center_pred_y)
+                
+        Returns:
+            [number_of_unique_obj, 4] 텐서 
+            (cam_id, obj_id, center_pred_x, center_pred_y)
+        """
+        num_cams, batch_size, _ = corrs_pred_with_obj.shape
+        
+        # 1. 카메라 ID 텐서 생성
+        cam_ids = torch.arange(num_cams, device=corrs_pred_with_obj.device)
+        cam_ids = cam_ids.view(-1, 1, 1).expand(-1, batch_size, 1)
+        
+        # 2. 모든 정보 결합 [cam_id, obj_id, pred_x, pred_y]
+        combined = torch.cat([cam_ids.float(), corrs_pred_with_obj], dim=-1)
+        
+        # 3. 배치 차원 병합 [num_cams * batch_size, 4]
+        flat_combined = combined.view(-1, 4)
+        
+        # 4. 객체 ID 추출 및 연속성 체크
+        obj_ids = flat_combined[:, 1]
+        unique_ids, counts = torch.unique(obj_ids, return_counts=True)
+        
+        # 5. 객체 ID 연속성 검증
+        if not torch.all(torch.diff(unique_ids) == 1):
+            print("경고: 객체 ID가 연속적이지 않음. 누락된 객체 존재 가능")
+        
+        # 6. 중복 제거 (첫 번째 발생만 유지)
+        _, unique_indices = torch.unique(obj_ids, return_inverse=True)
+        first_occurrence = torch.zeros_like(obj_ids, dtype=torch.bool)
+        
+        for obj_id in unique_ids:
+            indices = (obj_ids == obj_id).nonzero(as_tuple=True)[0]
+            if indices.numel() > 0:
+                first_occurrence[indices[0]] = True
+        
+        # 7. 고유 객체 선택
+        unique_objs = flat_combined[first_occurrence]
+        
+        # 8. 크기 검증
+        if unique_objs.size(0) != unique_ids.size(0):
+            print(f"크기 불일치: 고유 객체 {unique_ids.size(0)}개, 결과 {unique_objs.size(0)}개")
+        
+        return unique_objs
+    
+    def uvz_to_lidar_xyz(self, estimated_uvz: torch.Tensor, lidar2img: torch.Tensor) -> torch.Tensor:
+        """
+        이미지 좌표계의 (u, v, depth) 포인트를 LiDAR 좌표계의 (x, y, z)로 변환합니다.
+
+        Args:
+            estimated_uvz (torch.Tensor): (N*V, Num_Points, 3) 형태의 텐서.
+                                        각 포인트는 (u, v, z) 정보를 가집니다.
+                                        z는 카메라 좌표계에서의 깊이(depth)입니다.
+            lidar2img (torch.Tensor): (N, V, 4, 4) 형태의 변환 행렬.
+
+        Returns:
+            torch.Tensor: (N*V, Num_Points, 3) 형태의 LiDAR 좌표계 (x, y, z) 텐서.
+        """
+        # 1. 데이터 형태(Shape) 준비
+        N, V, _, _ = lidar2img.shape
+        # (N, V, 4, 4) -> (N*V, 4, 4)
+        lidar2img_reshaped = lidar2img.view(N * V, 4, 4)
+        # (N*V, Num_Points, 3)
+        num_points = estimated_uvz.shape[1]
+
+        # 2. 역행렬 계산 (image -> lidar 변환)
+        img2lidar = torch.inverse(lidar2img_reshaped)
+
+        # 3. (u, v, z)를 4D 동차 좌표(Homogeneous Coordinate)로 변환
+        # (u, v, z) -> (u*z, v*z, z, 1)
+        uv = estimated_uvz[..., 0:2]
+        depth = estimated_uvz[..., 2:3] # 차원을 유지하기 위해 [..., 2:3] 사용
+
+        # (u, v) * depth -> (u*z, v*z)
+        points_2d_multiplied_by_depth = uv * depth
+        
+        # (u*z, v*z, z, 1) 형태의 동차 좌표 생성
+        points_img_homogeneous = torch.cat(
+            [points_2d_multiplied_by_depth, depth, torch.ones_like(depth)], 
+            dim=-1
+        ) # shape: (N*V, Num_Points, 4)
+
+        # 4. 좌표 변환 (행렬 곱셈)
+        # img2lidar: (N*V, 4, 4)
+        # points_img_homogeneous: (N*V, Num_Points, 4)
+        # einsum을 사용하여 배치별 행렬 곱셈 수행
+        # 결과 shape: (N*V, Num_Points, 4)
+        points_lidar_homogeneous = torch.einsum(
+            'bmn,bqn->bqm', 
+            img2lidar, 
+            points_img_homogeneous
+        )
+
+        # 5. 3D 좌표로 변환
+        # 동차 좌표 (x, y, z, w)를 w로 나누어 (x, y, z)를 얻음
+        points_lidar_xyz = points_lidar_homogeneous[..., :3] / (points_lidar_homogeneous[..., 3:] + 1e-8)
+
+        return points_lidar_xyz
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
              batch_data_samples: List[Det3DDataSample],
              **kwargs) -> List[Det3DDataSample]:
         batch_input_metas = [item.metainfo for item in batch_data_samples]
-        feats,img_feats,lidar2imag,camera_intrinsics,camera2lidar = self.extract_feat(batch_inputs_dict, batch_input_metas)
-        sbs_img, pertubed_points = self.extract_sbs_img(batch_inputs_dict, batch_input_metas)
+        feats,img_feats,lidar2imag,camera_intrinsics,camera2lidar = self.extract_feat(
+                                                                    batch_inputs_dict, batch_input_metas)
+        sbs_img, pertubed_points,dense_depth_map = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
 
         reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
             img_feats, batch_data_samples)
@@ -697,8 +906,54 @@ class BEVFusion(Base3DDetector):
             reshaped_img_feats, 
             reshaped_data_samples, 
             batch_inputs_dict, 
-            visualize=True # 디버깅 시 True, 평소에는 False
+            visualize=False # 디버깅 시 True, 평소에는 False
         )
+
+        rois , proposla_list = self._generate_rois_from_detections(detections_2d)
+        rois_center = self.get_center_points(rois)
+        trimed_center_pts =self.batch_rois_center_by_cam_id(rois_center,batch_size=200)
+        cam_ids = trimed_center_pts[..., 0]
+        object_ids = trimed_center_pts[..., 1]
+
+        query_input = trimed_center_pts[..., 2:].clone()
+        query_input[..., 0] /= 1600
+        query_input[..., 1] /= 900
+        query_input[:,:,0] = query_input[:,:,0]/2    # recaling points for sbs image resizing
+        query_input[:,:,1] = query_input[:,:,1]
+
+        B,N,C,H,W = sbs_img.shape
+        raw_corrs, cycle, corr_mask, enc_out = self.corr(sbs_img.view(B*N,C,H,W), query_input)
+
+        # # ##### 검증용 display ######
+        # from .imageprocessing_unit import draw_correspondences
+        # # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
+        # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
+        # for cid in range(12):
+        #     # idx = id_to_idx[cid.item()]
+        #     # draw_correspondences(
+        #     #     trimed_corrs = gt_corrs[cid][:10,...],  # 첫 번째 배치 선택
+        #     #     sbs_img=sbs_img[cid],
+        #     #     save_path='correspondence_visualization_gt.jpg'
+        #     # )
+        #     draw_correspondences(
+        #         trimed_corrs = pred_corrs[cid][:1,...],  # 첫 번째 배치 선택
+        #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
+        #         save_path='correspondence_visualization_pred.jpg'
+        #     )
+        #     print ("end")
+
+        # corrs_pred_with_idx = torch.cat([cam_ids.unsqueeze(-1),object_ids.unsqueeze(-1),raw_corrs], dim=-1)  # [num_cams, batch_size, 3]
+        # raw_pred_center_pts = self.remove_duplicate_objs(corrs_pred_with_idx)
+
+        raw_pred_center_pts = raw_corrs.clone()
+        raw_pred_center_pts[..., 0] = (raw_pred_center_pts[..., 0] - 0.5) * 2
+        raw_pred_center_pts[..., 0] *= 1600
+        raw_pred_center_pts[..., 1] *= 900
+
+        esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map,enc_out)
+        esitmated_uvz =torch.cat([raw_pred_center_pts, esitmated_z['depth']],dim=-1)
+
+        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, lidar2imag)
 
         if self.with_bbox_head:
             bbox_loss = self.bbox_head.loss(feats, batch_data_samples)

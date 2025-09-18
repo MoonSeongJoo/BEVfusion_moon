@@ -127,7 +127,7 @@ model = dict(
         zbound=[-10.0, 10.0, 20.0],
         dbound=[1.0, 60.0, 0.5],
         downsample=2),
-    cotr=dict(
+    corr=dict(
         type='COTR',
         num_kp=200,
         # --- 기존 cotr_args의 내용을 여기에 추가 ---
@@ -150,6 +150,15 @@ model = dict(
             checkpoint='data/weights/backbone_base_corr_rev5.0_corrected.pth' # 예시 경로
             # checkpoint=None # 가중치 로딩이 필요 없을 경우
         )
+    ),
+    z_estimator=dict(
+        type='ZEstimator',
+        enc_channels=312,
+        uv_dim=2,
+        hidden_dim=512,
+        init_cfg=dict(
+            type='Pretrained',
+            checkpoint='data/weights/zestimator_corrected.pth')
     ),
     fusion_layer=dict(
         type='ConvFuser', in_channels=[80, 256], out_channels=256)

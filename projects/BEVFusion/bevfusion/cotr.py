@@ -3,39 +3,9 @@ import torch
 import torch.nn as nn
 from data.COTR.COTR_models.cotr_model_moon_Ver12_0 import build
 from mmdet3d.registry import MODELS
-from mmengine.model import BaseModule
-
-cotr_args = easydict.EasyDict({
-                "out_dir" : "general_config['out']",
-                # "load_weights" : "None",
-#                 "load_weights_path" : './COTR/out/default/checkpoint.pth.tar' ,
-                # "load_weights_path" : "./models/200_checkpoint.pth.tar",
-                "load_weights_path" : None,
-                "load_weights_freeze" : False ,
-                "max_corrs" : 1000 ,
-                "dim_feedforward" : 1024 , 
-                "backbone" : "resnet50" ,
-                "hidden_dim" : 312 ,
-                # "hidden_dim" : 136 ,
-                "dilation" : False ,
-                "dropout" : 0.1 ,
-                "nheads" : 8 ,
-                "layer" : "layer3" ,
-                "enc_layers" : 6 ,
-                "dec_layers" : 6 ,
-                "position_embedding" : "lin_sine"
-                
-})
-
-# @HEADS.register_module()
-# class COTR(BaseModule):
-#     def __init__(self, num_kp=200):
-#         super(COTR, self).__init__()
-#         self.num_kp = num_kp
-#         ##### CORR network #######
-#         self.corr = build(cotr_args)
-#         # 배치 정규화 레이어 추가 (최종 출력 차원 기준)
-#         # self.final_bn = nn.BatchNorm1d(3)  # corrs_pred의 마지막 차원이 3인 경우
+from mmengine.model import BaseModule 
+from mmengine.runner import load_checkpoint 
+from mmengine import print_log             
 
 @MODELS.register_module()
 class COTR(BaseModule):
@@ -80,8 +50,24 @@ class COTR(BaseModule):
         }
 
         ##### CORR network #######
-        # 동적으로 생성한 cotr_config를 전달합니다. build 함수가 easydict를 요구하면 변환합니다.
         self.corr = build(easydict.EasyDict(cotr_config))
+
+        # --- ✨ 2. 가중치 수동 로드 로직 추가 ---
+        if self.init_cfg and self.init_cfg['type'] == 'Pretrained':
+            checkpoint_path = self.init_cfg.get('checkpoint')
+            if checkpoint_path:
+                print_log(f'Manually loading checkpoint for self.corr from: {checkpoint_path}', logger='current')
+                # self.corr 모듈에 직접 체크포인트를 로드합니다.
+                load_checkpoint(
+                    self.corr, 
+                    checkpoint_path, 
+                    map_location='cpu', 
+                    strict=False,
+                    # 키 이름의 맨 앞에 있는 'corr.' 문자열을 제거하는 정규식
+                    revise_keys=[('^corr\\.', '')] # <-- 이 라인을 추가!
+                )
+            else:
+                print_log('No checkpoint path in init_cfg for COTR.', logger='current', level='WARNING')
     
     def forward(self, sbs_img , query_input):
 
