@@ -1,7 +1,7 @@
 import easydict
 import torch
 import torch.nn as nn
-from data.COTR.COTR_models.cotr_model_moon_Ver12_0 import build
+from .COTR.COTR_models.cotr_model_moon_Ver12_0 import build
 from mmdet3d.registry import MODELS
 from mmengine.model import BaseModule 
 from mmengine.runner import load_checkpoint 
@@ -24,6 +24,7 @@ class COTR(BaseModule):
                  dec_layers=6,
                  position_embedding='lin_sine',
                  load_weights_freeze=False, # cfg에서 받을 수 있도록 추가
+                 frozen=False,  # <--- ✨ 1. frozen 인자를 추가합니다 (기본값 False).
                  init_cfg=None): # mmdet3d의 표준 가중치 초기화를 위해 init_cfg를 받습니다.
         # super() 호출 시 init_cfg를 전달해야 Pretrained 가중치 로딩이 동작합니다.
         super(COTR, self).__init__(init_cfg)
@@ -68,6 +69,18 @@ class COTR(BaseModule):
                 )
             else:
                 print_log('No checkpoint path in init_cfg for COTR.', logger='current', level='WARNING')
+        
+        self.frozen = frozen
+        if self.frozen:
+            self.freeze()
+        
+    def freeze(self):
+        """Freeze all parameters of the module and set to eval mode."""
+        # 모듈을 평가 모드(eval)로 설정합니다. (Dropout, BatchNorm 등에 영향)
+        self.eval()
+        # 모든 파라미터를 순회하며 그래디언트 계산을 비활성화합니다.
+        for param in self.parameters():
+            param.requires_grad = False
     
     def forward(self, sbs_img , query_input):
 

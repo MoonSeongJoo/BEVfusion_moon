@@ -271,7 +271,7 @@ class CustomPack3DDetInputs(Pack3DDetInputs):
     def __init__(self, class_names: list, **kwargs):
         super().__init__(**kwargs)
         self.name_to_idx = {name: i for i, name in enumerate(class_names)}
-        self.INPUTS_KEYS.extend(['img_original', 'points_original'])
+        self.INPUTS_KEYS.extend(['img_original', 'points_original','perturbed_points'])
         self.INSTANCEDATA_2D_KEYS.append('gt_labels')
 
     def transform(self, results: dict) -> dict:

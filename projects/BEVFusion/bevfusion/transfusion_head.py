@@ -147,6 +147,36 @@ class TransFusionHead(nn.Module):
                     norm_cfg=norm_cfg,
                     bias=bias,
                 ))
+            
+        # 1단계 퓨전을 위한 새로운 전용 모듈들을 정의합니다.
+        self.fusion_cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_channel,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True  # [Batch, Seq, Channel] 입력을 받도록 설정
+        )
+        self.fusion_ffn = nn.Sequential(
+            nn.Linear(hidden_channel, hidden_channel * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_channel * 2, hidden_channel),
+        )
+        self.fusion_norm1 = nn.LayerNorm(hidden_channel)
+        self.fusion_norm2 = nn.LayerNorm(hidden_channel)
+
+        # 카메라 제안(det_xyz)의 3D 좌표를 위한 Positional Embedding (유지)
+        self.camera_proposal_pos_embedding = nn.Sequential(
+            nn.Linear(3, hidden_channel),
+            nn.ReLU(),
+            nn.Linear(hidden_channel, hidden_channel)
+        )
+
+        # BEV 쿼리(query_pos)의 2D 좌표를 위한 Positional Embedding (신규 추가)
+        # MMDetection 레이어 내부 기능을 밖으로 꺼내온 것입니다.
+        self.bev_query_pos_embedding = nn.Sequential(
+            nn.Linear(2, hidden_channel),
+            nn.ReLU(),
+            nn.Linear(hidden_channel, hidden_channel),
+        )
 
         self.init_weights()
         self._init_assigner_sampler()
@@ -202,7 +232,7 @@ class TransFusionHead(nn.Module):
                 build_assigner(res) for res in self.train_cfg.assigner
             ]
 
-    def forward_single(self, inputs, metas):
+    def forward_single(self, inputs,det_xyz, det_feats, metas):
         """Forward function for CenterPoint.
         Args:
             inputs (torch.Tensor): Input feature map with the shape of
@@ -273,6 +303,35 @@ class TransFusionHead(nn.Module):
                 -1, -1, bev_pos.shape[-1]),
             dim=1,
         )
+        
+        # <<< [최종 수정] 2단계 퓨전 아키텍처 구현 >>>
+        if det_xyz is not None and det_feats is not None:
+            # --- 1단계: 비대칭 Cross-Attention (카메라 정보 흡수) ---
+
+            # 1. 입력 텐서 준비 (모두 [B, N, C] 형태로 통일)
+            # Query: BEV 기반 쿼리
+            bev_query_feat = query_feat.permute(0, 2, 1)
+            bev_query_pos_embed = self.bev_query_pos_embedding(query_pos)
+
+            # Key/Value: 카메라 기반 제안
+            cam_proposal_feat = det_feats
+            cam_proposal_pos_embed = self.camera_proposal_pos_embedding(det_xyz)
+
+            # 2. MultiheadAttention 호출
+            # 128개의 BEV 쿼리가 1200개의 카메라 제안을 참고하여 업데이트됨
+            fused_feat = self.fusion_cross_attention(
+                query=bev_query_feat + bev_query_pos_embed,
+                key=cam_proposal_feat + cam_proposal_pos_embed,
+                value=cam_proposal_feat
+            )[0]
+
+            # 3. 잔차 연결(Residual Connection) 및 FFN (표준 Transformer 블록 구조)
+            bev_query_feat = self.fusion_norm1(bev_query_feat + fused_feat)
+            bev_query_feat = self.fusion_norm2(bev_query_feat + self.fusion_ffn(bev_query_feat))
+
+            # 4. 다음 단계를 위해 텐서 모양 복원 [B, 128, C] -> [B, C, 128]
+            query_feat = bev_query_feat.permute(0, 2, 1).contiguous()
+
         #################################
         # transformer decoder layer (Fusion feature as K,V)
         #################################
@@ -319,24 +378,38 @@ class TransFusionHead(nn.Module):
                 new_res[key] = ret_dicts[0][key]
         return [new_res]
 
-    def forward(self, feats, metas):
-        """Forward pass.
+    # def forward(self, feats, metas):
+    #     """Forward pass.
 
-        Args:
-            feats (list[torch.Tensor]): Multi-level features, e.g.,
-                features produced by FPN.
-        Returns:
-            tuple(list[dict]): Output results. first index by level, second
-            index by layer
-        """
+    #     Args:
+    #         feats (list[torch.Tensor]): Multi-level features, e.g.,
+    #             features produced by FPN.
+    #     Returns:
+    #         tuple(list[dict]): Output results. first index by level, second
+    #         index by layer
+    #     """
+    #     if isinstance(feats, torch.Tensor):
+    #         feats = [feats]
+    #     res = multi_apply(self.forward_single, feats, [metas])
+    #     assert len(res) == 1, 'only support one level features.'
+    #     return res
+    def forward(self, feats, det_xyz=None, det_feats=None, metas=None):
         if isinstance(feats, torch.Tensor):
             feats = [feats]
-        res = multi_apply(self.forward_single, feats, [metas])
+        # multi_apply 호출 시에도 순서만 맞춰주면 됩니다.
+        res = multi_apply(self.forward_single, feats, [det_xyz], [det_feats], [metas])
+        
         assert len(res) == 1, 'only support one level features.'
         return res
 
-    def predict(self, batch_feats, batch_input_metas):
-        preds_dicts = self(batch_feats, batch_input_metas)
+    # def predict(self, batch_feats, batch_input_metas):
+    #     preds_dicts = self(batch_feats, batch_input_metas)
+    #     res = self.predict_by_feat(preds_dicts, batch_input_metas)
+    #     return res
+
+    def predict(self, batch_feats, det_xyz, det_feats, batch_input_metas):
+        # self()는 forward를 호출. 이제 모든 인자를 올바르게 전달합니다.
+        preds_dicts = self(batch_feats, det_xyz, det_feats, batch_input_metas)
         res = self.predict_by_feat(preds_dicts, batch_input_metas)
         return res
 
@@ -742,7 +815,7 @@ class TransFusionHead(nn.Module):
             heatmap[None],
         )
 
-    def loss(self, batch_feats, batch_data_samples):
+    def loss(self, batch_feats, det_xyz,det_feats, batch_data_samples):
         """Loss function for CenterHead.
 
         Args:
@@ -757,7 +830,7 @@ class TransFusionHead(nn.Module):
         for data_sample in batch_data_samples:
             batch_input_metas.append(data_sample.metainfo)
             batch_gt_instances_3d.append(data_sample.gt_instances_3d)
-        preds_dicts = self(batch_feats, batch_input_metas)
+        preds_dicts = self(batch_feats,det_xyz, det_feats,batch_input_metas)
         loss = self.loss_by_feat(preds_dicts, batch_gt_instances_3d)
 
         return loss

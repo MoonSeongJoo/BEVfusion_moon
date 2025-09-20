@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from mmengine.utils import is_list_of
 from torch import Tensor
@@ -88,6 +89,11 @@ class BEVFusion(Base3DDetector):
 
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+
+        feat_dim_original = 312 # 입력 차원은 det_feat의 원래 특징 차원입니다 (12 * 64 = 768).
+        hidden_channel = bbox_head['hidden_channel'] # (128) 출력 차원은 TransFusionHead의 hidden_channel과 반드시 일치해야 합니다.
+        self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
+
 
     def _forward(self,
                  batch_inputs: Tensor,
@@ -245,42 +251,101 @@ class BEVFusion(Base3DDetector):
 
         return feats, coords, sizes
 
-    def predict(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
+    # def predict(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
+    #             batch_data_samples: List[Det3DDataSample],
+    #             **kwargs) -> List[Det3DDataSample]:
+    #     """Forward of testing.
+
+    #     Args:
+    #         batch_inputs_dict (dict): The model input dict which include
+    #             'points' keys.
+
+    #             - points (list[torch.Tensor]): Point cloud of each sample.
+    #         batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
+    #             Samples. It usually includes information such as
+    #             `gt_instance_3d`.
+
+    #     Returns:
+    #         list[:obj:`Det3DDataSample`]: Detection results of the
+    #         input sample. Each Det3DDataSample usually contain
+    #         'pred_instances_3d'. And the ``pred_instances_3d`` usually
+    #         contains following keys.
+
+    #         - scores_3d (Tensor): Classification scores, has a shape
+    #             (num_instances, )
+    #         - labels_3d (Tensor): Labels of bboxes, has a shape
+    #             (num_instances, ).
+    #         - bbox_3d (:obj:`BaseInstance3DBoxes`): Prediction of bboxes,
+    #             contains a tensor with shape (num_instances, 7).
+    #     """
+    #     batch_input_metas = [item.metainfo for item in batch_data_samples]
+    #     feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+
+    #     if self.with_bbox_head:
+    #         outputs = self.bbox_head.predict(feats, batch_input_metas)
+
+    #     res = self.add_pred_to_datasample(batch_data_samples, outputs)
+
+    #     return res
+
+    def predict(self, batch_inputs_dict: Dict[str, Tensor],
                 batch_data_samples: List[Det3DDataSample],
                 **kwargs) -> List[Det3DDataSample]:
-        """Forward of testing.
-
+        """
         Args:
-            batch_inputs_dict (dict): The model input dict which include
-                'points' keys.
-
-                - points (list[torch.Tensor]): Point cloud of each sample.
-            batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
+            batch_inputs_dict (dict): The model input dict which contains
+                `points`, `img` keys.
+            batch_data_samples (List[Det3DDataSample]): The Data
                 Samples. It usually includes information such as
-                `gt_instance_3d`.
+                `gt_instance_3d`, `gt_panoptic_seg_3d` and `gt_sem_seg_3d`.
 
         Returns:
-            list[:obj:`Det3DDataSample`]: Detection results of the
-            input sample. Each Det3DDataSample usually contain
-            'pred_instances_3d'. And the ``pred_instances_3d`` usually
-            contains following keys.
-
-            - scores_3d (Tensor): Classification scores, has a shape
-                (num_instances, )
-            - labels_3d (Tensor): Labels of bboxes, has a shape
-                (num_instances, ).
-            - bbox_3d (:obj:`BaseInstance3DBoxes`): Prediction of bboxes,
-                contains a tensor with shape (num_instances, 7).
+            list[Det3DDataSample]: Detection results of the
+            input images. Each Det3DDataSample usually contains
+            'pred_instances_3d'.
         """
         batch_input_metas = [item.metainfo for item in batch_data_samples]
-        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        
+        # 1. loss 메서드와 동일하게 모든 특징과 proposal을 생성합니다.
+        feats, img_feats, lidar2imag, _, _ = self.extract_feat(
+            batch_inputs_dict, batch_input_metas)
+        sbs_img, _, dense_depth_map = self.extract_sbs_img(
+            batch_inputs_dict, batch_input_metas, visualize=False)
+        reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
+            img_feats, batch_data_samples)
+        detections_2d = self._generate_and_process_2d_dets(
+            reshaped_img_feats, reshaped_data_samples, batch_inputs_dict, visualize=False)
+        rois, _ = self._generate_rois_from_detections(detections_2d)
+        rois_center = self.get_center_points(rois)
+        trimed_center_pts = self.batch_rois_center_by_cam_id(rois_center, batch_size=200)
+        query_input = trimed_center_pts[..., 2:].clone()
+        # ... (query_input 정규화 로직) ...
+        query_input[..., 0] /= 1600
+        query_input[..., 1] /= 900
+        query_input[:,:,0] = query_input[:,:,0]/2
+        
+        B, N, C, H, W = sbs_img.shape
+        raw_corrs, _, _, enc_out = self.corr(sbs_img.view(B*N, C, H, W), query_input)
+        # ... (det_xyz, det_feat_sampled, projected_feat 생성 로직) ...
+        raw_pred_center_pts = raw_corrs.clone()
+        raw_pred_center_pts[..., 0] = (raw_pred_center_pts[..., 0] - 0.5) * 2
+        raw_pred_center_pts[..., 0] *= 1600
+        raw_pred_center_pts[..., 1] *= 900
+        esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map, enc_out)
+        esitmated_uvz = torch.cat([raw_pred_center_pts, esitmated_z['depth']], dim=-1)
+        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, lidar2imag)
+        det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
+        det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(
+            det_xyz, det_feat_sampled, B=B, N_cam=N)
 
-        if self.with_bbox_head:
-            outputs = self.bbox_head.predict(feats, batch_input_metas)
+        # 2. 이제 헤드의 predict 메서드에 모든 인자를 전달합니다.
+        results_list_3d = self.bbox_head.predict(
+            feats, det_xyz_proc, det_feat_proc, batch_input_metas)
 
-        res = self.add_pred_to_datasample(batch_data_samples, outputs)
-
-        return res
+        # 예측 결과(results_list_3d)를 원본 데이터 샘플(batch_data_samples)에 합쳐줍니다.
+        results = self.add_pred_to_datasample(batch_data_samples,
+                                              results_list_3d)
+        return results
 
     def extract_feat(
         self,
@@ -336,7 +401,7 @@ class BEVFusion(Base3DDetector):
         **kwargs,
     ):
         imgs = batch_inputs_dict.get('img_original', None)
-        points = batch_inputs_dict.get('points_original', None)
+        points = batch_inputs_dict.get('perturbed_points', None)
         
         if imgs is not None:
             imgs = imgs.contiguous()
@@ -877,6 +942,75 @@ class BEVFusion(Base3DDetector):
         points_lidar_xyz = points_lidar_homogeneous[..., :3] / (points_lidar_homogeneous[..., 3:] + 1e-8)
 
         return points_lidar_xyz
+    
+    def _prepare_camera_proposals(self, det_xyz, det_feat_sampled, B, N_cam):
+        """
+        카메라 기반 제안(proposal)들을 배치(batch) 우선 형태로 전처리합니다.
+
+        (B * N_cam, ...) 모양의 텐서를 (B, N_cam * ..., ...) 모양으로 재구성합니다.
+
+        Args:
+            det_xyz (torch.Tensor): [B * N_cam, N_proposals, 3] 모양의 좌표 텐서
+            det_feat_sampled (torch.Tensor): [B * N_cam, N_proposals, C] 모양의 샘플링된 특징 텐서
+            B (int): 배치 크기
+            N_cam (int): 카메라 수
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 전처리된 (det_xyz, det_feat) 텐서.
+                                            Shape: ([B, N_total, 3], [B, N_total, C])
+        """
+        # 1. det_xyz 전처리: (B * N_cam, ...) -> (B, ...)
+        N_proposals = det_xyz.shape[1]
+        # [B * N_cam, N, 3] -> [B, N_cam * N, 3]
+        det_xyz_preprocessed = det_xyz.reshape(B, N_cam * N_proposals, 3)
+
+        # 2. det_feat_sampled 전처리: (B * N_cam, ...) -> (B, ...)
+        # 이제 det_xyz와 동일한 방식으로 모양만 재구성해주면 됩니다.
+        det_feat_preprocessed = det_feat_sampled.reshape(B, N_cam * N_proposals, -1)
+        det_feat_preprocessed = self.feat_projector(det_feat_preprocessed)
+
+        return det_xyz_preprocessed, det_feat_preprocessed
+    
+
+    def _sample_features_from_grid(self, feature_map, coords):
+        """
+        주어진 2D 좌표를 이용해 2D 특징 맵에서 특징 벡터를 샘플링합니다.
+
+        F.grid_sample을 사용하여, 각 좌표에 해당하는 특징을
+        bilinear interpolation을 통해 정확하게 추출합니다.
+
+        Args:
+            feature_map (torch.Tensor): 샘플링할 원본 2D 특징 맵.
+                Shape: [B_N, C, H, W]
+            coords (torch.Tensor): 샘플링할 위치의 (u, v) 좌표.
+                [0, 1] 또는 [-1, 1] 범위로 가정하며, 내부에서 [-1, 1]로 변환합니다.
+                Shape: [B_N, N_proposals, 2]
+
+        Returns:
+            torch.Tensor: 각 좌표에서 샘플링된 특징 벡터.
+                Shape: [B_N, N_proposals, C]
+        """
+        # 입력 텐서들로부터 필요한 차원 정보를 가져옵니다.
+        B_N, C, H, W = feature_map.shape
+        _, N_proposals, _ = coords.shape
+
+        # <<< [수정] 좌표 범위를 [0, 1] -> [-1, 1]로 변환 >>>
+        # F.grid_sample은 -1 ~ 1 범위의 좌표를 기대합니다.
+        coords_normalized = coords * 2.0 - 1.0
+
+        # F.grid_sample의 입력 형식에 맞게 좌표 텐서의 모양을 변경합니다.
+        # [B_N, N_proposals, 2] -> [B_N, 1, N_proposals, 2]
+        sampling_grid = coords_normalized.view(B_N, 1, N_proposals, 2)
+
+        # F.grid_sample을 사용하여 N_proposals개 좌표 위치의 특징을 정확히 샘플링합니다.
+        # 결과 sampled_feat의 모양: [B_N, C, 1, N_proposals]
+        sampled_feat = F.grid_sample(feature_map, sampling_grid, mode='bilinear', align_corners=True)
+
+        # 최종적으로 원하는 모양인 [B_N, N_proposals, C] 형태로 정리합니다.
+        # [B_N, C, 1, N_proposals] -> [B_N, C, N_proposals] -> [B_N, N_proposals, C]
+        sampled_feat_final = sampled_feat.squeeze(2).permute(0, 2, 1)
+
+        return sampled_feat_final
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
              batch_data_samples: List[Det3DDataSample],
@@ -899,6 +1033,9 @@ class BEVFusion(Base3DDetector):
         total_losses = dict()
         for k, v in losses_2d.items():
             total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
+        
+        # losses 딕셔너리를 total_losses로 초기화하여 2D loss를 먼저 담습니다.
+        losses = total_losses
 
         # ✨ 2. 헬퍼 함수를 호출하여 2D 탐지 결과 생성, 처리, 시각화를 한 번에 수행
         #    시각화가 필요할 때 visualize=True로 설정
@@ -942,9 +1079,6 @@ class BEVFusion(Base3DDetector):
         #     )
         #     print ("end")
 
-        # corrs_pred_with_idx = torch.cat([cam_ids.unsqueeze(-1),object_ids.unsqueeze(-1),raw_corrs], dim=-1)  # [num_cams, batch_size, 3]
-        # raw_pred_center_pts = self.remove_duplicate_objs(corrs_pred_with_idx)
-
         raw_pred_center_pts = raw_corrs.clone()
         raw_pred_center_pts[..., 0] = (raw_pred_center_pts[..., 0] - 0.5) * 2
         raw_pred_center_pts[..., 0] *= 1600
@@ -954,9 +1088,12 @@ class BEVFusion(Base3DDetector):
         esitmated_uvz =torch.cat([raw_pred_center_pts, esitmated_z['depth']],dim=-1)
 
         det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, lidar2imag)
+        #    이때 query_input은 -1~1 범위로 정규화된 상태여야 합니다.
+        det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
+        det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz,det_feat_sampled,B=B,N_cam=N)
 
         if self.with_bbox_head:
-            bbox_loss = self.bbox_head.loss(feats, batch_data_samples)
+            bbox_loss = self.bbox_head.loss(feats, det_xyz_proc, det_feat_proc, batch_data_samples)
 
         losses.update(bbox_loss)
 

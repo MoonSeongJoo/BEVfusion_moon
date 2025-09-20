@@ -1,0 +1,638 @@
+{
+"backbone": "resnet50",
+"batch_size": 16,
+"bidirectional": true,
+"cc_resume": false,
+"command": "train_cotr.py --scene_file sample_data/200_megadepth.json --info_level=rgbd --use_ram=no --use_cc=no --batch_size=16 --learning_rate=1e-4 --lr_backbone=1e-5 --max_iter=300000 --workers=8 --cycle_consis=yes --bidirectional=yes --position_embedding=lin_sine --layer=layer3 --confirm=no --dataset_name=megadepth_sushi --suffix=stage_3 --valid_iter=2000 --enable_zoom=yes --crop_cam=no_crop --out_dir=./out/cotr --use_mlp=no --load_weights=model:cotr_resnet50_layer3_1024_dset:megadepth_sushi_bs:16_pe:lin_sine_lrbackbone:1e-05_suffix:stage_2",
+"confirm": false,
+"crop_cam": "no_crop",
+"cycle_consis": true,
+"dataset_name": "megadepth_sushi",
+"dec_layers": 6,
+"dilation": false,
+"dim_feedforward": 1024,
+"dropout": 0.1,
+"enable_zoom": true,
+"enc_layers": 6,
+"essential": false,
+"hidden_dim": 256,
+"info_level": "rgbd",
+"k_size": 1,
+"kp_pool": 100,
+"layer": "layer3",
+"learning_rate": 0.0001,
+"load_weights": "model:cotr_resnet50_layer3_1024_dset:megadepth_sushi_bs:16_pe:lin_sine_lrbackbone:1e-05_suffix:stage_2",
+"load_weights_path": "./out/cotr/model:cotr_resnet50_layer3_1024_dset:megadepth_sushi_bs:16_pe:lin_sine_lrbackbone:1e-05_suffix:stage_2/checkpoint.pth.tar",
+"lr_backbone": 1e-05,
+"max_iter": 300000,
+"max_rotation": 0,
+"name": "model:cotr_resnet50_layer3_1024_dset:megadepth_sushi_bs:16_pe:lin_sine_lrbackbone:1e-05_suffix:stage_3",
+"need_rotation": false,
+"nheads": 8,
+"nn_method": "overlapping",
+"num_kp": 100,
+"num_queries": 100,
+"out": "./out/cotr/model:cotr_resnet50_layer3_1024_dset:megadepth_sushi_bs:16_pe:lin_sine_lrbackbone:1e-05_suffix:stage_3",
+"out_dir": "./out/cotr",
+"pool_size": 20,
+"position_embedding": "lin_sine",
+"resume": false,
+"rotation_chance": 0,
+"scene_file": "sample_data/200_megadepth.json",
+"scenes_name_list": [
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0000/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0000/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0000/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0000/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0000/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0000/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0001/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0001/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0001/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0002/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0002/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0002/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0003/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0003/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0003/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0004/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0004/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0004/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0004/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0004/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0004/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0005/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0005/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0005/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0007/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0007/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0007/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0007/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0007/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0007/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0011/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0011/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0011/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0012/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0012/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0012/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0013/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0013/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0013/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0017/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0017/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0017/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0020/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0020/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0020/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0020/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0020/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0020/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0023/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0023/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0023/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0023/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0023/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0023/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0026/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0026/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0026/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0027/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0027/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0027/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0033/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0033/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0033/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0034/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0034/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0034/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0035/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0035/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0035/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0036/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0036/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0036/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0037/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0037/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0037/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0039/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0039/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0039/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0041/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0041/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0041/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0042/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0042/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0042/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0043/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0043/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0043/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0044/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0044/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0044/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0046/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0046/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0046/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0046/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0046/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0046/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0048/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0048/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0048/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0049/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0049/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0049/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0050/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0050/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0050/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0056/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0056/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0056/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0057/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0057/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0057/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0058/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0058/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0058/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0060/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0060/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0060/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0061/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0061/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0061/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0062/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0062/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0062/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0064/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0064/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0064/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0065/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0065/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0065/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0067/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0067/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0067/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0070/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0070/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0070/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0071/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0071/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0071/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0071/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0071/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0071/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0076/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0076/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0076/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0078/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0078/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0078/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0083/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0083/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0083/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0086/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0086/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0086/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0087/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0087/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0087/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0090/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0090/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0090/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0092/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0092/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0092/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0094/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0094/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0094/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0095/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0095/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0095/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0095/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0095/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0095/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0098/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0098/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0098/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0099/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0099/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0099/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0100/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0100/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0100/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0101/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0101/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0101/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0102/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0102/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0102/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0103/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0103/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0103/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0104/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0104/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0104/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0104/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0104/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0104/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0105/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0105/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0105/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0107/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0107/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0107/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0115/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0115/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0115/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0117/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0117/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0117/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0117/dense2/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0117/dense2/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0117/sparse/manhattan/2_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0121/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0121/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0121/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0122/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0122/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0122/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0130/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0130/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0130/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0130/dense2/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0130/dense2/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0130/sparse/manhattan/2_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0137/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0137/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0137/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0137/dense2/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0137/dense2/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0137/sparse/manhattan/2_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0141/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0141/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0141/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0143/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0143/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0143/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0147/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0147/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0147/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0147/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0147/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0147/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0148/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0148/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0148/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0148/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0148/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0148/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0149/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0149/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0149/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0150/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0150/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0150/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0151/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0151/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0151/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0156/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0156/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0156/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0160/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0160/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0160/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0160/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0160/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0160/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0160/dense2/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0160/dense2/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0160/sparse/manhattan/2_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0162/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0162/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0162/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0175/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0175/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0175/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0176/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0176/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0176/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0176/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0176/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0176/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0176/dense2/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0176/dense2/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0176/sparse/manhattan/2_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0177/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0177/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0177/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0178/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0178/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0178/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0181/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0181/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0181/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0183/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0183/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0183/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0189/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0189/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0189/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0190/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0190/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0190/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0197/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0197/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0197/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0200/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0200/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0200/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0200/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0200/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0200/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0204/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0204/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0204/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0205/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0205/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0205/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0209/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0209/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0209/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0212/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0212/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0212/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0214/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0214/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0214/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0214/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0214/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0214/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0224/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0224/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0224/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0224/dense1/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0224/dense1/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0224/sparse/manhattan/1_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0231/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0231/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0231/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0235/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0235/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0235/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0237/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0237/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0237/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0238/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0238/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0238/sparse/manhattan/0_rectified/sparse"
+},
+{
+"depth_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0240/dense0/depths",
+"image_dir": "/scratch/dataset/megadepth/MegaDepth_v1/phoenix/S6/zl548/MegaDepth_v1/0240/dense0/imgs",
+"scene_dir": "/scratch/dataset/megadepth/MegaDepth_v1_SfM/0240/sparse/manhattan/0_rectified/sparse"
+}
+],
+"shuffle_data": true,
+"suffix": "stage_3",
+"tb_dir": "./tb_out",
+"tb_out": "./tb_out/model:cotr_resnet50_layer3_1024_dset:megadepth_sushi_bs:16_pe:lin_sine_lrbackbone:1e-05_suffix:stage_3",
+"use_cc": false,
+"use_cuda": true,
+"use_mlp": false,
+"use_ram": false,
+"valid_iter": 2000,
+"workers": 8,
+"zoom_end": 0.1,
+"zoom_jitter": 0.5,
+"zoom_levels": 10,
+"zoom_start": 1.0
+}

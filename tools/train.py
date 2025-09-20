@@ -4,12 +4,15 @@ import logging
 import os
 import os.path as osp
 
+import torch
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
 from mmengine.config import Config, DictAction
 from mmengine.logging import print_log
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
-import torch
 from mmdet3d.utils import replace_ceph_backend
 
 
@@ -137,6 +140,29 @@ def main():
         # build customized runner from the registry
         # if 'runner_type' is set in the cfg
         runner = RUNNERS.build(cfg)
+    
+        # --- [검증 코드 시작] ---
+    # runner.model을 통해 빌드된 모델 객체에 접근합니다.
+    model = runner.model
+    if hasattr(model, 'corr'):
+        print("="*60)
+        print("🔍 Checking if 'corr' module is frozen...")
+        is_frozen = True
+        for name, param in model.corr.named_parameters():
+            if param.requires_grad:
+                print(f"  ❌ Parameter '{name}' is NOT frozen.")
+                is_frozen = False
+
+        if is_frozen:
+            print("  ✅ Success! All parameters in 'corr' are correctly frozen.")
+        else:
+            print("  🔥 Warning! Some parameters in 'corr' are not frozen!")
+        print("="*60)
+    else:
+        print("="*60)
+        print("  ⚠️ Warning! Model has no attribute 'corr'. Skipping freeze check.")
+        print("="*60)
+    # --- [검증 코드 끝] ---
 
     # start training
     runner.train()

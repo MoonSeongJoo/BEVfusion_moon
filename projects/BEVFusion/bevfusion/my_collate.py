@@ -23,7 +23,7 @@ def custom_collate(data_batch: list) -> dict:
     for key in all_keys:
         data_for_key = [d[key] for d in inputs_list]
         
-        if key in ['points', 'points_original']:
+        if key in ['points', 'points_original' ,'perturbed_points']:
             # 포인트 클라우드는 항상 리스트로 유지
             batched_inputs[key] = data_for_key
             

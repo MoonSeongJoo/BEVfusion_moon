@@ -22,6 +22,7 @@ custom_imports = dict(
              'projects.BEVFusion.bevfusion.cotr'],
     allow_failed_imports=False)
 
+data_root = 'data/nuscenes/'
 
 model = dict(
     type='BEVFusion',
@@ -29,7 +30,9 @@ model = dict(
     train_cfg=dict(
         complement_2d_gt=0.35, # <-- 커스텀 설정을 여기로 이동
         # 레퍼런스 코드에서 사용했던 다른 설정도 여기에 추가
-        detection_proposal=dict(min_bbox_size=0) 
+        detection_proposal=dict(min_bbox_size=0),
+        # # --- ✨ [핵심 수정] corr 모듈을 학습에서 제외(freeze)하도록 설정 ---
+        # frozen_modules=['corr']
     ),
     data_preprocessor=dict(
         type='CustomDet3DDataPreprocessor',
@@ -129,6 +132,7 @@ model = dict(
         downsample=2),
     corr=dict(
         type='COTR',
+        frozen=True,  # <--- ✨✨ 여기에 frozen 플래그를 직접 추가합니다.
         num_kp=200,
         # --- 기존 cotr_args의 내용을 여기에 추가 ---
         max_corrs=1000,
@@ -234,7 +238,7 @@ train_pipeline = [
         class_names=class_names,
         # 처리할 모든 키 목록
         keys=[
-            'points', 'img', 'img_original','points_original',
+            'points', 'img', 'img_original','points_original','perturbed_points',
             'gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes','gt_labels',
         ],
         # 메타 정보로 처리할 키 목록
@@ -247,7 +251,7 @@ train_pipeline = [
             'lidar_path', 'img_path', 'transformation_3d_flow', 'pcd_rotation',
             'pcd_scale_factor', 'pcd_trans', 'img_aug_matrix',
             'lidar_aug_matrix', 'num_pts_feats',
-            'gt_KT','mis_RT','mis_KT','lidar_depth_gt','lidar_depth_mis','matched_uvset','perturbed_points',
+            'gt_KT','mis_RT','mis_KT','lidar_depth_gt','lidar_depth_mis','matched_uvset',
             'ann_info_2d_per_cam' 
         ])
 ]
@@ -258,6 +262,8 @@ test_pipeline = [
         to_float32=True,
         color_type='color',
         backend_args=backend_args),
+    # <<< [추가] 원본 이미지를 보존하기 위해 복사
+    dict(type='CopyImageToKey', key='img', new_key='img_original'),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -272,26 +278,52 @@ test_pipeline = [
         pad_empty_sweeps=True,
         remove_close=True,
         backend_args=backend_args),
+    # <<< [추가] 평가를 위해 2D/3D 어노테이션 로드
     dict(
-        type='ImageAug3D',
+        type='LoadAnnotations3D',
+        with_bbox_3d=True,
+        with_label_3d=True,
+        with_bbox=True,
+        with_label=True,
+        with_attr_label=False),
+    # <<< [수정] Augmentation 타입을 CustomImageAug3D로 통일 (랜덤 옵션은 비활성화)
+    dict(
+        type='CustomImageAug3D',
         final_dim=[256, 704],
-        resize_lim=[0.48, 0.48],
+        resize_lim=[0.48, 0.48], # 테스트 시에는 고정된 크기 사용
         bot_pct_lim=[0.0, 0.0],
         rot_lim=[0.0, 0.0],
         rand_flip=False,
         is_train=False),
+    # <<< [추가] 학습 파이프라인과 동일한 단계 추가
+    dict(type='PointToMultiViewDepth', grid_config=grid_config, downsample=1),
+    # <<< [수정] 필터 타입을 CustomPointsRangeFilter로 통일 (또는 유지)
+    dict(type='CustomPointsRangeFilter', point_cloud_range=point_cloud_range),
+    # <<< [추가] 학습 시와 동일한 필터링 적용
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(
-        type='PointsRangeFilter',
-        point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]),
+        type='ObjectNameFilter',
+        classes=[
+            'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+        ]),
+    # <<< [핵심 수정] Pack 단계를 CustomPack3DDetInputs로 통일하고 모든 키 포함
     dict(
-        type='Pack3DDetInputs',
-        keys=['img', 'points', 'gt_bboxes_3d', 'gt_labels_3d',
-              'img_original','points_original','gt_KT','mis_RT','mis_KT',
-            'lidar_depth_gt','lidar_depth_mis','matched_uvset','perturbed_points',],
+        type='CustomPack3DDetInputs',
+        class_names=class_names,
+        keys=[
+            'points', 'img', 'img_original', 'points_original','perturbed_points',
+            'gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes', 'gt_labels',
+        ],
         meta_keys=[
+            'img_shape', 'ori_shape', 'pad_shape', 'scale_factor',
             'cam2img', 'ori_cam2img', 'lidar2cam', 'lidar2img', 'cam2lidar',
             'ori_lidar2img', 'img_aug_matrix', 'box_type_3d', 'sample_idx',
-            'lidar_path', 'img_path', 'num_pts_feats'
+            'lidar_path', 'img_path', 'transformation_3d_flow', 'pcd_rotation',
+            'pcd_scale_factor', 'pcd_trans', 'img_aug_matrix',
+            'lidar_aug_matrix', 'num_pts_feats',
+            'gt_KT','mis_RT','mis_KT','lidar_depth_gt','lidar_depth_mis','matched_uvset',
+            'ann_info_2d_per_cam'
         ])
 ]
 
