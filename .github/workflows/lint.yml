@@ -6,15 +6,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# jobs:
+#   lint:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v2
+#       - name: Set up Python 3.7
+#         uses: actions/setup-python@v2
+#         with:
+#           python-version: 3.7
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Set up Python 3.7
-        uses: actions/setup-python@v2
+      - uses: actions/checkout@v4 # 액션 버전 업데이트
+      - name: Set up Python
+        uses: actions/setup-python@v5 # 액션 버전 업데이트
         with:
-          python-version: 3.7
+          python-version: '3.10' # 지원되는 버전으로 변경
+      # ... 이하 생략 ...
       - name: Install pre-commit hook
         run: |
           pip install pre-commit
