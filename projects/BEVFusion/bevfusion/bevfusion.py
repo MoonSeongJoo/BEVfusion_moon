@@ -33,6 +33,7 @@ class BEVFusion(Base3DDetector):
 
     def __init__(
         self,
+        enable_selective_freezing,
         class_names: List[str],
         data_preprocessor: OptConfigType = None,
         pts_voxel_encoder: Optional[dict] = None,
@@ -94,6 +95,59 @@ class BEVFusion(Base3DDetector):
         hidden_channel = bbox_head['hidden_channel'] # (128) 출력 차원은 TransFusionHead의 hidden_channel과 반드시 일치해야 합니다.
         self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
 
+        # =====================================================================
+        # ✨ START: Code added for selective module freezing
+        # =====================================================================
+        # Set this flag to True to freeze parts of the network during training.
+        # The specific modules to be frozen are defined in the _freeze_modules() method.
+        self.enable_selective_freezing = enable_selective_freezing
+        if self.enable_selective_freezing:
+            print("\n!!! WARNING: Selectively freezing parts of the network. !!!\n")
+            self._freeze_modules()
+        # =====================================================================
+        # ✨ END: Code added for selective module freezing
+        # =====================================================================
+    
+    def _freeze_modules(self):
+            """
+            Selectively freezes parts of the network for targeted training.
+            This configuration trains ONLY the image 2D detection pipeline.
+            """
+            # --- STRATEGY: Freeze everything EXCEPT the Image 2D Detection pipeline. ---
+            print("Freezing all modules EXCEPT the Image 2D Detection pipeline.")
+            
+            # 동결할 모듈 목록 (2D 탐지 관련 모듈 제외)
+            modules_to_freeze = {
+                # LiDAR Path
+                'pts_voxel_layer': self.pts_voxel_layer,
+                'pts_voxel_encoder': self.pts_voxel_encoder,
+                'pts_middle_encoder': self.pts_middle_encoder,
+                'pts_backbone': self.pts_backbone,
+                'pts_neck': self.pts_neck,
+                
+                # 3D Detection Head
+                'bbox_head': self.bbox_head,
+                
+                # Fusion & View Transform
+                'view_transform': self.view_transform,
+                'fusion_layer': self.fusion_layer,
+                
+                # Custom Modules
+                'corr': self.corr,
+                'z_estimator': self.z_estimator,
+            }
+
+            # 선택된 모듈들의 파라미터 업데이트를 중지
+            for name, module in modules_to_freeze.items():
+                if module is not None:
+                    for param in module.parameters():
+                        param.requires_grad = False
+                    print(f" - ❄️ Module '{name}' has been frozen.")
+                else:
+                    print(f" - Module '{name}' is None, skipping.")
+            
+            print("\n - 🔥 The following modules will be trained: 'img_backbone', 'img_neck', 'img_bbox_head'.")
+            print("---------------------------------")
 
     def _forward(self,
                  batch_inputs: Tensor,
@@ -1073,7 +1127,7 @@ class BEVFusion(Base3DDetector):
         #     #     save_path='correspondence_visualization_gt.jpg'
         #     # )
         #     draw_correspondences(
-        #         trimed_corrs = pred_corrs[cid][:1,...],  # 첫 번째 배치 선택
+        #         trimed_corrs = pred_corrs[cid][:10,...],  # 첫 번째 배치 선택
         #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
         #         save_path='correspondence_visualization_pred.jpg'
         #     )
@@ -1095,7 +1149,7 @@ class BEVFusion(Base3DDetector):
         if self.with_bbox_head:
             bbox_loss = self.bbox_head.loss(feats, det_xyz_proc, det_feat_proc, batch_data_samples)
 
-        losses.update(bbox_loss)
+        # losses.update(bbox_loss)
 
         return losses
 

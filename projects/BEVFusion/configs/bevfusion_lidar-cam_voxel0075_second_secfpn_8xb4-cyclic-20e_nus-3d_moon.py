@@ -26,6 +26,7 @@ data_root = 'data/nuscenes/'
 
 model = dict(
     type='BEVFusion',
+    enable_selective_freezing=True,
     class_names=class_names,
     train_cfg=dict(
         complement_2d_gt=0.35, # <-- 커스텀 설정을 여기로 이동
@@ -93,8 +94,8 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=1.0),
-        loss_bbox=dict(type='mmdet.L1Loss', loss_weight=1.0),
+            loss_weight=2.0),
+        loss_bbox=dict(type='mmdet.L1Loss', loss_weight=2.0),
         train_cfg=dict(
             assigner=dict(
                 type='mmdet.MaxIoUAssigner',
@@ -132,7 +133,7 @@ model = dict(
         downsample=2),
     corr=dict(
         type='COTR',
-        frozen=True,  # <--- ✨✨ 여기에 frozen 플래그를 직접 추가합니다.
+        # frozen=True,  # <--- ✨✨ 여기에 frozen 플래그를 직접 추가합니다.
         num_kp=200,
         # --- 기존 cotr_args의 내용을 여기에 추가 ---
         max_corrs=1000,
@@ -373,13 +374,27 @@ param_scheduler = [
 ]
 
 # runtime settings
-train_cfg = dict(by_epoch=True, max_epochs=6, val_interval=1,)
+train_cfg = dict(by_epoch=True, max_epochs=24, val_interval=24,)
 val_cfg = dict()
 test_cfg = dict()
 
+# optim_wrapper = dict(
+#     type='OptimWrapper',
+#     optimizer=dict(type='AdamW', lr=0.0002, weight_decay=0.01),
+#     clip_grad=dict(max_norm=35, norm_type=2))
+
+# --- ✨ 핵심 수정: 옵티마이저 설정을 변경하여 모듈별로 다른 학습률 적용 ---
 optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=0.0002, weight_decay=0.01),
+    # paramwise_cfg를 통해 특정 파라미터 그룹에 다른 학습률을 설정합니다.
+    paramwise_cfg=dict(
+        custom_keys={
+            # 이미지 백본은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
+            'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
+            # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
+            'corr': dict(lr_mult=0.1, decay_mult=1.0),
+        }),
     clip_grad=dict(max_norm=35, norm_type=2))
 
 # Default setting for scaling LR automatically
@@ -390,5 +405,16 @@ auto_scale_lr = dict(enable=False, base_batch_size=32)
 
 default_hooks = dict(
     logger=dict(type='LoggerHook', interval=50),
-    checkpoint=dict(type='CheckpointHook', interval=1))
+    # checkpoint=dict(type='CheckpointHook', interval=1),
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=50,      # 1000번의 이터레이션마다 저장
+        by_epoch=False)     # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
+    )
 del _base_.custom_hooks
+
+# load_from =  "data/work_dirs/bevfusion/20250919_bevfusion/epoch_1.pth"
+load_from = None
+resume_from = None
+
+log_level = 'WARNING' 

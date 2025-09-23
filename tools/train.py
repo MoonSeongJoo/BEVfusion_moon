@@ -15,7 +15,6 @@ from mmengine.runner import Runner
 
 from mmdet3d.utils import replace_ceph_backend
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a 3D detector')
     parser.add_argument('config', help='train config file path')
@@ -141,7 +140,7 @@ def main():
         # if 'runner_type' is set in the cfg
         runner = RUNNERS.build(cfg)
     
-        # --- [검증 코드 시작] ---
+    # --- [검증 코드 시작] ---
     # runner.model을 통해 빌드된 모델 객체에 접근합니다.
     model = runner.model
     if hasattr(model, 'corr'):
@@ -162,11 +161,8 @@ def main():
         print("="*60)
         print("  ⚠️ Warning! Model has no attribute 'corr'. Skipping freeze check.")
         print("="*60)
-    # --- [검증 코드 끝] ---
-
     # start training
     runner.train()
-
 
 if __name__ == '__main__':
     torch.set_printoptions(precision=4, sci_mode=False)
