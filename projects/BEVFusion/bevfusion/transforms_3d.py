@@ -7,7 +7,12 @@ from mmcv.transforms import BaseTransform
 from PIL import Image
 
 from mmdet3d.datasets import GlobalRotScaleTrans
+from mmdet3d.structures import points_cam2img
 from mmdet3d.registry import TRANSFORMS
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import os
+import datetime
 
 
 @TRANSFORMS.register_module()
@@ -78,13 +83,59 @@ class ImageAug3D(BaseTransform):
 
         return img, rotation, translation
 
+    # def transform(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    #     imgs = data['img']
+    #     new_imgs = []
+    #     transforms = []
+    #     for img in imgs:
+    #         resize, resize_dims, crop, flip, rotate = self.sample_augmentation(
+    #             data)
+    #         post_rot = torch.eye(2)
+    #         post_tran = torch.zeros(2)
+    #         new_img, rotation, translation = self.img_transform(
+    #             img,
+    #             post_rot,
+    #             post_tran,
+    #             resize=resize,
+    #             resize_dims=resize_dims,
+    #             crop=crop,
+    #             flip=flip,
+    #             rotate=rotate,
+    #         )
+    #         transform = torch.eye(4)
+    #         transform[:2, :2] = rotation
+    #         transform[:2, 3] = translation
+    #         new_imgs.append(np.array(new_img).astype(np.float32))
+    #         transforms.append(transform.numpy())
+    #     data['img'] = new_imgs
+    #     # update the calibration matrices
+    #     data['img_aug_matrix'] = transforms
+    #     return data
+    
+    # ====================================================================
+    # ===== 아래 transform 함수에 파라미터를 저장하는 로직이 추가되었습니다 =====
+    # ====================================================================
     def transform(self, data: Dict[str, Any]) -> Dict[str, Any]:
         imgs = data['img']
         new_imgs = []
         transforms = []
+        
+        # BBox 역변환에 사용할 파라미터들을 저장할 리스트
+        img_aug_params = []
+
         for img in imgs:
-            resize, resize_dims, crop, flip, rotate = self.sample_augmentation(
-                data)
+            resize, resize_dims, crop, flip, rotate = self.sample_augmentation(data)
+            
+            # 역변환에 필요한 파라미터들을 딕셔너리 형태로 저장
+            params = {
+                'resize': resize,
+                'crop': crop,
+                'flip': flip,
+                'rotate': rotate,
+                'final_dim': self.final_dim,
+            }
+            img_aug_params.append(params)
+            
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)
             new_img, rotation, translation = self.img_transform(
@@ -102,9 +153,13 @@ class ImageAug3D(BaseTransform):
             transform[:2, 3] = translation
             new_imgs.append(np.array(new_img).astype(np.float32))
             transforms.append(transform.numpy())
+        
         data['img'] = new_imgs
-        # update the calibration matrices
         data['img_aug_matrix'] = transforms
+        
+        # ===== 저장된 파라미터를 data 딕셔너리에 추가 =====
+        data['img_aug_params'] = img_aug_params
+        
         return data
 
 @TRANSFORMS.register_module()
@@ -124,6 +179,141 @@ class CustomImageAug3D(ImageAug3D):
             augmented_results['img_original'] = img_original
         
         return augmented_results
+    
+@TRANSFORMS.register_module()
+class GenerateUpdated2DAnnotations(BaseTransform):
+    """
+    [ValueError 및 원근 나누기 오류 최종 해결 버전]
+    1. 2D 좌표를 올바른 4D 동차 좌표계로 변환하여 행렬 차원 문제를 해결.
+    2. 원근 나누기 시 올바른 값(w')을 사용하도록 수정.
+    """
+
+    def __init__(self, classes=None, visualize=False, vis_dir='vis_outputs'):
+        super().__init__()
+        self.classes = classes if classes is not None else [
+            'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+            'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+        ]
+        self.visualize = visualize
+        self.vis_dir = vis_dir
+        self.camera_types = [
+            'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK',
+            'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
+        ]
+
+    def _create_empty_annotations(self) -> dict:
+        return {'gt_bboxes': np.zeros((0, 4), dtype=np.float32), 'gt_labels': []}
+
+    def transform(self, results: dict) -> dict:
+        gt_bboxes_3d = results.get('gt_bboxes_3d', None)
+
+        if gt_bboxes_3d is None or len(gt_bboxes_3d.tensor) == 0:
+            ann_info_aug_2d_per_cam = {}
+            for cam_name in self.camera_types:
+                ann_info_aug_2d_per_cam[cam_name] = self._create_empty_annotations()
+            results['ann_info_aug_2d_per_cam'] = ann_info_aug_2d_per_cam
+            return results
+
+        corners_3d_augmented = gt_bboxes_3d.corners.cpu().numpy()
+        num_gt = corners_3d_augmented.shape[0]
+        # final_img_shape = results['img'].shape[1:3]
+        final_img_shape = (256,704)
+        lidar2img_matrices = results['lidar2img']
+        img_aug_matrices = results['img_aug_matrix']
+        lidar_aug_mat = results['lidar_aug_matrix']
+
+        ann_info_aug_2d_per_cam = {}
+
+        for cam_idx, cam_name in enumerate(self.camera_types):
+            lidar2img_mat = lidar2img_matrices[cam_idx]
+            img_aug_mat = img_aug_matrices[cam_idx]
+
+            if isinstance(lidar2img_mat, torch.Tensor): lidar2img_mat = lidar2img_mat.cpu().numpy()
+            if isinstance(img_aug_mat, torch.Tensor): img_aug_mat = img_aug_mat.cpu().numpy()
+            if isinstance(lidar_aug_mat, torch.Tensor): lidar_aug_mat = lidar_aug_mat.cpu().numpy()
+
+            # 1단계: 3D 증강 되돌리기
+            lidar_aug_inv = np.linalg.inv(lidar_aug_mat)
+            corners_3d_augmented_flat = corners_3d_augmented.reshape(-1, 3)
+            corners_3d_augmented_hom = np.concatenate([corners_3d_augmented_flat, np.ones((corners_3d_augmented_flat.shape[0], 1))], axis=1)
+            corners_3d_original_hom = corners_3d_augmented_hom @ lidar_aug_inv.T
+            corners_3d_original = corners_3d_original_hom[:, :3]
+
+            # 2단계: 3D -> 2D 투영 (라이브러리 함수 사용)
+            corners_2d_original = points_cam2img(corners_3d_original, lidar2img_mat)
+
+            # 3단계: 2D 증강 적용
+            # [수정 1] 4x4 행렬과 곱하기 위해 4D 동차 좌표 [u, v, 0, 1]로 변환
+            corners_2d_original_hom = np.concatenate(
+                [corners_2d_original, 
+                 np.zeros((corners_2d_original.shape[0], 1)),
+                 np.ones((corners_2d_original.shape[0], 1))], 
+                axis=1)
+
+            # (N, 4) @ (4, 4) -> (N, 4) 곱셈
+            corners_2d_final_hom = corners_2d_original_hom @ img_aug_mat.T
+            
+            eps = 1e-5
+            
+            # [수정 2] 원근 나누기를 위해 네 번째 값(w')을 사용
+            depth = corners_2d_final_hom[:, 3]
+
+            corners_2d_final = corners_2d_final_hom[:, :2] / (depth[:, np.newaxis] + eps)
+            corners_2d_final = corners_2d_final.reshape(num_gt, 8, 2)
+            
+            # 이하 로직은 동일
+            on_img = (corners_2d_final[..., 0] >= 0) & (corners_2d_final[..., 0] < final_img_shape[1]) & \
+                     (corners_2d_final[..., 1] >= 0) & (corners_2d_final[..., 1] < final_img_shape[0])
+            valid_mask = on_img.any(axis=1)
+
+            if np.any(valid_mask):
+                valid_corners = corners_2d_final[valid_mask]
+                valid_corners[..., 0] = np.clip(valid_corners[..., 0], 0, final_img_shape[1])
+                valid_corners[..., 1] = np.clip(valid_corners[..., 1], 0, final_img_shape[0])
+                min_uv = np.min(valid_corners, axis=1)
+                max_uv = np.max(valid_corners, axis=1)
+                bboxes_2d = np.concatenate([min_uv, max_uv], axis=1).astype(np.float32)
+                labels_3d_np = results['gt_labels_3d']
+                string_labels = [self.classes[l] for l in labels_3d_np[valid_mask]]
+                ann_info_aug_2d_per_cam[cam_name] = {'gt_bboxes': bboxes_2d, 'gt_labels': string_labels}
+            else:
+                ann_info_aug_2d_per_cam[cam_name] = self._create_empty_annotations()
+        
+        results['ann_info_aug_2d_per_cam'] = ann_info_aug_2d_per_cam
+        
+        if self.visualize:
+            # (이하 시각화 코드는 동일)
+            os.makedirs(self.vis_dir, exist_ok=True)
+            img_array = results['img']
+            fig, axes = plt.subplots(2, 3, figsize=(24, 8))
+            axes = axes.flatten()
+            fig.suptitle(f"Sample IDX: {results.get('sample_idx', 'N/A')}", fontsize=16)
+            for i, cam_name in enumerate(self.camera_types):
+                ax = axes[i]
+                cam_img_hwc = img_array[i]
+                cam_img_display = np.clip(cam_img_hwc, 0, 255).astype(np.uint8)
+                # cam_img_display = cam_img_display[..., ::-1]
+                ax.imshow(cam_img_display)
+                ax.set_title(cam_name)
+                ax.axis('off')
+                annotations = ann_info_aug_2d_per_cam[cam_name]
+                for bbox, label in zip(annotations['gt_bboxes'], annotations['gt_labels']):
+                    x1, y1, x2, y2 = bbox
+                    width, height = x2 - x1, y2 - y1
+                    rect = patches.Rectangle((x1, y1), width, height, linewidth=2, edgecolor='lime', facecolor='none')
+                    ax.add_patch(rect)
+                    ax.text(x1, y1 - 5, label, bbox=dict(facecolor='lime', alpha=0.8), fontsize=8, color='black')
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            sample_id = results.get('sample_idx', 'sample')
+            save_path = os.path.join(self.vis_dir, f'{sample_id}_{timestamp}.jpg')
+            plt.tight_layout()
+            plt.savefig(save_path)
+            plt.close(fig)
+        
+        results['gt_bboxes'] = np.zeros((0, 4), dtype=np.float32)
+        results['gt_labels'] = np.zeros((0,), dtype=np.int64)
+
+        return results
 
 @TRANSFORMS.register_module()
 class BEVFusionRandomFlip3D:

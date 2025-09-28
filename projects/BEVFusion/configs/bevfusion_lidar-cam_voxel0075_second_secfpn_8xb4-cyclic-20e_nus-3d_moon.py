@@ -94,8 +94,8 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=2.0),
-        loss_bbox=dict(type='mmdet.L1Loss', loss_weight=2.0),
+            loss_weight=1.0),
+        loss_bbox=dict(type='mmdet.L1Loss', loss_weight=1.0),
         train_cfg=dict(
             assigner=dict(
                 type='mmdet.MaxIoUAssigner',
@@ -233,6 +233,11 @@ train_pipeline = [
         prob=0.0,
         fixed_prob=True),
     dict(type='PointShuffle'),
+    # --- ✨ 여기에 새로운 Transform 추가! ✨ ---
+    dict(type='GenerateUpdated2DAnnotations',
+         classes=class_names, 
+         visualize=False,
+         vis_dir='vis_2d_detection_outputs'),
     dict(
         type='CustomPack3DDetInputs',
         # class_names를 전달하여 라벨 변환을 활성화
@@ -253,7 +258,7 @@ train_pipeline = [
             'pcd_scale_factor', 'pcd_trans', 'img_aug_matrix',
             'lidar_aug_matrix', 'num_pts_feats',
             'gt_KT','mis_RT','mis_KT','lidar_depth_gt','lidar_depth_mis','matched_uvset',
-            'ann_info_2d_per_cam' 
+            'ann_info_2d_per_cam' ,'ann_info_aug_2d_per_cam','img_aug_params',
         ])
 ]
 
@@ -404,17 +409,27 @@ optim_wrapper = dict(
 auto_scale_lr = dict(enable=False, base_batch_size=32)
 
 default_hooks = dict(
-    logger=dict(type='LoggerHook', interval=50),
+    logger=dict(type='LoggerHook',
+                interval=50,
+                ),
     # checkpoint=dict(type='CheckpointHook', interval=1),
     checkpoint=dict(
         type='CheckpointHook',
-        interval=50,      # 1000번의 이터레이션마다 저장
-        by_epoch=False)     # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
+        interval=1000,      # 1000번의 이터레이션마다 저장
+        by_epoch=False,
+        max_keep_ckpts=3,)     # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
     )
 del _base_.custom_hooks
 
-# load_from =  "data/work_dirs/bevfusion/20250919_bevfusion/epoch_1.pth"
+# load_from =  "data/work_dirs/bevfusion/20250925_bevfusion_2d_detection_only/iter_1500.pth"
 load_from = None
 resume_from = None
 
-log_level = 'WARNING' 
+# log_level = 'WARNING' 
+visualizer = dict(
+    type='Det3DLocalVisualizer', # 3D 시각화를 위한 기본 Visualizer
+    vis_backends=[
+        dict(type='LocalVisBackend'),
+        # --- ✨ 여기에 TensorBoard 백엔드를 추가합니다 ✨ ---
+        dict(type='TensorboardVisBackend')
+    ])

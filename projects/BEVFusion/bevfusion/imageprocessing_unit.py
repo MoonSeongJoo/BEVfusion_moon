@@ -17,6 +17,9 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.utils.geometry_utils import view_points
 # from geomloss import SamplesLoss
+import os
+import cv2
+import matplotlib.patches as patches
 
 def visualize_bboxes(img_tensor, proposal_list, output_path='output.png', dpi=150):
     """
@@ -4174,59 +4177,146 @@ def differentiable_center2lidar(center_pred, intrinsics, extrinsics, eps=1e-6):
     return center_lidar_with_index, center_lidar, lidar2img
 
 
-def draw_correspondences(trimed_corrs, sbs_img, save_path='correspond.jpg'):
-    """정규화 좌표 기반 시각화 (0~1 범위 입력 필요)"""
-    import matplotlib.pyplot as plt
-    import numpy as np
+# def draw_correspondences(trimed_corrs, sbs_img, save_path='correspond.jpg'):
+#     """정규화 좌표 기반 시각화 (0~1 범위 입력 필요)"""
+#     import matplotlib.pyplot as plt
+#     import numpy as np
     
-    # 1. 이미지 전처리
-    img_tensor = sbs_img# [3, 192, 1280]
-    denorm_img = img_tensor / 2 + 0.5  # 정규화 해제
+#     # 1. 이미지 전처리
+#     img_tensor = sbs_img# [3, 192, 1280]
+#     denorm_img = img_tensor / 2 + 0.5  # 정규화 해제
+#     img_np = denorm_img.permute(1, 2, 0).cpu().numpy()
+    
+#     # 2. 좌표 추출 및 스케일 복원
+#     H, W = img_np.shape[:2]
+#     left_pts = trimed_corrs[:, :2].detach().cpu().numpy()  # 정규화 좌표 [N,2] (0~1)
+#     right_pts = trimed_corrs[:, 2:].detach().cpu().numpy()
+    
+#     # 3. 정규화 → 픽셀 좌표 변환 (원본 알고리즘 반영)
+#     left_pts[:, 0] = left_pts[:, 0] * 640  # u = (norm_u - 0.5)*640 
+#     left_pts[:, 1] = left_pts[:, 1] * 192  # v = norm_v * 192
+#     right_pts[:, 0] = (right_pts[:, 0] - 0.5) * 640 + 640  # 우측 오프셋 적용
+#     right_pts[:, 1] = right_pts[:, 1] * 192
+
+#     # 4. 좌표 클리핑 및 필터링
+#     left_pts[:, 0] = np.clip(left_pts[:, 0], 0, W-1)
+#     left_pts[:, 1] = np.clip(left_pts[:, 1], 0, H-1)
+#     right_pts[:, 0] = np.clip(right_pts[:, 0], 0, W-1)
+#     right_pts[:, 1] = np.clip(right_pts[:, 1], 0, H-1)
+    
+#     valid_mask = ~(np.isnan(left_pts).any(axis=1) | np.isnan(right_pts).any(axis=1))
+#     left_pts = left_pts[valid_mask]
+#     right_pts = right_pts[valid_mask]
+
+#     # 5. 시각화
+#     plt.figure(figsize=(20, 6))
+#     plt.imshow(img_np)
+    
+#     # 좌측 포인트 (청색)
+#     plt.scatter(left_pts[:,0], left_pts[:,1], 
+#                 c='cyan', s=30, edgecolors='k', linewidth=0.8, label='Left Points')
+#     # 우측 포인트 (자홍색)
+#     plt.scatter(right_pts[:,0], right_pts[:,1], 
+#                 c='magenta', s=30, edgecolors='k', linewidth=0.8, label='Right Points')
+    
+#     # 연결선 그리기 (옵션)
+#     for l, r in zip(left_pts, right_pts):
+#         plt.plot([l[0], r[0]], [l[1], r[1]], 
+#                 color='yellow', linestyle='--', linewidth=1.5, alpha=0.4)
+
+#     plt.axis('off')
+#     plt.legend(loc='upper right', prop={'size': 12})
+#     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+#     plt.close()
+#     print(f"Correspondence image saved to {save_path}")
+
+def draw_correspondences(
+    trimed_corrs, 
+    sbs_img, 
+    save_path='correspondence.jpg', 
+    bboxes_to_draw=None, 
+    score_thr=0.3
+):
+    """
+    Side-by-Side 이미지에 대응점과 Bounding Box를 함께 시각화하여 저장합니다.
+    BBox 좌표를 [900, 1600] -> [192, 640] 스케일로 정확하게 변환합니다.
+    """
+    # 1. 이미지 텐서 전처리
+    denorm_img = sbs_img / 2 + 0.5
     img_np = denorm_img.permute(1, 2, 0).cpu().numpy()
-    
-    # 2. 좌표 추출 및 스케일 복원
-    H, W = img_np.shape[:2]
-    left_pts = trimed_corrs[:, :2].detach().cpu().numpy()  # 정규화 좌표 [N,2] (0~1)
-    right_pts = trimed_corrs[:, 2:].detach().cpu().numpy()
-    
-    # 3. 정규화 → 픽셀 좌표 변환 (원본 알고리즘 반영)
-    left_pts[:, 0] = left_pts[:, 0] * 640  # u = (norm_u - 0.5)*640 
-    left_pts[:, 1] = left_pts[:, 1] * 192  # v = norm_v * 192
-    right_pts[:, 0] = (right_pts[:, 0] - 0.5) * 640 + 640  # 우측 오프셋 적용
-    right_pts[:, 1] = right_pts[:, 1] * 192
+    H_img, W_img, _ = img_np.shape # 현재 시각화될 SBS 이미지의 높이(192), 너비(1280)
 
-    # 4. 좌표 클리핑 및 필터링
-    left_pts[:, 0] = np.clip(left_pts[:, 0], 0, W-1)
-    left_pts[:, 1] = np.clip(left_pts[:, 1], 0, H-1)
-    right_pts[:, 0] = np.clip(right_pts[:, 0], 0, W-1)
-    right_pts[:, 1] = np.clip(right_pts[:, 1], 0, H-1)
-    
-    valid_mask = ~(np.isnan(left_pts).any(axis=1) | np.isnan(right_pts).any(axis=1))
-    left_pts = left_pts[valid_mask]
-    right_pts = right_pts[valid_mask]
+    # SBS 이미지의 왼쪽 절반에 해당하는 너비 (640)
+    LEFT_IMG_WIDTH = W_img / 2 
+    # SBS 이미지의 높이 (192)
+    LEFT_IMG_HEIGHT = H_img
 
-    # 5. 시각화
-    plt.figure(figsize=(20, 6))
-    plt.imshow(img_np)
-    
-    # 좌측 포인트 (청색)
-    plt.scatter(left_pts[:,0], left_pts[:,1], 
-                c='cyan', s=30, edgecolors='k', linewidth=0.8, label='Left Points')
-    # 우측 포인트 (자홍색)
-    plt.scatter(right_pts[:,0], right_pts[:,1], 
-                c='magenta', s=30, edgecolors='k', linewidth=0.8, label='Right Points')
-    
-    # 연결선 그리기 (옵션)
-    for l, r in zip(left_pts, right_pts):
-        plt.plot([l[0], r[0]], [l[1], r[1]], 
-                color='yellow', linestyle='--', linewidth=1.5, alpha=0.4)
+    # 원본 BBox의 기준 해상도
+    ORIGINAL_BBOX_WIDTH = 1600
+    ORIGINAL_BBOX_HEIGHT = 900
 
-    plt.axis('off')
-    plt.legend(loc='upper right', prop={'size': 12})
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Correspondence image saved to {save_path}")
+    # BBox 스케일링 비율 계산
+    scale_x = LEFT_IMG_WIDTH / ORIGINAL_BBOX_WIDTH # 640 / 1600 = 0.4
+    scale_y = LEFT_IMG_HEIGHT / ORIGINAL_BBOX_HEIGHT # 192 / 900 = 0.2133...
 
+    # 2. Matplotlib 시각화 준비
+    fig, ax = plt.subplots(1, figsize=(20, 6))
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    ax.imshow(img_np)
+
+    # 3. 대응점(Correspondence Points) 그리기 (기존 로직 유지)
+    if trimed_corrs is not None and trimed_corrs.shape[0] > 0:
+        left_pts = trimed_corrs[:, :2].detach().cpu().numpy()
+        right_pts = trimed_corrs[:, 2:].detach().cpu().numpy()
+        
+        # 정규화 좌표를 SBS 이미지의 픽셀 좌표로 변환
+        left_pts[:, 0] = left_pts[:, 0] * LEFT_IMG_WIDTH
+        left_pts[:, 1] = left_pts[:, 1] * LEFT_IMG_HEIGHT
+        right_pts[:, 0] = (right_pts[:, 0] - 0.5) * LEFT_IMG_WIDTH + LEFT_IMG_WIDTH
+        right_pts[:, 1] = right_pts[:, 1] * LEFT_IMG_HEIGHT
+
+        valid_mask = ~(np.isnan(left_pts).any(axis=1) | np.isnan(right_pts).any(axis=1))
+        left_pts, right_pts = left_pts[valid_mask], right_pts[valid_mask]
+
+        ax.scatter(left_pts[:, 0], left_pts[:, 1], c='cyan', s=30, edgecolors='k', linewidth=0.8, label='Left Points')
+        ax.scatter(right_pts[:, 0], right_pts[:, 1], c='magenta', s=30, edgecolors='k', linewidth=0.8, label='Right Points')
+        for l, r in zip(left_pts, right_pts):
+            ax.plot([l[0], r[0]], [l[1], r[1]], color='yellow', linestyle='--', linewidth=1.5, alpha=0.4)
+
+    # 4. Bounding Box 그리기 (수정된 로직)
+    if bboxes_to_draw is not None and bboxes_to_draw.shape[0] > 0:
+        bboxes = bboxes_to_draw.clone()
+
+        # ====================================================================
+        # ===== 여기가 BBox 좌표 스케일링 및 이동 로직입니다. =====
+        # ====================================================================
+        # X 좌표 스케일링
+        bboxes[:, [0, 2]] *= scale_x
+        # Y 좌표 스케일링
+        bboxes[:, [1, 3]] *= scale_y
+        
+        for bbox_data in bboxes:
+            coords, score, label = bbox_data[:4], bbox_data[4], int(bbox_data[5].item())
+            if score < score_thr:
+                continue
+            
+            x1, y1, x2, y2 = coords.cpu().numpy()
+            width, height = x2 - x1, y2 - y1
+            
+            rect = patches.Rectangle((x1, y1), width, height, linewidth=2, edgecolor='blue', facecolor='none')
+            ax.add_patch(rect)
+            
+            # 텍스트 위치도 스케일링된 좌표에 맞춰 조정
+            ax.text(x1, y1 - 5, f'L:{label} | {score:.2f}', 
+                    color='blue', fontsize=10, bbox=dict(facecolor='white', alpha=0.5))
+
+    # 5. 최종 이미지 저장
+    ax.set_aspect('equal') # 비율 유지
+    ax.axis('off')
+    # ax.legend(loc='upper right', prop={'size': 12})
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    print(f"Correspondence and BBox image saved to {save_path}")
 
 def geometric_propagation(depth_map, iterations=3):
     """
@@ -5089,3 +5179,142 @@ def bbox2roi_with_camidx(bbox_list):
         rois_list.append(rois)
     rois = torch.cat(rois_list, 0)
     return rois
+
+def save_verification_image(
+    original_img, 
+    augmented_img, 
+    original_preds_tensor, 
+    augmented_preds_tensor, 
+    save_path,
+    score_thr=0.3
+):
+    """
+    원본/증강 이미지에 BBox를 그린 검증 결과를 단일 이미지 파일로 저장합니다.
+
+    Args:
+        original_img (np.ndarray): 원본 이미지 (H, W, 3).
+        augmented_img (np.ndarray): 증강된 이미지 (fH, fW, 3).
+        original_preds_tensor (torch.Tensor): 원본 좌표계의 예측 텐서 (N, 6).
+        augmented_preds_tensor (torch.Tensor): 증강 좌표계의 예측 텐서 (N, 6).
+        save_path (str): 이미지를 저장할 경로 (e.g., 'output/verification.png').
+        score_thr (float, optional): 지정된 점수 이상의 BBox만 표시.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # 예측 텐서에서 정보 분리
+    orig_boxes, orig_scores, orig_labels = original_preds_tensor[:, :4], original_preds_tensor[:, 4], original_preds_tensor[:, 5]
+    aug_boxes, aug_scores, aug_labels = augmented_preds_tensor[:, :4], augmented_preds_tensor[:, 4], augmented_preds_tensor[:, 5]
+
+    # 1. 원본 이미지에 BBox 그리기
+    vis_orig = original_img.copy()
+    for i, bbox in enumerate(orig_boxes):
+        if orig_scores[i] < score_thr:
+            continue
+        x1, y1, x2, y2 = bbox.int().cpu().numpy()
+        cv2.rectangle(vis_orig, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        text = f'L:{int(orig_labels[i].item())} | {orig_scores[i].item():.2f}'
+        cv2.putText(vis_orig, text, (x1, y1 - 10), font, 0.5, (0, 255, 0), 2)
+
+    # 2. 증강 이미지에 BBox 그리기
+    vis_aug = augmented_img.copy().astype(np.uint8)
+    for i, bbox in enumerate(aug_boxes):
+        if aug_scores[i] < score_thr:
+            continue
+        x1, y1, x2, y2 = bbox.int().cpu().numpy()
+        cv2.rectangle(vis_aug, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        text = f'L:{int(aug_labels[i].item())} | {aug_scores[i].item():.2f}'
+        cv2.putText(vis_aug, text, (x1, y1 - 10), font, 0.5, (255, 0, 0), 2)
+
+    # 3. Matplotlib으로 두 이미지 비교 그림 생성
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+    ax1.imshow(cv2.cvtColor(vis_orig, cv2.COLOR_BGR2RGB))
+    ax1.set_title('Original Image with Converted BBoxes (Green)')
+    ax1.axis('off')
+
+    ax2.imshow(vis_aug)
+    ax2.set_title('Augmented Image with Predicted BBoxes (Red)')
+    ax2.axis('off')
+
+    plt.tight_layout()
+
+    # 4. 그림을 파일로 저장하고 plot을 닫음
+    # 저장 경로의 디렉터리가 없으면 생성
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path)
+    plt.close(fig) # 메모리 해제를 위해 꼭 닫아주세요.
+    print(f"Verification image saved to: {save_path}")
+
+def denormalize_image(tensor, mean, std):
+    """
+    정규화된 이미지 텐서를 시각화를 위한 uint8 NumPy 배열로 역정규화합니다.
+    """
+    mean = torch.tensor(mean, device=tensor.device).view(3, 1, 1)
+    std = torch.tensor(std, device=tensor.device).view(3, 1, 1)
+
+    # 역정규화: (정규화된 값 * std) + mean
+    denorm_tensor = tensor * std + mean
+
+    # (C, H, W) -> (H, W, C) 변환 및 NumPy 배열로 변경
+    img_np = denorm_tensor.permute(1, 2, 0).cpu().numpy()
+
+    # 0-255 범위로 클리핑하고 uint8 타입으로 변환
+    img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+    
+    return img_np
+
+def save_batch_predictions_to_file(
+    batch_inputs_dict, 
+    reshaped_data_samples, 
+    augmented_preds_list, 
+    original_preds_list,
+    current_step,
+    save_dir='vis_results',
+    view_index=0, 
+    score_thr=0.3
+):
+    """
+    배치 데이터 중 특정 뷰를 선택하여 검증 이미지를 파일로 저장합니다.
+    """
+    # ====================================================================
+    # ===== ⚠️ 중요: 사용하시는 데이터셋의 정규화 값을 입력하세요. =====
+    # ===== (MMDetection3D config 파일의 'img_norm_cfg'에 있습니다)
+    # ====================================================================
+    IMG_MEAN = [123.675, 116.28, 103.53] # ImageNet 기본값 예시
+    IMG_STD = [58.395, 57.12, 57.375]   # ImageNet 기본값 예시
+    
+    num_cameras = 6
+    batch_idx = view_index // num_cameras
+    cam_idx = view_index % num_cameras
+    
+    # --- 원본 이미지 처리 ---
+    original_imgs_batch = batch_inputs_dict.get('img_original')
+    if original_imgs_batch is None:
+        print("저장 실패: batch_inputs_dict에 'img_original'이 없습니다.")
+        return
+    original_img_tensor = original_imgs_batch[batch_idx][cam_idx]
+    # 값의 범위가 0-255이므로 uint8로 타입만 변환합니다.
+    original_img = original_img_tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+    
+    # --- 증강 이미지 처리 ---
+    augmented_imgs_batch = batch_inputs_dict.get('imgs')
+    if augmented_imgs_batch is None:
+        print("저장 실패: batch_inputs_dict에 'imgs'가 없습니다.")
+        return
+    augmented_img_tensor = augmented_imgs_batch[batch_idx][cam_idx]
+    # 정규화되어 있으므로, denormalize_image 함수를 사용해 역정규화합니다.
+    augmented_img = denormalize_image(augmented_img_tensor, IMG_MEAN, IMG_STD)
+    
+    # 예측 데이터 선택 및 저장 경로 생성
+    aug_preds_tensor = augmented_preds_list[view_index]
+    orig_preds_tensor = original_preds_list[view_index]
+    save_path = os.path.join(save_dir, f'step_{current_step}_view_{view_index}.png')
+
+    # 이미지 저장 함수 호출
+    save_verification_image(
+        original_img,
+        augmented_img,
+        orig_preds_tensor,
+        aug_preds_tensor,
+        save_path=save_path,
+        score_thr=score_thr
+    )

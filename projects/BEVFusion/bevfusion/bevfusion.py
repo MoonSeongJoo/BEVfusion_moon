@@ -20,12 +20,14 @@ from mmdet3d.utils import OptConfigType, OptMultiConfig, OptSampleList
 from .ops import Voxelization
 from .imageprocessing_unit import (dense_map_from_depth_batch_v2, 
                                    batch_colormap,two_images_side_by_side_gpu,
-                                   display_depth_maps
+                                   display_depth_maps,
+                                   save_batch_predictions_to_file
                                    )
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import torch
 import os
+import math
 
 
 @MODELS.register_module()
@@ -107,6 +109,8 @@ class BEVFusion(Base3DDetector):
         # =====================================================================
         # ✨ END: Code added for selective module freezing
         # =====================================================================
+
+        self.vis_step_counter = 0
     
     def _freeze_modules(self):
             """
@@ -116,25 +120,44 @@ class BEVFusion(Base3DDetector):
             # --- STRATEGY: Freeze everything EXCEPT the Image 2D Detection pipeline. ---
             print("Freezing all modules EXCEPT the Image 2D Detection pipeline.")
             
-            # 동결할 모듈 목록 (2D 탐지 관련 모듈 제외)
+            # # 동결할 모듈 목록 (2D 탐지 관련 모듈 제외)
+            # modules_to_freeze = {
+            #     # LiDAR Path
+            #     'pts_voxel_layer': self.pts_voxel_layer,
+            #     'pts_voxel_encoder': self.pts_voxel_encoder,
+            #     'pts_middle_encoder': self.pts_middle_encoder,
+            #     'pts_backbone': self.pts_backbone,
+            #     'pts_neck': self.pts_neck,
+                
+            #     # 3D Detection Head
+            #     'bbox_head': self.bbox_head,
+                
+            #     # Fusion & View Transform
+            #     'view_transform': self.view_transform,
+            #     'fusion_layer': self.fusion_layer,
+                
+            #     # Custom Modules
+            #     'corr': self.corr,
+            #     'z_estimator': self.z_estimator,
+            # }
             modules_to_freeze = {
-                # LiDAR Path
-                'pts_voxel_layer': self.pts_voxel_layer,
-                'pts_voxel_encoder': self.pts_voxel_encoder,
-                'pts_middle_encoder': self.pts_middle_encoder,
-                'pts_backbone': self.pts_backbone,
-                'pts_neck': self.pts_neck,
+                # # LiDAR Path
+                # 'pts_voxel_layer': self.pts_voxel_layer,
+                # 'pts_voxel_encoder': self.pts_voxel_encoder,
+                # 'pts_middle_encoder': self.pts_middle_encoder,
+                # 'pts_backbone': self.pts_backbone,
+                # 'pts_neck': self.pts_neck,
                 
-                # 3D Detection Head
-                'bbox_head': self.bbox_head,
+                # # 3D Detection Head
+                # 'bbox_head': self.bbox_head,
                 
-                # Fusion & View Transform
-                'view_transform': self.view_transform,
-                'fusion_layer': self.fusion_layer,
+                # # Fusion & View Transform
+                # 'view_transform': self.view_transform,
+                # 'fusion_layer': self.fusion_layer,
                 
-                # Custom Modules
+                # # Custom Modules
                 'corr': self.corr,
-                'z_estimator': self.z_estimator,
+                # 'z_estimator': self.z_estimator,
             }
 
             # 선택된 모듈들의 파라미터 업데이트를 중지
@@ -535,7 +558,7 @@ class BEVFusion(Base3DDetector):
         device = img_feats[0].device
 
         for sample in batch_data_samples:
-            multi_cam_2d_anns = sample.metainfo['ann_info_2d_per_cam']
+            multi_cam_2d_anns = sample.metainfo['ann_info_aug_2d_per_cam']
             for cam_name in camera_types:
                 new_sample = Det3DDataSample()
                 new_sample.set_metainfo(sample.metainfo)
@@ -668,21 +691,21 @@ class BEVFusion(Base3DDetector):
                     bbox=dict(facecolor='r', alpha=0.5),
                     fontsize=10, color='white')
 
-            # 4. 정답(Ground Truth) 바운딩 박스 그리기 (녹색)
-            if 'bboxes' in gt_sample.gt_instances:
-                gt_bboxes = gt_sample.gt_instances.bboxes.cpu().numpy()
-                gt_labels = gt_sample.gt_instances.labels.cpu().numpy()
-                for box, label_idx in zip(gt_bboxes, gt_labels):
-                    x1, y1, x2, y2 = box
-                    w, h = x2 - x1, y2 - y1
-                    rect = patches.Rectangle(
-                        (x1, y1), w, h, linewidth=2, edgecolor='g', facecolor='none')
-                    ax.add_patch(rect)
-                    ax.text(
-                        x1, y1 + h + 20,
-                        f'{self.class_names[int(label_idx)]}',
-                        bbox=dict(facecolor='g', alpha=0.5),
-                        fontsize=10, color='white')
+            # # 4. 정답(Ground Truth) 바운딩 박스 그리기 (녹색)
+            # if 'bboxes' in gt_sample.gt_instances:
+            #     gt_bboxes = gt_sample.gt_instances.bboxes.cpu().numpy()
+            #     gt_labels = gt_sample.gt_instances.labels.cpu().numpy()
+            #     for box, label_idx in zip(gt_bboxes, gt_labels):
+            #         x1, y1, x2, y2 = box
+            #         w, h = x2 - x1, y2 - y1
+            #         rect = patches.Rectangle(
+            #             (x1, y1), w, h, linewidth=2, edgecolor='g', facecolor='none')
+            #         ax.add_patch(rect)
+            #         ax.text(
+            #             x1, y1 + h + 20,
+            #             f'{self.class_names[int(label_idx)]}',
+            #             bbox=dict(facecolor='g', alpha=0.5),
+            #             fontsize=10, color='white')
             
             # 5. 이미지 저장 및 종료
             plt.savefig(f'{save_dir}/result_sample_{i}.png', bbox_inches='tight', pad_inches=0)
@@ -744,12 +767,15 @@ class BEVFusion(Base3DDetector):
 
         # 4. 시각화 옵션이 켜져 있으면 결과 그리기
         if visualize and detections_2d is not None:
-            orig_images = batch_inputs_dict['img_original']
-            N, V, C, H, W = orig_images.shape
-            orig_images_reshaped = orig_images.view(N * V, C, H, W)
+            # orig_images = batch_inputs_dict['img_original']
+            aug_images = batch_inputs_dict['imgs']
+            # N, V, C, H, W = orig_images.shape
+            N, V, C, H, W = aug_images.shape
+            # orig_images_reshaped = orig_images.view(N * V, C, H, W)
+            aug_images_reshaped = aug_images.view(N * V, C, H, W)
             
             self.display_2d_results(
-                images=orig_images_reshaped,
+                images=aug_images_reshaped,
                 predictions=detections_2d,
                 ground_truths=reshaped_data_samples
             )
@@ -1065,6 +1091,162 @@ class BEVFusion(Base3DDetector):
         sampled_feat_final = sampled_feat.squeeze(2).permute(0, 2, 1)
 
         return sampled_feat_final
+    
+    def convert_boxes_to_original_scale_FINAL_DEBUG(
+        self,
+        pred_results_list: List[torch.Tensor],
+        data_samples_list: List
+    ) -> List[torch.Tensor]:
+        num_cameras = 6 
+        converted_results = []
+
+        for i, (pred_tensor, data_sample) in enumerate(zip(pred_results_list, data_samples_list)):
+            
+            if pred_tensor.shape[0] == 0:
+                converted_results.append(pred_tensor)
+                continue
+                
+            aug_bboxes = pred_tensor[:, :4].clone()
+
+            if not hasattr(data_sample, 'img_aug_params'):
+                converted_results.append(pred_tensor)
+                continue
+
+            params_list = data_sample.img_aug_params
+            cam_index = i % num_cameras
+            params_dict = params_list[cam_index]
+
+            resize, crop, flip, rotate = params_dict['resize'], params_dict['crop'], params_dict['flip'], params_dict['rotate']
+            fW, fH = params_dict['final_dim']
+            
+            # ==========================================================
+            # ===== 버그를 수정한 올바른 corners 생성 코드입니다. =====
+            # ==========================================================
+            x1, y1, x2, y2 = aug_bboxes.T
+            corners = torch.stack([x1, y1, x2, y1, x2, y2, x1, y2], dim=-1).view(-1, 4, 2)
+
+            # ==================== DEBUG PRINT CODE ====================
+            if flip and pred_tensor.shape[0] > 0:
+                print("\n--- STARTING FINAL DEBUG FOR FLIPPED IMAGE ---")
+                print(f"Params: {params_dict}")
+                print(f"Initial Corners (Corrected):\n{corners[0].cpu().numpy().round(2)}")
+            # ==========================================================
+
+            # Sequential Inverse Transformation
+            if rotate != 0:
+                angle = math.radians(rotate)
+                cos, sin = math.cos(angle), math.sin(angle)
+                cx, cy = (fW - 1) / 2, (fH - 1) / 2
+                R_inv = torch.tensor([[cos, sin], [-sin, cos]], device=corners.device, dtype=torch.float32)
+                corners = (corners - torch.tensor([cx, cy], device=corners.device)) @ R_inv.T + torch.tensor([cx, cy], device=corners.device)
+                if flip and pred_tensor.shape[0] > 0: print(f"After Inverse Rotate:\n{corners[0].cpu().numpy().round(2)}")
+
+            if flip:
+                corners[..., 0] = (fW - 1) - corners[..., 0]
+                if pred_tensor.shape[0] > 0: print(f"After Inverse Flip:\n{corners[0].cpu().numpy().round(2)}")
+
+            corners[..., 0] += crop[0]
+            corners[..., 1] += crop[1]
+            if flip and pred_tensor.shape[0] > 0: print(f"After Inverse Crop:\n{corners[0].cpu().numpy().round(2)}")
+
+            corners /= resize
+            if flip and pred_tensor.shape[0] > 0:
+                print(f"After Inverse Resize (Final Coords):\n{corners[0].cpu().numpy().round(2)}")
+                print("--- ENDING FINAL DEBUG ---")
+
+            min_coords = torch.min(corners, dim=1).values
+            max_coords = torch.max(corners, dim=1).values
+            original_bboxes = torch.cat([min_coords, max_coords], dim=1)
+            
+            new_pred_tensor = pred_tensor.clone()
+            new_pred_tensor[:, :4] = original_bboxes
+            converted_results.append(new_pred_tensor)
+
+        return converted_results
+    
+    def convert_boxes_to_original_scale(
+        self,
+        pred_results_list: List[torch.Tensor],
+        data_samples_list: List
+    ) -> List[torch.Tensor]:
+        """
+        증강된 이미지 좌표계의 BBox를 원본으로 역변환합니다. (최종 버전)
+        너비/높이 변수 할당 오류를 수정하여 모든 변환을 최종적으로 해결합니다.
+        """
+        num_cameras = 6 
+        converted_results = []
+
+        for i, (pred_tensor, data_sample) in enumerate(zip(pred_results_list, data_samples_list)):
+            
+            if pred_tensor.shape[0] == 0:
+                converted_results.append(pred_tensor)
+                continue
+                
+            aug_bboxes = pred_tensor[:, :4].clone()
+
+            if not hasattr(data_sample, 'img_aug_params'):
+                converted_results.append(pred_tensor)
+                continue
+
+            params_list = data_sample.img_aug_params
+            cam_index = i % num_cameras
+            params_dict = params_list[cam_index]
+
+            resize, crop, flip, rotate = params_dict['resize'], params_dict['crop'], params_dict['flip'], params_dict['rotate']
+            
+            # ====================================================================
+            # ===== 여기가 모든 문제의 원인이었던 변수 할당 오류 수정 부분입니다 =====
+            # ====================================================================
+            fH, fW = params_dict['final_dim'] # [Height, Width] 순서로 할당
+            
+            # --- 역변환 행렬 구성 ---
+            M_resize_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+            M_resize_inv[0, 0] = 1 / resize
+            M_resize_inv[1, 1] = 1 / resize
+
+            M_crop_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+            M_crop_inv[0, 2] = crop[0]
+            M_crop_inv[1, 2] = crop[1]
+
+            M_flip_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+            if flip:
+                M_flip_inv[0, 0] = -1
+                M_flip_inv[0, 2] = fW - 1
+
+            M_rotate_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+            if rotate != 0:
+                angle = math.radians(rotate)
+                cos, sin = math.cos(angle), math.sin(angle)
+                cx, cy = (fW - 1) / 2, (fH - 1) / 2
+                
+                T1 = torch.tensor([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+                # 올바른 방향인 시계 방향(Clockwise) 역회전 행렬
+                R_inv = torch.tensor([[cos, sin, 0], [-sin, cos, 0], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+                T2 = torch.tensor([[1, 0, cx], [0, 1, cy], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+                M_rotate_inv = T2 @ R_inv @ T1
+
+            # 최종 역변환 행렬 계산
+            M_total_inv = M_resize_inv @ M_crop_inv @ M_flip_inv @ M_rotate_inv
+
+            # Bounding Box 변환 적용
+            x1, y1, x2, y2 = aug_bboxes.T
+            corners = torch.stack([x1, y1, x2, y1, x2, y2, x1, y2], dim=-1).view(-1, 4, 2)
+            corners_hom = torch.cat([corners, torch.ones(corners.shape[0], 4, 1, device=corners.device)], dim=-1)
+            
+            M_total_inv = M_total_inv.to(corners_hom.dtype)
+            transformed_corners_hom = (M_total_inv @ corners_hom.transpose(1, 2)).transpose(1, 2)
+            
+            transformed_corners = transformed_corners_hom[..., :2] / transformed_corners_hom[..., 2, None]
+            
+            min_coords = torch.min(transformed_corners, dim=1).values
+            max_coords = torch.max(transformed_corners, dim=1).values
+            original_bboxes = torch.cat([min_coords, max_coords], dim=1)
+            
+            new_pred_tensor = pred_tensor.clone()
+            new_pred_tensor[:, :4] = original_bboxes
+            converted_results.append(new_pred_tensor)
+
+        return converted_results
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
              batch_data_samples: List[Det3DDataSample],
@@ -1100,7 +1282,12 @@ class BEVFusion(Base3DDetector):
             visualize=False # 디버깅 시 True, 평소에는 False
         )
 
-        rois , proposla_list = self._generate_rois_from_detections(detections_2d)
+        detections_2d_orig_coords = self.convert_boxes_to_original_scale(
+            pred_results_list=detections_2d,
+            data_samples_list=reshaped_data_samples
+        )
+
+        rois , proposla_list = self._generate_rois_from_detections(detections_2d_orig_coords)
         rois_center = self.get_center_points(rois)
         trimed_center_pts =self.batch_rois_center_by_cam_id(rois_center,batch_size=200)
         cam_ids = trimed_center_pts[..., 0]
@@ -1119,6 +1306,8 @@ class BEVFusion(Base3DDetector):
         # from .imageprocessing_unit import draw_correspondences
         # # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
         # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
+        # # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
+        # self.vis_step_counter += 1
         # for cid in range(12):
         #     # idx = id_to_idx[cid.item()]
         #     # draw_correspondences(
@@ -1126,11 +1315,25 @@ class BEVFusion(Base3DDetector):
         #     #     sbs_img=sbs_img[cid],
         #     #     save_path='correspondence_visualization_gt.jpg'
         #     # )
+        #     bboxes_for_this_view = detections_2d_orig_coords[cid]
         #     draw_correspondences(
-        #         trimed_corrs = pred_corrs[cid][:10,...],  # 첫 번째 배치 선택
+        #         trimed_corrs = pred_corrs[cid][:3,...],  # 첫 번째 배치 선택
         #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
-        #         save_path='correspondence_visualization_pred.jpg'
+        #         save_path='correspondence_visualization_pred.jpg',
+        #         bboxes_to_draw = bboxes_for_this_view, # 원본 좌표계 BBox 전달
+        #         score_thr = 0.4
         #     )
+        #     # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
+        #     save_batch_predictions_to_file(
+        #             batch_inputs_dict=batch_inputs_dict,
+        #             reshaped_data_samples=reshaped_data_samples,
+        #             augmented_preds_list=detections_2d,
+        #             original_preds_list=detections_2d_orig_coords,
+        #             current_step=self.vis_step_counter,
+        #             save_dir='work_dirs/my_exp/vis_results',
+        #             view_index=cid, # 루프 변수 cid를 view_index로 사용
+        #             score_thr=0.4
+        #         )
         #     print ("end")
 
         raw_pred_center_pts = raw_corrs.clone()
@@ -1149,7 +1352,7 @@ class BEVFusion(Base3DDetector):
         if self.with_bbox_head:
             bbox_loss = self.bbox_head.loss(feats, det_xyz_proc, det_feat_proc, batch_data_samples)
 
-        # losses.update(bbox_loss)
+        losses.update(bbox_loss)
 
         return losses
 
