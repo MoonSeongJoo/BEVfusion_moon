@@ -267,8 +267,8 @@ test_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=3,
-    num_workers=12,
+    batch_size=1,
+    num_workers=4,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
@@ -287,7 +287,8 @@ train_dataloader = dict(
             use_valid_flag=True,
             # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
             # and box_type_3d='Depth' in sunrgbd and scannet dataset.
-            box_type_3d='LiDAR')))
+            box_type_3d='LiDAR',
+            filter_empty_gt=True)))
 val_dataloader = dict(
     batch_size=1,
     num_workers=4,

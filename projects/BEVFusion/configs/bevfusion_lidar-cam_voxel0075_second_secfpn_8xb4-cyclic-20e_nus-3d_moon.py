@@ -259,6 +259,8 @@ train_pipeline = [
             'lidar_aug_matrix', 'num_pts_feats',
             'gt_KT','mis_RT','mis_KT','lidar_depth_gt','lidar_depth_mis','matched_uvset',
             'ann_info_2d_per_cam' ,'ann_info_aug_2d_per_cam','img_aug_params',
+            'camera2lidar', 'broken_camera2lidar', 'broken_camera_intrinsics',
+            'gt_delta_rot','gt_delta_trans',
         ])
 ]
 
@@ -322,14 +324,18 @@ test_pipeline = [
             'gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes', 'gt_labels',
         ],
         meta_keys=[
+            # --- ✨ 필수 메타 키 추가 ✨ ---
             'img_shape', 'ori_shape', 'pad_shape', 'scale_factor',
+            # 기존 메타 키들
             'cam2img', 'ori_cam2img', 'lidar2cam', 'lidar2img', 'cam2lidar',
             'ori_lidar2img', 'img_aug_matrix', 'box_type_3d', 'sample_idx',
             'lidar_path', 'img_path', 'transformation_3d_flow', 'pcd_rotation',
             'pcd_scale_factor', 'pcd_trans', 'img_aug_matrix',
             'lidar_aug_matrix', 'num_pts_feats',
             'gt_KT','mis_RT','mis_KT','lidar_depth_gt','lidar_depth_mis','matched_uvset',
-            'ann_info_2d_per_cam'
+            'ann_info_2d_per_cam' ,'ann_info_aug_2d_per_cam','img_aug_params',
+            'camera2lidar', 'broken_camera2lidar', 'broken_camera_intrinsics',
+            'gt_delta_rot','gt_delta_trans',
         ])
 ]
 
@@ -415,7 +421,7 @@ default_hooks = dict(
     # checkpoint=dict(type='CheckpointHook', interval=1),
     checkpoint=dict(
         type='CheckpointHook',
-        interval=1000,      # 1000번의 이터레이션마다 저장
+        interval=500,      # 1000번의 이터레이션마다 저장
         by_epoch=False,
         max_keep_ckpts=3,)     # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
     )

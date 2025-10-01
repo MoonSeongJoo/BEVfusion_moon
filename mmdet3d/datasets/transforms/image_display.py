@@ -1123,3 +1123,24 @@ def direction_aware_bilateral_filter(Pts, n, m, grid):
     
     return output_depth
 
+def rotation_matrix_to_axis_angle(R: torch.Tensor) -> torch.Tensor:
+    """
+    3x3 회전 행렬을 axis-angle 벡터로 변환합니다.
+    """
+    # 클램프를 사용하여 acos의 입력 범위를 [-1, 1]로 제한
+    trace = torch.clamp(R.trace(), -1.0, 3.0)
+    angle = torch.acos((trace - 1.0) / 2.0)
+    
+    # 각도가 0에 가까우면 (단위 행렬) 축은 의미 없으므로 영벡터 반환
+    if angle < 1e-6:
+        return torch.zeros(3, device=R.device, dtype=R.dtype)
+    
+    # 축 계산
+    axis_x = R[2, 1] - R[1, 2]
+    axis_y = R[0, 2] - R[2, 0]
+    axis_z = R[1, 0] - R[0, 1]
+    
+    axis = torch.tensor([axis_x, axis_y, axis_z], device=R.device, dtype=R.dtype)
+    axis = axis / (2.0 * torch.sin(angle))
+    
+    return angle * axis

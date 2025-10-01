@@ -5318,3 +5318,46 @@ def save_batch_predictions_to_file(
         save_path=save_path,
         score_thr=score_thr
     )
+
+def axis_angle_to_rotation_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
+    """
+    하나 이상의 축-각 벡터를 3x3 회전 행렬로 변환합니다.
+
+    Args:
+        axis_angle (torch.Tensor): 변환할 축-각 벡터. 
+                                  Shape: (..., 3), 여기서 ...는 배치 차원을 의미.
+
+    Returns:
+        torch.Tensor: 변환된 회전 행렬. Shape: (..., 3, 3).
+    """
+    # 1. 각도(theta)와 단위 회전축(axis) 분리
+    # 벡터의 크기(norm)가 회전 각도(radian)
+    angle = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
+    
+    # 수치적 안정성을 위해 작은 epsilon 추가
+    # 각도가 0에 가까우면 axis는 어떤 방향이든 상관없음
+    axis = F.normalize(axis_angle, dim=-1)
+
+    # 2. 로드리게스 공식을 위한 준비
+    # 단위 회전축 벡터로 skew-symmetric cross-product 행렬 K 생성
+    K = torch.zeros(*axis.shape[:-1], 3, 3, device=axis.device, dtype=axis.dtype)
+    K[..., 0, 1] = -axis[..., 2]
+    K[..., 0, 2] =  axis[..., 1]
+    K[..., 1, 0] =  axis[..., 2]
+    K[..., 1, 2] = -axis[..., 0]
+    K[..., 2, 0] = -axis[..., 1]
+    K[..., 2, 1] =  axis[..., 0]
+
+    # 단위 행렬 I 생성
+    I = torch.eye(3, device=axis.device, dtype=axis.dtype).expand_as(K)
+    
+    # cos(theta)와 sin(theta) 계산
+    # (..., 1) -> (..., 1, 1) 형태로 브로드캐스팅 준비
+    cos_angle = torch.cos(angle).unsqueeze(-1)
+    sin_angle = torch.sin(angle).unsqueeze(-1)
+
+    # 3. 로드리게스 회전 공식 적용
+    # R = I + sin(θ)K + (1 - cos(θ))K^2
+    rotation_matrix = I + sin_angle * K + (1 - cos_angle) * torch.matmul(K, K)
+    
+    return rotation_matrix

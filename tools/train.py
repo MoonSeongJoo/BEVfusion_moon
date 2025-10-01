@@ -14,6 +14,7 @@ from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet3d.utils import replace_ceph_backend
+torch.autograd.set_detect_anomaly(True)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a 3D detector')

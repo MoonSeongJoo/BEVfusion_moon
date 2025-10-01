@@ -292,8 +292,22 @@ class BaseDepthTransform(BaseViewTransform):
             cur_coords += cur_lidar2image[:, :3, 3].reshape(-1, 3, 1)
             # get 2d coords
             dist = cur_coords[:, 2, :]
-            cur_coords[:, 2, :] = torch.clamp(cur_coords[:, 2, :], 1e-5, 1e5)
-            cur_coords[:, :2, :] /= cur_coords[:, 2:3, :]
+            # 수정 전 (In-place 연산산)
+            # cur_coords[:, 2, :] = torch.clamp(cur_coords[:, 2, :], 1e-5, 1e5)
+            # cur_coords[:, :2, :] /= cur_coords[:, 2:3, :]
+            
+            # 수정 후 (새로운 텐서를 조립하는 방식)
+            # 1. 계산에 필요한 부분을 새로운 변수로 분리합니다.
+            uv_coords = cur_coords[:, :2, :]
+            z_coords = cur_coords[:, 2:3, :] # 차원 유지를 위해 [2:3] 사용
+
+            # 2. 각 부분에 필요한 연산을 'out-of-place' 방식으로 수행합니다.
+            #    (결과를 새로운 변수에 저장)
+            clamped_z = torch.clamp(z_coords, min=1e-5, max=1e5)
+            final_uv = uv_coords / clamped_z  # 일반 나눗셈 연산
+
+            # 3. 최종 계산된 부분들을 torch.cat으로 합쳐 완전히 새로운 cur_coords를 생성합니다.
+            cur_coords = torch.cat([final_uv, clamped_z], dim=1)
 
             # imgaug
             cur_coords = cur_img_aug_matrix[:, :3, :3].matmul(cur_coords)

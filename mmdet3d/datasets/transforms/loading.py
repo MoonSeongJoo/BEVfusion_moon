@@ -15,6 +15,7 @@ from mmdet3d.structures.bbox_3d import get_box_type
 from mmdet3d.structures.points import BasePoints, get_points_type
 from mmdet3d.structures import LiDARPoints 
 
+import cv2
 import torch
 import matplotlib.pyplot as plt
 from .image_display import (points2depthmap_cpu,points2depthmap_gpu,
@@ -24,6 +25,7 @@ from .image_display import (points2depthmap_cpu,points2depthmap_gpu,
                                                              colormap,preprocess_points,edge_aware_bilateral_filter,
                                                              visualize_depth_maps,trim_corrs,find_exact_correspondences,
                                                              enhanced_geometric_propagation,direction_aware_completion,direction_aware_bilateral_filter,
+                                                             rotation_matrix_to_axis_angle,
                                                              )
 
 
@@ -1415,6 +1417,12 @@ class PointToMultiViewDepth(object):
         list_gt_KT ,list_mis_RT ,list_mis_KT = [] ,[] ,[]
         matched_uvset_list = []
         
+        list_original_cam2lidar = []
+        list_broken_cam2lidar = []
+        list_gt_delta_rot = []
+        list_gt_delta_trans = []
+        list_broken_cam_intrinsics = []
+        
         # raw_points_lidar= results['points_original']
         points_lidar = results['points_original'].tensor[:, :4].clone().to(dtype=torch.float32)
         
@@ -1426,13 +1434,36 @@ class PointToMultiViewDepth(object):
             lidar2img = torch.from_numpy(results['lidar2img'][cid]).to(dtype=torch.float32)
             lidar2cam = torch.from_numpy(results['lidar2cam'][cid]).to(dtype=torch.float32)
             cam2img = torch.from_numpy(results['cam2img'][cid]).to(dtype=torch.float32)
-            
+
+            try:
+                # 1. torch.linalg.inv()를 사용하여 역행렬을 직접 계산
+                original_camera2lidar = torch.linalg.inv(lidar2cam)
+            except torch.linalg.LinAlgError:
+                # 역행렬 계산이 불가능한 경우 단위 행렬로 대체
+                original_camera2lidar = torch.eye(4, dtype=torch.float32, device=lidar2cam.device)
+
             img_height, img_width, _ = raw_img_np.shape
 
             points2img = add_calibration(lidar2img,points_lidar)
             miscalibrated_points2img ,perturbed_points, extrinsic_perturb, lidar2img_original ,lidar2img_mis = add_mis_calibration_adv(
                                                                                     lidar2img,lidar2cam,cam2img, points_lidar, max_r=2.0,max_t=0.5)
             
+            # --- ✨ CORRECTED LOGIC V2: 올바른 행렬 곱셈 적용 ---
+            # 1. 'broken_camera2lidar' 계산
+            # ❗️ CRITICAL CHANGE: Perturbation의 '역행렬'을 구합니다.
+            try:
+                extrinsic_perturb_inv = torch.linalg.inv(extrinsic_perturb)
+            except torch.linalg.LinAlgError:
+                extrinsic_perturb_inv = torch.eye(4, dtype=torch.float32, device=extrinsic_perturb.device)
+
+            # ❗️ CRITICAL CHANGE: T_c2l_broken = inv(T_perturb) @ T_c2l
+            broken_camera2lidar = extrinsic_perturb_inv @ original_camera2lidar
+            
+            # 2. 'gt_delta_trans' 와 'gt_delta_rot' 추출 (이전과 동일)
+            gt_delta_trans = extrinsic_perturb[:3, 3]
+            R_perturb = extrinsic_perturb[:3, :3]
+            gt_delta_rot = rotation_matrix_to_axis_angle(R_perturb)
+
             depth_gt, gt_uv,gt_z, valid_indices_gt,original_gt_idx= points2depthmap_gpu(points2img, img_height ,img_width,self.grid_config,downsample=1)
             # lidarOnImage_gt = torch.cat((gt_uv, gt_z.unsqueeze(1)), dim=1)
             # pts = lidarOnImage_gt.T
@@ -1458,6 +1489,11 @@ class PointToMultiViewDepth(object):
             lidar_depth_map_mis.append(depth_mis)
             lidar_depth_map_gt.append(depth_gt)
             matched_uvset_list.append(trim_matched_uv_set)
+            list_original_cam2lidar.append(original_camera2lidar)
+            list_broken_cam2lidar.append(broken_camera2lidar)
+            list_gt_delta_rot.append(gt_delta_rot)
+            list_gt_delta_trans.append(gt_delta_trans)
+            list_broken_cam_intrinsics.append(cam2img)
 
             # ###### input display ######
             # # img_np = raw_img_np
@@ -1505,7 +1541,87 @@ class PointToMultiViewDepth(object):
             # plt.savefig('load_pipeline.jpg', dpi=300, bbox_inches='tight')
             # plt.close()
             # print ("end of print")
+
+            # PointToMultiViewDepth의 for 루프 마지막 부분에 추가
+
+            # # --- ✨ ADDED & REFINED: 시각적 검증 ---
+            # # 검증을 위해 첫 번째 데이터 샘플의 첫 번째 카메라(cid=0)만 시각화
+            # if cid == 0 and 'img_original' in results and len(results['img_original']) > 0:
+
+            #     # --- 1. 원본 이미지 준비 (타입 및 색상 채널 자동 처리) ---
+            #     vis_img = results['img_original'][cid].copy()
+                
+            #     # Matplotlib은 RGB 순서를 기대하므로, BGR일 경우 변환
+            #     if vis_img.shape[2] == 3 and results.get('img_bgr2rgb', True): # 파이프라인에서 BGR->RGB 변환 여부 확인
+            #         vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
+
+            #     # float 타입 이미지가 0-255 범위일 경우 0-1로 정규화
+            #     if vis_img.dtype == np.float32 or vis_img.dtype == np.float64:
+            #         if vis_img.max() > 1.0:
+            #             vis_img = vis_img / 255.0
+                
+            #     h, w, _ = vis_img.shape
+                
+            #     # --- 2. GT 포인트 투영 (깊이 기반 색상) ---
+            #     points_gt = (list_gt_KT[cid] @ points_lidar.T).T
+            #     points_gt[:, :2] /= points_gt[:, 2:3]
+            #     in_bounds_gt = (points_gt[:, 0] >= 0) & (points_gt[:, 0] < w) & \
+            #                 (points_gt[:, 1] >= 0) & (points_gt[:, 1] < h) & (points_gt[:, 2] > 0)
+            #     points_gt_vis = points_gt[in_bounds_gt].cpu().numpy()
+
+            #     # --- 3. Broken 포인트 투영 (깊이 기반 색상) ---
+            #     points_mis = (list_mis_KT[cid] @ points_lidar.T).T
+            #     points_mis[:, :2] /= points_mis[:, 2:3]
+            #     in_bounds_mis = (points_mis[:, 0] >= 0) & (points_mis[:, 0] < w) & \
+            #                     (points_mis[:, 1] >= 0) & (points_mis[:, 1] < h) & (points_mis[:, 2] > 0)
+            #     points_mis_vis = points_mis[in_bounds_mis].cpu().numpy()
+                
+            #     # --- 4. 시각화 (두 이미지를 나란히 비교) ---
+            #     fig, axes = plt.subplots(1, 2, figsize=(32, 9))
+            #     fig.tight_layout()
+
+            #     # 왼쪽: Ground Truth 투영
+            #     axes[0].imshow(vis_img)
+            #     scatter1 = axes[0].scatter(points_gt_vis[:, 0], points_gt_vis[:, 1], 
+            #                             c=points_gt_vis[:, 2], cmap='viridis', s=1, alpha=0.7)
+            #     axes[0].set_title("Ground Truth Projection (Colored by Depth)")
+            #     axes[0].axis('off')
+            #     cbar1 = fig.colorbar(scatter1, ax=axes[0], orientation='vertical', label='Depth (meters)')
+
+            #     # 오른쪽: Mis-calibrated 투영
+            #     axes[1].imshow(vis_img)
+            #     scatter2 = axes[1].scatter(points_mis_vis[:, 0], points_mis_vis[:, 1], 
+            #                             c=points_mis_vis[:, 2], cmap='viridis', s=1, alpha=0.7)
+            #     axes[1].set_title("Mis-calibrated Projection (Colored by Depth)")
+            #     axes[1].axis('off')
+            #     cbar2 = fig.colorbar(scatter2, ax=axes[1], orientation='vertical', label='Depth (meters)')
+
+            #     plt.savefig("verification_projection_comparison.jpg", dpi=150, bbox_inches='tight')
+            #     plt.close()
+            #     print("✅ Visual verification image saved to verification_projection_comparison.jpg")
         
+        # # --- 5. ✨ CORRECTED: Sanity Check 로직 수정 ---
+        # stacked_original_c2l = torch.stack(list_original_cam2lidar)
+        # stacked_broken_c2l = torch.stack(list_broken_cam2lidar)
+        # stacked_perturb_RT = torch.stack(list_mis_RT)
+
+        # # ❗️ CRITICAL CHANGE: 검증 공식 변경
+        # # T_c2l_broken = inv(T_perturb) @ T_c2l 이므로,
+        # # T_perturb @ T_c2l_broken = T_c2l 이 성립해야 합니다.
+        # restored_c2l = stacked_perturb_RT @ stacked_broken_c2l
+
+        # is_verified = torch.allclose(stacked_original_c2l, restored_c2l, atol=1e-6)
+        
+        # if is_verified:
+        #     print("✅ Sanity Check Passed: perturb @ broken_c2l == original_c2l")
+        # else:
+        #     print("❌ Sanity Check Failed!")
+        #     print("Original:\n", stacked_original_c2l[0])
+        #     print("Broken:\n", stacked_broken_c2l[0])
+        #     print("Perturb:\n", stacked_perturb_RT[0])
+        #     print("Restored (Perturb @ Broken):\n", restored_c2l[0])
+        # ########## sanity check end ###########
+
         last_feature_from_original = results['points_original'].tensor[:, 4].unsqueeze(1)
         perturbed_points_full = torch.cat([perturbed_points, last_feature_from_original], dim=1)
 
@@ -1518,5 +1634,12 @@ class PointToMultiViewDepth(object):
         results['matched_uvset'] = torch.stack(matched_uvset_list)
         # results['perturbed_points'] = trim_corrs(perturbed_points)
         results['perturbed_points'] = perturbed_points_full
+
+        # ✨ MODIFIED: loss 함수 및 다른 모듈에서 사용할 변수들을 최종적으로 results에 추가
+        results['camera2lidar'] = torch.stack(list_original_cam2lidar)
+        results['broken_camera2lidar'] = torch.stack(list_broken_cam2lidar)
+        results['broken_camera_intrinsics'] = torch.stack(list_broken_cam_intrinsics)
+        results['gt_delta_rot'] = torch.stack(list_gt_delta_rot)
+        results['gt_delta_trans'] = torch.stack(list_gt_delta_trans)
         
         return results

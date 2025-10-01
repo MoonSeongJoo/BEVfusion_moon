@@ -21,7 +21,8 @@ from .ops import Voxelization
 from .imageprocessing_unit import (dense_map_from_depth_batch_v2, 
                                    batch_colormap,two_images_side_by_side_gpu,
                                    display_depth_maps,
-                                   save_batch_predictions_to_file
+                                   save_batch_predictions_to_file,
+                                   axis_angle_to_rotation_matrix,
                                    )
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -29,6 +30,46 @@ import torch
 import os
 import math
 
+class CalibrationCorrectionHead(nn.Module):
+    """
+    특징 맵을 입력받아 6-DoF 보정 파라미터를 예측하는 헤드.
+
+    Args:
+        in_channels (int): 입력 특징 맵의 채널 수.
+        hidden_dim (int): MLP의 중간층 차원.
+        out_dim (int): 출력 차원. 기본값은 6 (rot 3 + trans 3).
+    """
+    def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
+        super().__init__()
+        
+        # 1. 공간 차원(H, W)을 없애고 채널 정보만 남기기 위한 풀링 레이어
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        
+        # 2. 풀링된 특징 벡터를 최종 6-DoF 값으로 매핑하는 MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): 입력 특징 맵 (B*N, C, H, W)
+        
+        Returns:
+            torch.Tensor: 예측된 6-DoF 파라미터 (B*N, 6)
+        """
+        # (B*N, C, H, W) -> (B*N, C, 1, 1)
+        x = self.pool(x)
+        
+        # (B*N, C, 1, 1) -> (B*N, C)
+        x = torch.flatten(x, 1)
+        
+        # (B*N, C) -> (B*N, 6)
+        pred_delta_6dof = self.mlp(x)
+        
+        return pred_delta_6dof
 
 @MODELS.register_module()
 class BEVFusion(Base3DDetector):
@@ -97,6 +138,8 @@ class BEVFusion(Base3DDetector):
         hidden_channel = bbox_head['hidden_channel'] # (128) 출력 차원은 TransFusionHead의 hidden_channel과 반드시 일치해야 합니다.
         self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
 
+        self.calib_head = CalibrationCorrectionHead(in_channels=312) 
+
         # =====================================================================
         # ✨ START: Code added for selective module freezing
         # =====================================================================
@@ -111,6 +154,7 @@ class BEVFusion(Base3DDetector):
         # =====================================================================
 
         self.vis_step_counter = 0
+        self.training_step = 0
     
     def _freeze_modules(self):
             """
@@ -236,48 +280,46 @@ class BEVFusion(Base3DDetector):
         """bool: Whether the detector has a segmentation head.
         """
         return hasattr(self, 'seg_head') and self.seg_head is not None
-   
+    
     def extract_img_feat(
         self,
-        x,
-        points,
-        lidar2image,
-        camera_intrinsics,
-        camera2lidar,
-        img_aug_matrix,
-        lidar_aug_matrix,
-        img_metas,
-    ) -> tuple[torch.Tensor, tuple]: # 반환 타입 힌트 수정
-        B, N, C, H, W = x.size()
-        x_reshaped_4d = x.view(B * N, C, H, W).contiguous()
+        # ✨ MODIFIED: 입력이 이제 Neck의 출력이므로 이름을 x_neck으로 변경
+        x_neck: tuple,
+        points: List[torch.Tensor],
+        lidar2image: torch.Tensor,
+        camera_intrinsics: torch.Tensor,
+        camera2lidar: torch.Tensor,
+        img_aug_matrix: torch.Tensor,
+        lidar_aug_matrix: torch.Tensor,
+        img_metas: List[Dict],
+    ) -> Tuple[torch.Tensor, tuple]:
+        """
+        이미지 넥(Neck) 특징과 Calibration 정보를 받아 View Transform을 거쳐 
+        BEV 특징과 5D 이미지 특징을 생성합니다.
+        """
+        # --- ❗️ REMOVED: Neck 중복 계산 로직 삭제 ---
+        # x_neck_tuple_4d = self.img_neck(x_backbone)
+        # 이제 x_neck이 바로 입력으로 들어옵니다.
+        x_neck_tuple_4d = x_neck
 
-        x_backbone = self.img_backbone(x_reshaped_4d)
-        
-        # 1. img_neck의 출력(튜플)을 별도의 변수에 저장합니다.
-        x_neck_tuple_4d = self.img_neck(x_backbone)
-
-        # --- ✨ 2D 헤드용 img_feature를 생성하는 새로운 로직 시작 ---
-        # 이 로직은 기존 x의 흐름에 영향을 주지 않습니다.
+        # --- 2. 2D Head용 특징 재구성 (기존과 동일) ---
+        B, N = len(img_metas), len(img_metas[0]['cam2img'])
         img_feature_tuple_5d = []
         for feat_4d in x_neck_tuple_4d:
-            # 각 4D 피처 (B*N, C, H, W)를 5D (B, N, C, H, W)로 변환
             _BN, C_feat, H_feat, W_feat = feat_4d.size()
             feat_5d = feat_4d.view(B, N, C_feat, H_feat, W_feat)
             img_feature_tuple_5d.append(feat_5d)
         img_feature_tuple_5d = tuple(img_feature_tuple_5d)
-        # --- 새로운 로직 끝 ---
 
-        # --- 아래는 view_transform의 입력을 만들기 위한 기존 로직 (그대로 유지) ---
-        x_for_bev = x_neck_tuple_4d
-        if not isinstance(x_for_bev, torch.Tensor):
-            x_for_bev = x_for_bev[0]
-
+        # --- 3. View Transform용 특징 선택 (기존과 동일) ---
+        x_for_bev = x_neck_tuple_4d[0]
         BN, C_bev, H_bev, W_bev = x_for_bev.size()
-        x_for_bev_5d = x_for_bev.view(B, int(BN / B), C_bev, H_bev, W_bev)
+        x_for_bev_5d = x_for_bev.view(B, N, C_bev, H_bev, W_bev)
 
+        # --- 4. View Transform 수행 (기존과 동일) ---
         with torch.autocast(device_type='cuda', dtype=torch.float32):
             bev_feature = self.view_transform(
-                x_for_bev_5d, # 기존과 동일한 단일 5D 텐서 전달
+                x_for_bev_5d,
                 points,
                 lidar2image,
                 camera_intrinsics,
@@ -286,10 +328,64 @@ class BEVFusion(Base3DDetector):
                 lidar_aug_matrix,
                 img_metas,
             )
-        # --- 기존 로직 끝 ---
         
-        # 최종적으로 BEV 피처와, 2D 헤드용으로 새롭게 가공된 이미지 피처 튜플을 반환
-        return bev_feature, img_feature_tuple_5d
+        # --- 5. ✨ MODIFIED: 반환값 수정 ---
+        # Docstring에 명시된 대로 BEV 특징과 5D 이미지 특징 튜플을 모두 반환합니다.
+        return bev_feature
+   
+    # def extract_img_feat(
+    #     self,
+    #     x,
+    #     points,
+    #     lidar2image,
+    #     camera_intrinsics,
+    #     camera2lidar,
+    #     img_aug_matrix,
+    #     lidar_aug_matrix,
+    #     img_metas,
+    # ) -> tuple[torch.Tensor, tuple]: # 반환 타입 힌트 수정
+    #     B, N, C, H, W = x.size()
+    #     x_reshaped_4d = x.view(B * N, C, H, W).contiguous()
+
+    #     x_backbone = self.img_backbone(x_reshaped_4d)
+        
+    #     # 1. img_neck의 출력(튜플)을 별도의 변수에 저장합니다.
+    #     x_neck_tuple_4d = self.img_neck(x_backbone)
+
+    #     # --- ✨ 2D 헤드용 img_feature를 생성하는 새로운 로직 시작 ---
+    #     # 이 로직은 기존 x의 흐름에 영향을 주지 않습니다.
+    #     img_feature_tuple_5d = []
+    #     for feat_4d in x_neck_tuple_4d:
+    #         # 각 4D 피처 (B*N, C, H, W)를 5D (B, N, C, H, W)로 변환
+    #         _BN, C_feat, H_feat, W_feat = feat_4d.size()
+    #         feat_5d = feat_4d.view(B, N, C_feat, H_feat, W_feat)
+    #         img_feature_tuple_5d.append(feat_5d)
+    #     img_feature_tuple_5d = tuple(img_feature_tuple_5d)
+    #     # --- 새로운 로직 끝 ---
+
+    #     # --- 아래는 view_transform의 입력을 만들기 위한 기존 로직 (그대로 유지) ---
+    #     x_for_bev = x_neck_tuple_4d
+    #     if not isinstance(x_for_bev, torch.Tensor):
+    #         x_for_bev = x_for_bev[0]
+
+    #     BN, C_bev, H_bev, W_bev = x_for_bev.size()
+    #     x_for_bev_5d = x_for_bev.view(B, int(BN / B), C_bev, H_bev, W_bev)
+
+    #     with torch.autocast(device_type='cuda', dtype=torch.float32):
+    #         bev_feature = self.view_transform(
+    #             x_for_bev_5d, # 기존과 동일한 단일 5D 텐서 전달
+    #             points,
+    #             lidar2image,
+    #             camera_intrinsics,
+    #             camera2lidar,
+    #             img_aug_matrix,
+    #             lidar_aug_matrix,
+    #             img_metas,
+    #         )
+    #     # --- 기존 로직 끝 ---
+        
+    #     # 최종적으로 BEV 피처와, 2D 헤드용으로 새롭게 가공된 이미지 피처 튜플을 반환
+    #     return bev_feature, img_feature_tuple_5d
     
     def extract_pts_feat(self, batch_inputs_dict) -> torch.Tensor:
         points = batch_inputs_dict['points']
@@ -364,111 +460,144 @@ class BEVFusion(Base3DDetector):
     #     res = self.add_pred_to_datasample(batch_data_samples, outputs)
 
     #     return res
-
-    def predict(self, batch_inputs_dict: Dict[str, Tensor],
-                batch_data_samples: List[Det3DDataSample],
-                **kwargs) -> List[Det3DDataSample]:
-        """
-        Args:
-            batch_inputs_dict (dict): The model input dict which contains
-                `points`, `img` keys.
-            batch_data_samples (List[Det3DDataSample]): The Data
-                Samples. It usually includes information such as
-                `gt_instance_3d`, `gt_panoptic_seg_3d` and `gt_sem_seg_3d`.
-
-        Returns:
-            list[Det3DDataSample]: Detection results of the
-            input images. Each Det3DDataSample usually contains
-            'pred_instances_3d'.
-        """
-        batch_input_metas = [item.metainfo for item in batch_data_samples]
-        
-        # 1. loss 메서드와 동일하게 모든 특징과 proposal을 생성합니다.
-        feats, img_feats, lidar2imag, _, _ = self.extract_feat(
-            batch_inputs_dict, batch_input_metas)
-        sbs_img, _, dense_depth_map = self.extract_sbs_img(
-            batch_inputs_dict, batch_input_metas, visualize=False)
-        reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
-            img_feats, batch_data_samples)
-        detections_2d = self._generate_and_process_2d_dets(
-            reshaped_img_feats, reshaped_data_samples, batch_inputs_dict, visualize=False)
-        rois, _ = self._generate_rois_from_detections(detections_2d)
-        rois_center = self.get_center_points(rois)
-        trimed_center_pts = self.batch_rois_center_by_cam_id(rois_center, batch_size=200)
-        query_input = trimed_center_pts[..., 2:].clone()
-        # ... (query_input 정규화 로직) ...
-        query_input[..., 0] /= 1600
-        query_input[..., 1] /= 900
-        query_input[:,:,0] = query_input[:,:,0]/2
-        
-        B, N, C, H, W = sbs_img.shape
-        raw_corrs, _, _, enc_out = self.corr(sbs_img.view(B*N, C, H, W), query_input)
-        # ... (det_xyz, det_feat_sampled, projected_feat 생성 로직) ...
-        raw_pred_center_pts = raw_corrs.clone()
-        raw_pred_center_pts[..., 0] = (raw_pred_center_pts[..., 0] - 0.5) * 2
-        raw_pred_center_pts[..., 0] *= 1600
-        raw_pred_center_pts[..., 1] *= 900
-        esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map, enc_out)
-        esitmated_uvz = torch.cat([raw_pred_center_pts, esitmated_z['depth']], dim=-1)
-        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, lidar2imag)
-        det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
-        det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(
-            det_xyz, det_feat_sampled, B=B, N_cam=N)
-
-        # 2. 이제 헤드의 predict 메서드에 모든 인자를 전달합니다.
-        results_list_3d = self.bbox_head.predict(
-            feats, det_xyz_proc, det_feat_proc, batch_input_metas)
-
-        # 예측 결과(results_list_3d)를 원본 데이터 샘플(batch_data_samples)에 합쳐줍니다.
-        results = self.add_pred_to_datasample(batch_data_samples,
-                                              results_list_3d)
-        return results
-
+    
     def extract_feat(
         self,
-        batch_inputs_dict,
-        batch_input_metas,
-        **kwargs,
-    ):
-        imgs = batch_inputs_dict.get('imgs', None)
-        points = batch_inputs_dict.get('points', None)
-        features = []
-        if imgs is not None:
-            imgs = imgs.contiguous()
+        batch_inputs_dict: Dict[str, torch.Tensor],
+        batch_input_metas: List[Dict],
+        # ✨ 보정된 Calibration 딕셔너리를 선택적으로 받음
+        corrected_calib: Optional[Dict[str, torch.Tensor]] = None,
+        # ✨ 미리 계산된 이미지 백본 특징을 선택적으로 받음
+        precomputed_img_feats: Optional[tuple] = None
+    ) -> tuple:
+        """
+        이미지와 포인트 클라우드 특징을 추출하고 융합합니다.
+
+        Args:
+            batch_inputs_dict (Dict): 'imgs', 'points' 등을 포함하는 입력 데이터 딕셔너리.
+            batch_input_metas (List[Dict]): 데이터 샘플의 메타 정보 리스트.
+            corrected_calib (Optional[Dict]): 온라인으로 보정된 Calibration 파라미터.
+                제공되면 이 값을 우선적으로 사용하여 융합을 수행합니다.
+            precomputed_img_feats (Optional[tuple]): 미리 계산된 이미지 백본 특징.
+                제공되면 이미지 백본 계산을 건너뛰어 효율성을 높입니다.
+
+        Returns:
+            tuple: 최종 3D 특징, 원본 이미지 특징, 그리고 융합에 사용된 
+                lidar2image, camera_intrinsics, camera2lidar 행렬들을 반환합니다.
+        """
+        imgs = batch_inputs_dict.get('imgs')
+        points = batch_inputs_dict.get('points')
+
+        # --- 1. 융합에 사용할 Calibration 파라미터 결정 ---
+        if corrected_calib is not None:
+            # 'corrected_calib'가 제공되면 (학습 시), 보정된 값을 사용합니다.
+            lidar2image = corrected_calib['lidar2img']
+            camera_intrinsics = corrected_calib.get('cam2img')
+            camera2lidar = corrected_calib['cam2lidar']
+        else:
+            # 제공되지 않으면 (추론 시), 기존 방식대로 metas에서 값을 로드합니다.
             lidar2image, camera_intrinsics, camera2lidar = [], [], []
-            img_aug_matrix, lidar_aug_matrix = [], []
-            for i, meta in enumerate(batch_input_metas):
+            for meta in batch_input_metas:
                 lidar2image.append(meta['lidar2img'])
                 camera_intrinsics.append(meta['cam2img'])
                 camera2lidar.append(meta['cam2lidar'])
-                img_aug_matrix.append(meta.get('img_aug_matrix', np.eye(4)))
-                lidar_aug_matrix.append(
-                    meta.get('lidar_aug_matrix', np.eye(4)))
-
+            
             lidar2image = imgs.new_tensor(np.asarray(lidar2image))
             camera_intrinsics = imgs.new_tensor(np.array(camera_intrinsics))
             camera2lidar = imgs.new_tensor(np.asarray(camera2lidar))
-            img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
-            lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
-            img_feature ,raw_img_feature = self.extract_img_feat(imgs, deepcopy(points),
-                                                lidar2image, camera_intrinsics,
-                                                camera2lidar, img_aug_matrix,
-                                                lidar_aug_matrix,
-                                                batch_input_metas)
-            features.append(img_feature)
-        pts_feature = self.extract_pts_feat(batch_inputs_dict)
-        features.append(pts_feature)
 
+        # Augmentation 행렬은 Calibration과 별개로 항상 metas에서 로드합니다.
+        img_aug_matrix, lidar_aug_matrix = [], []
+        for meta in batch_input_metas:
+            img_aug_matrix.append(meta.get('img_aug_matrix', np.eye(4)))
+            lidar_aug_matrix.append(meta.get('lidar_aug_matrix', np.eye(4)))
+        img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
+        lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
+
+        # --- 2. 각 센서의 특징 추출 ---
+        # 이미지 특징 추출: 미리 계산된 값이 있으면 사용하고, 없으면 새로 계산합니다.
+        if precomputed_img_feats is None:
+            # loss 함수에서 미리 계산하지 않은 경우 (예: 독립적인 추론)
+            img_feats_from_backbone = self.img_backbone(batch_inputs_dict)
+        else:
+            # loss 함수에서 전달받은 값을 사용 (중복 계산 방지)
+            img_feats_from_backbone = precomputed_img_feats
+
+        # ✨ '올바른' Calibration과 미리 계산된 이미지 특징을 extract_img_feat에 전달
+        img_bev_feature = self.extract_img_feat(
+            img_feats_from_backbone,  # 원본 이미지 대신 백본 특징 전달
+            deepcopy(points),
+            lidar2image, 
+            camera_intrinsics,
+            camera2lidar, 
+            img_aug_matrix,
+            lidar_aug_matrix,
+            batch_input_metas
+        )
+        
+        # 포인트 클라우드 특징 추출 (카메라와 무관)
+        pts_feature = self.extract_pts_feat(batch_inputs_dict)
+        
+        # --- 3. 특징 융합 및 3D 후처리 ---
+        features = [img_bev_feature, pts_feature]
+        
         if self.fusion_layer is not None:
             x = self.fusion_layer(features)
         else:
-            assert len(features) == 1, features
-            x = features[0]
+            # 기본 융합: BEV 특징을 기본으로 사용
+            x = features[0] 
 
         x = self.pts_backbone(x)
         x = self.pts_neck(x)
 
-        return x, raw_img_feature,lidar2image, camera_intrinsics, camera2lidar
+        # --- 4. 결과 반환 ---
+        return x
+
+    # def extract_feat(
+    #     self,
+    #     batch_inputs_dict,
+    #     batch_input_metas,
+    #     **kwargs,
+    # ):
+    #     imgs = batch_inputs_dict.get('imgs', None)
+    #     points = batch_inputs_dict.get('points', None)
+    #     features = []
+    #     if imgs is not None:
+    #         imgs = imgs.contiguous()
+    #         lidar2image, camera_intrinsics, camera2lidar = [], [], []
+    #         img_aug_matrix, lidar_aug_matrix = [], []
+    #         for i, meta in enumerate(batch_input_metas):
+    #             lidar2image.append(meta['lidar2img'])
+    #             camera_intrinsics.append(meta['cam2img'])
+    #             camera2lidar.append(meta['cam2lidar'])
+    #             img_aug_matrix.append(meta.get('img_aug_matrix', np.eye(4)))
+    #             lidar_aug_matrix.append(
+    #                 meta.get('lidar_aug_matrix', np.eye(4)))
+
+    #         lidar2image = imgs.new_tensor(np.asarray(lidar2image))
+    #         camera_intrinsics = imgs.new_tensor(np.array(camera_intrinsics))
+    #         camera2lidar = imgs.new_tensor(np.asarray(camera2lidar))
+    #         img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
+    #         lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
+    #         img_feature ,raw_img_feature = self.extract_img_feat(imgs, deepcopy(points),
+    #                                             lidar2image, camera_intrinsics,
+    #                                             camera2lidar, img_aug_matrix,
+    #                                             lidar_aug_matrix,
+    #                                             batch_input_metas)
+    #         features.append(img_feature)
+    #     pts_feature = self.extract_pts_feat(batch_inputs_dict)
+    #     features.append(pts_feature)
+
+    #     if self.fusion_layer is not None:
+    #         x = self.fusion_layer(features)
+    #     else:
+    #         assert len(features) == 1, features
+    #         x = features[0]
+
+    #     x = self.pts_backbone(x)
+    #     x = self.pts_neck(x)
+
+    #     return x, raw_img_feature,lidar2image, camera_intrinsics, camera2lidar
     
     def extract_sbs_img(
         self,
@@ -534,61 +663,129 @@ class BEVFusion(Base3DDetector):
         
         return bbox_overlaps(bboxes1_coords, bboxes2_coords)
 
+    # def _prepare_2d_head_inputs(
+    #     self,
+    #     img_feats: tuple,
+    #     batch_data_samples: List[Det3DDataSample]
+    # ) -> Tuple[tuple, List[Det3DDataSample]]:
+    #     """
+    #     Multi-view 이미지 피처와 DataSample을 2D 탐지 헤드에 맞게 변환합니다.
+    #     (입력 img_feats가 4D 텐서일 경우를 처리하도록 수정됨)
+    #     """
+    #     # --- ✨ MODIFIED: 4D 텐서를 그대로 사용 ---
+    #     # 입력 img_feats는 이미 (B*N, C, H, W) 형태이므로, 
+    #     # 추가적인 reshape 없이 그대로 사용합니다.
+    #     reshaped_img_feats = img_feats
+        
+    #     # --- (이후 DataSample 처리 로직은 기존과 동일) ---
+    #     camera_types = [
+    #         'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK',
+    #         'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
+    #     ]
+    #     reshaped_data_samples = []
+    #     # img_feats[0]이 None일 가능성을 대비하여 device를 안전하게 가져옴
+    #     device = img_feats[0].device if img_feats and img_feats[0] is not None else 'cpu' 
+
+    #     for sample in batch_data_samples:
+    #         # metainfo 키 존재 여부 확인
+    #         if 'ann_info_aug_2d_per_cam' not in sample.metainfo:
+    #             continue
+    #         multi_cam_2d_anns = sample.metainfo['ann_info_aug_2d_per_cam']
+
+    #         for cam_name in camera_types:
+    #             if cam_name not in multi_cam_2d_anns:
+    #                 continue
+                    
+    #             new_sample = Det3DDataSample()
+    #             new_sample.set_metainfo(sample.metainfo)
+    #             if 'gt_instances_3d' in sample:
+    #                 new_sample.gt_instances_3d = sample.gt_instances_3d
+
+    #             cam_gt = multi_cam_2d_anns[cam_name]
+    #             gt_instances_2d = InstanceData()
+                
+    #             # Bbox 데이터 처리
+    #             gt_bboxes = cam_gt.get('gt_bboxes', []) # 키가 없을 경우 빈 리스트 반환
+    #             bboxes_tensor = torch.as_tensor(
+    #                 gt_bboxes, dtype=torch.float32, device=device)
+    #             gt_instances_2d.bboxes = bboxes_tensor.reshape(-1, 4)
+                
+    #             # 라벨 데이터 처리
+    #             string_labels = cam_gt.get('gt_labels', []) # 키가 없을 경우 빈 리스트 반환
+    #             numeric_labels = [self.name_to_idx.get(name, -1) for name in string_labels]
+    #             labels_tensor = torch.as_tensor(
+    #                 numeric_labels, dtype=torch.long, device=device)
+    #             gt_instances_2d.labels = labels_tensor.reshape(-1)
+                
+    #             new_sample.gt_instances = gt_instances_2d
+    #             reshaped_data_samples.append(new_sample)
+        
+    #     return reshaped_img_feats, reshaped_data_samples
+    
     def _prepare_2d_head_inputs(
-            self,
-            img_feats: tuple,
-            batch_data_samples: List[Det3DDataSample]
-    ) -> tuple[tuple, List[Det3DDataSample]]:
+        self,
+        img_feats: tuple,
+        batch_data_samples: List[Det3DDataSample]
+    ) -> Tuple[tuple, List[Det3DDataSample]]:
         """
         Multi-view 이미지 피처와 DataSample을 2D 탐지 헤드에 맞게 변환합니다.
-        (GT가 없는 샘플도 안전하게 2D 텐서로 처리하도록 수정됨)
+        학습 모드와 추론 모드를 구분하여 처리합니다.
         """
-        N, V = img_feats[0].shape[:2]
-        reshaped_img_feats = []
-        for feat in img_feats:
-            _N, _V, C, H, W = feat.shape
-            reshaped_img_feats.append(feat.view(_N * _V, C, H, W))
-        reshaped_img_feats = tuple(reshaped_img_feats)
-
-        camera_types = [
-            'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK',
-            'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
-        ]
+        # img_feats는 이미 (B*N, C, H, W) 형태이므로 그대로 사용합니다.
+        reshaped_img_feats = img_feats
         reshaped_data_samples = []
-        device = img_feats[0].device
 
-        for sample in batch_data_samples:
-            multi_cam_2d_anns = sample.metainfo['ann_info_aug_2d_per_cam']
-            for cam_name in camera_types:
-                new_sample = Det3DDataSample()
-                new_sample.set_metainfo(sample.metainfo)
-                if 'gt_instances_3d' in sample:
-                    new_sample.gt_instances_3d = sample.gt_instances_3d
+        if self.training:
+            # --- 학습(Training) 경로 ---
+            # 기존과 동일하게 GT 어노테이션을 처리하여 loss 계산에 사용합니다.
+            camera_types = [
+                'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK',
+                'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
+            ]
+            device = img_feats[0].device if img_feats and img_feats[0] is not None else 'cpu'
 
-                cam_gt = multi_cam_2d_anns[cam_name]
-                gt_instances_2d = InstanceData()
-                
-                # --- ✨ 핵심 수정 로직 ---
-                # 1. bbox 데이터를 가져옵니다. (비어있을 수 있음)
-                gt_bboxes = cam_gt['gt_bboxes']
-                bboxes_tensor = torch.as_tensor(
-                    gt_bboxes, dtype=torch.float32, device=device)
-                
-                # 2. 텐서가 비어있더라도 항상 (N, 4) 형태의 2D가 되도록 보장합니다.
-                #    비어있을 경우 shape=(0, 4)가 됩니다.
-                gt_instances_2d.bboxes = bboxes_tensor.reshape(-1, 4)
-                
-                # 3. 라벨도 동일하게 처리합니다.
-                string_labels = cam_gt['gt_labels']
-                numeric_labels = [self.name_to_idx.get(name, -1) for name in string_labels]
-                labels_tensor = torch.as_tensor(
-                    numeric_labels, dtype=torch.long, device=device)
-                gt_instances_2d.labels = labels_tensor.reshape(-1)
-                # -------------------------
-                
-                new_sample.gt_instances = gt_instances_2d
-                reshaped_data_samples.append(new_sample)
-        
+            for sample in batch_data_samples:
+                if 'ann_info_aug_2d_per_cam' not in sample.metainfo:
+                    continue
+                multi_cam_2d_anns = sample.metainfo['ann_info_aug_2d_per_cam']
+
+                for cam_name in camera_types:
+                    if cam_name not in multi_cam_2d_anns:
+                        continue
+                    
+                    # metainfo를 생성자에 전달하여 새 샘플 생성
+                    new_sample = type(sample)(metainfo=sample.metainfo)
+                    if 'gt_instances_3d' in sample:
+                        new_sample.gt_instances_3d = sample.gt_instances_3d
+
+                    cam_gt = multi_cam_2d_anns[cam_name]
+                    gt_instances_2d = InstanceData()
+                    
+                    gt_bboxes = cam_gt.get('gt_bboxes', [])
+                    bboxes_tensor = torch.as_tensor(
+                        gt_bboxes, dtype=torch.float32, device=device)
+                    gt_instances_2d.bboxes = bboxes_tensor.reshape(-1, 4)
+                    
+                    string_labels = cam_gt.get('gt_labels', [])
+                    numeric_labels = [self.name_to_idx.get(name, -1) for name in string_labels]
+                    labels_tensor = torch.as_tensor(
+                        numeric_labels, dtype=torch.long, device=device)
+                    gt_instances_2d.labels = labels_tensor.reshape(-1)
+                    
+                    new_sample.gt_instances = gt_instances_2d
+                    reshaped_data_samples.append(new_sample)
+        else:
+            # --- 추론(Inference) 경로 ---
+            # predict 함수가 메타정보를 필요로 하므로, GT 없이 메타정보만 담은
+            # 더미 DataSample 리스트를 생성합니다.
+            for sample in batch_data_samples:
+                # metainfo에서 카메라 개수를 가져옵니다. (e.g., lidar2img shape)
+                # 하드코딩보다 안정적인 방법입니다.
+                num_cameras = sample.metainfo['lidar2img'].shape[0]
+                for _ in range(num_cameras):
+                    dummy_sample = type(sample)(metainfo=sample.metainfo)
+                    reshaped_data_samples.append(dummy_sample)
+
         return reshaped_img_feats, reshaped_data_samples
 
     def process_2d_detections(self, det_results_list, device):
@@ -749,7 +946,9 @@ class BEVFusion(Base3DDetector):
             detections_2d = self.process_2d_detections(det_results_list, device)
 
             # 3. 설정에 따라 Ground Truth로 2D 탐지 결과를 보강
-            if self.train_cfg.get('complement_2d_gt', -1) > 0:
+            # if self.train_cfg.get('complement_2d_gt', -1) > 0:
+            # self.training 조건을 추가하여 학습 모드일 때만 이 블록이 실행되도록 합니다.
+            if self.training and self.train_cfg.get('complement_2d_gt', -1) > 0:
                 gt_bboxes_list = [sample.gt_instances.bboxes for sample in reshaped_data_samples]
                 gt_labels_list = [sample.gt_instances.labels for sample in reshaped_data_samples]
                 
@@ -1247,14 +1446,108 @@ class BEVFusion(Base3DDetector):
             converted_results.append(new_pred_tensor)
 
         return converted_results
+    
+    def extract_multiscale_img_feats(self, batch_inputs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        입력 딕셔너리에서 이미지를 추출하고, 
+        이미지 백본을 통과시켜 특징(features)을 반환합니다.
+        """
+        imgs = batch_inputs_dict['imgs']
+        B, N, C, H, W = imgs.size()
+        
+        # 이미지를 (B*N, C, H, W) 형태로 재구성하여 백본에 전달
+        imgs_reshaped = imgs.view(B * N, C, H, W).contiguous()
+        
+        # 이미지 백본을 통과시켜 특징 추출
+        x_backbone  = self.img_backbone(imgs_reshaped)
+
+        # 2. ✨ 핵심 수정: 백본 출력을 넥(FPN 등)에 통과시킵니다.
+        x_neck = self.img_neck(x_backbone)
+        
+        return x_neck
+    
+    def _get_corrected_calib_from_prediction(
+        self,
+        pred_delta_rot: torch.Tensor,
+        pred_delta_trans: torch.Tensor,
+        broken_camera2lidar: torch.Tensor,
+        broken_camera_intrinsics: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        예측된 delta 값과 broken calibration을 사용하여 
+        보정된 calibration 파라미터 딕셔너리를 생성합니다.
+        """
+        # --- 1. 예측된 오차를 사용하여 corrected_camera2lidar 생성 ---
+        pred_delta_rot_mat = axis_angle_to_rotation_matrix(pred_delta_rot)
+        broken_rots = broken_camera2lidar[..., :3, :3]
+        broken_trans = broken_camera2lidar[..., :3, 3]
+
+        corrected_camera2lidar_trans = broken_trans + pred_delta_trans
+        corrected_camera2lidar_rots = pred_delta_rot_mat @ broken_rots
+        
+        # --- ✨ FIX: In-place 할당 대신 torch.cat으로 새로운 4x4 행렬 조립 ---
+        
+        # 1. 상단 3x4 부분 [R_corr | t_corr] 생성
+        top_3x4 = torch.cat(
+            [corrected_camera2lidar_rots, corrected_camera2lidar_trans.unsqueeze(-1)], 
+            dim=-1
+        ) # shape: (B, N, 3, 4)
+
+        # 2. 하단 1x4 부분 [0, 0, 0, 1] 생성
+        B, N = broken_camera2lidar.shape[:2]
+        bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], 
+                                device=broken_camera2lidar.device, 
+                                dtype=broken_camera2lidar.dtype)
+        bottom_row = bottom_row.expand(B, N, -1, -1) # shape: (B, N, 1, 4)
+
+        # 3. 상단과 하단을 합쳐 최종 4x4 행렬 생성
+        corrected_camera2lidar = torch.cat([top_3x4, bottom_row], dim=-2)
+        
+        # --- (이후 lidar2img 계산 로직은 기존과 동일) ---
+        corrected_lidar2camera_rots = corrected_camera2lidar_rots.transpose(-1, -2)
+        corrected_lidar2camera_trans = -torch.matmul(
+            corrected_lidar2camera_rots,
+            corrected_camera2lidar_trans.unsqueeze(-1)
+        ).squeeze(-1)
+        corrected_lidar2camera_3x4 = torch.cat(
+            [corrected_lidar2camera_rots, corrected_lidar2camera_trans.unsqueeze(-1)], dim=-1
+        )
+
+        # 최종 투영 행렬 계산 (3x4)
+        intrinsics_3x3 = broken_camera_intrinsics[..., :3, :3]
+        corrected_lidar2imag_3x4 = intrinsics_3x3 @ corrected_lidar2camera_3x4
+        
+        # 4x4 동차 좌표계 행렬로 변환
+        B, N, _, _ = corrected_lidar2imag_3x4.shape
+        bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], 
+                                device=corrected_lidar2imag_3x4.device, 
+                                dtype=corrected_lidar2imag_3x4.dtype)
+        bottom_row = bottom_row.expand(B, N, -1, -1)
+        corrected_lidar2imag_4x4 = torch.cat([corrected_lidar2imag_3x4, bottom_row], dim=-2)
+
+        # --- 3. 최종 결과 딕셔너리 반환 ---
+        corrected_calib_dict = {
+            'lidar2img': corrected_lidar2imag_4x4,
+            'cam2img': broken_camera_intrinsics,
+            'cam2lidar': corrected_camera2lidar
+        }
+        
+        return corrected_calib_dict
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
              batch_data_samples: List[Det3DDataSample],
              **kwargs) -> List[Det3DDataSample]:
+        
+        target_device = batch_inputs_dict['imgs'].device
         batch_input_metas = [item.metainfo for item in batch_data_samples]
-        feats,img_feats,lidar2imag,camera_intrinsics,camera2lidar = self.extract_feat(
-                                                                    batch_inputs_dict, batch_input_metas)
-        sbs_img, pertubed_points,dense_depth_map = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
+        # batch_data_samples에서 직접 Calibration 관련 텐서를 가져옵니다.
+        broken_camera2lidar = torch.stack([s.broken_camera2lidar for s in batch_data_samples]).to(target_device)
+        broken_camera_intrinsics = torch.stack([s.broken_camera_intrinsics for s in batch_data_samples]).to(target_device)
+        original_camera2lidar = torch.stack([s.camera2lidar for s in batch_data_samples]).to(target_device)
+        gt_delta_rot = torch.stack([s.gt_delta_rot for s in batch_data_samples]).to(target_device)
+        gt_delta_trans = torch.stack([s.gt_delta_trans for s in batch_data_samples]).to(target_device)
+
+        img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
 
         reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
             img_feats, batch_data_samples)
@@ -1290,17 +1583,36 @@ class BEVFusion(Base3DDetector):
         rois , proposla_list = self._generate_rois_from_detections(detections_2d_orig_coords)
         rois_center = self.get_center_points(rois)
         trimed_center_pts =self.batch_rois_center_by_cam_id(rois_center,batch_size=200)
-        cam_ids = trimed_center_pts[..., 0]
-        object_ids = trimed_center_pts[..., 1]
 
-        query_input = trimed_center_pts[..., 2:].clone()
-        query_input[..., 0] /= 1600
-        query_input[..., 1] /= 900
-        query_input[:,:,0] = query_input[:,:,0]/2    # recaling points for sbs image resizing
-        query_input[:,:,1] = query_input[:,:,1]
+        # query_input = trimed_center_pts[..., 2:].clone()
+        # query_input[..., 0] /= 1600
+        # query_input[..., 1] /= 900
+        # query_input[:,:,0] = query_input[:,:,0]/2    # recaling points for sbs image resizing
+        # query_input[:,:,1] = query_input[:,:,1]
 
+        # --- ✨ FIX 1: query_input 정규화 로직 수정 ---
+        # in-place 연산 대신 새로운 텐서를 생성합니다.
+        query_coords = trimed_center_pts[..., 2:]
+        q_x = (query_coords[..., 0] / 1600) / 2
+        q_y = query_coords[..., 1] / 900
+        # z좌표가 있다면 유지, 없다면 x,y만 사용 (코드에 맞게 조절)
+        if query_coords.shape[-1] > 2:
+            q_z = query_coords[..., 2]
+            query_input = torch.stack([q_x, q_y, q_z], dim=-1)
+        else:
+            query_input = torch.stack([q_x, q_y], dim=-1)
+
+        sbs_img, pertubed_points,dense_depth_map = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
         B,N,C,H,W = sbs_img.shape
         raw_corrs, cycle, corr_mask, enc_out = self.corr(sbs_img.view(B*N,C,H,W), query_input)
+
+        pred_delta_6dof = self.calib_head(enc_out).view(B, N, 6)
+        pred_delta_rot = pred_delta_6dof[..., :3]
+        pred_delta_trans = pred_delta_6dof[..., 3:]
+
+        # Calibration Loss 추가
+        losses['loss_calib_rot'] = F.l1_loss(pred_delta_rot, gt_delta_rot, reduction='mean') * 1.0
+        losses['loss_calib_trans'] = F.l1_loss(pred_delta_trans, gt_delta_trans, reduction='mean') * 1.0
 
         # # ##### 검증용 display ######
         # from .imageprocessing_unit import draw_correspondences
@@ -1336,23 +1648,255 @@ class BEVFusion(Base3DDetector):
         #         )
         #     print ("end")
 
-        raw_pred_center_pts = raw_corrs.clone()
-        raw_pred_center_pts[..., 0] = (raw_pred_center_pts[..., 0] - 0.5) * 2
-        raw_pred_center_pts[..., 0] *= 1600
-        raw_pred_center_pts[..., 1] *= 900
+        # raw_pred_center_pts = raw_corrs.clone()
+        # raw_pred_center_pts[..., 0] = (raw_pred_center_pts[..., 0] - 0.5) * 2
+        # raw_pred_center_pts[..., 0] *= 1600
+        # raw_pred_center_pts[..., 1] *= 900
+
+        # --- ✨ FIX 2: raw_pred_center_pts 후처리 로직 수정 ---
+        # in-place 연산 대신 새로운 텐서를 생성합니다.
+        raw_corrs_clone = raw_corrs.clone()
+        r_x = (raw_corrs_clone[..., 0] - 0.5) * 2 * 1600
+        r_y = raw_corrs_clone[..., 1] * 900
+        raw_pred_center_pts = torch.stack([r_x, r_y], dim=-1)
 
         esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map,enc_out)
         esitmated_uvz =torch.cat([raw_pred_center_pts, esitmated_z['depth']],dim=-1)
 
-        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, lidar2imag)
+        corrected_calib_dict = self._get_corrected_calib_from_prediction(
+                        pred_delta_rot,
+                        pred_delta_trans,
+                        broken_camera2lidar,
+                        broken_camera_intrinsics
+                    )
+
+        # ✨ '보정된' lidar2imag를 사용하여 3D 좌표 변환 수행
+        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
         #    이때 query_input은 -1~1 범위로 정규화된 상태여야 합니다.
         det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
         det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz,det_feat_sampled,B=B,N_cam=N)
+
+        feats = self.extract_feat(batch_inputs_dict=batch_inputs_dict,
+                                batch_input_metas=batch_input_metas,
+                                corrected_calib=corrected_calib_dict,
+                                precomputed_img_feats=img_feats)
 
         if self.with_bbox_head:
             bbox_loss = self.bbox_head.loss(feats, det_xyz_proc, det_feat_proc, batch_data_samples)
 
         losses.update(bbox_loss)
 
+        # # --- ✨ VERIFICATION 2: 최종 시각적 검증 (GT / Broken / Corrected 비교) ---
+        # # 100 스텝마다 첫 번째 샘플의 첫 번째 카메라만 시각화하여 확인
+        # if hasattr(self, 'training_step') and self.training_step % 500 == 0:
+        #     with torch.no_grad():
+        #         import matplotlib.pyplot as plt
+        #         import cv2
+        #         import numpy as np
+
+        #         cam_idx = 0
+                
+        #         # --- 1. 시각화에 필요한 데이터 준비 ---
+        #         img_tensor_chw = batch_inputs_dict['img_original'][0][cam_idx].cpu().numpy()
+        #         img_for_vis = img_tensor_chw.transpose(1, 2, 0)
+        #         if img_for_vis.dtype in [np.float32, np.float64] and img_for_vis.max() > 1.0:
+        #             img_for_vis = img_for_vis / 255.0
+                    
+        #         points_for_vis = batch_inputs_dict['points_original'][0].tensor
+        #         h, w = img_for_vis.shape[:2]
+        #         K = broken_camera_intrinsics[0, cam_idx, :3, :3]
+                
+        #         # --- 2. 세 가지 상태의 투영 행렬(Projection Matrix) 계산 ---
+        #         # (P = K @ T_lidar2camera)
+                
+        #         # a) Ground Truth (정답)
+        #         T_l2c_orig = torch.inverse(original_camera2lidar[0, cam_idx])[:3, :]
+        #         P_orig = K @ T_l2c_orig
+                
+        #         # b) Broken (문제)
+        #         T_l2c_broken = torch.inverse(broken_camera2lidar[0, cam_idx])[:3, :]
+        #         P_broken = K @ T_l2c_broken
+                
+        #         # c) Corrected (모델의 해결책)
+        #         T_l2c_corr = torch.inverse(corrected_calib_dict['cam2lidar'][0, cam_idx])[:3, :]
+        #         P_corr = K @ T_l2c_corr
+
+        #         # --- 3. 포인트 투영을 위한 헬퍼 함수 ---
+        #         def project_points(points_tensor, P_matrix, height, width):
+        #             points_h = torch.cat([points_tensor[:, :3], torch.ones_like(points_tensor[:, :1])], dim=-1).to(P_matrix.device)
+        #             points_proj_raw = (P_matrix @ points_h.T).T
+                    
+        #             # Perspective Division (In-place 연산 방지)
+        #             uv = points_proj_raw[:, :2] / (points_proj_raw[:, 2:3] + 1e-8)
+        #             z = points_proj_raw[:, 2:3]
+        #             points_proj = torch.cat([uv, z], dim=-1)
+
+        #             mask = (points_proj[:, 0] >= 0) & (points_proj[:, 0] < width) & \
+        #                 (points_proj[:, 1] >= 0) & (points_proj[:, 1] < height) & (points_proj[:, 2] > 0)
+        #             return points_proj[mask].cpu().numpy()
+
+        #         # --- 4. 각 상태에 대해 포인트 투영 실행 ---
+        #         pts_gt = project_points(points_for_vis, P_orig, h, w)
+        #         pts_broken = project_points(points_for_vis, P_broken, h, w)
+        #         pts_corr = project_points(points_for_vis, P_corr, h, w)
+                
+        #         # --- 5. 최종 시각화 ---
+        #         plt.figure(figsize=(16, 9))
+        #         plt.imshow(img_for_vis)
+                
+        #         # 세 종류의 포인트를 각기 다른 색상으로 플로팅
+        #         plt.scatter(pts_broken[:, 0], pts_broken[:, 1], color='red', s=1, alpha=0.6, label='Broken (Problem)')
+        #         plt.scatter(pts_gt[:, 0], pts_gt[:, 1], color='lime', s=1, alpha=0.6, label='Ground Truth (Answer)')
+        #         plt.scatter(pts_corr[:, 0], pts_corr[:, 1], c='cyan', s=1, alpha=0.6, label='Corrected by Model (Solution)')
+                
+        #         plt.title(f"Visual Verification @ Step {self.training_step}")
+        #         plt.legend()
+        #         plt.axis('off')
+        #         plt.savefig(f"verification_step_{self.training_step}.jpg", bbox_inches='tight', pad_inches=0)
+        #         plt.close()
+        #         print(f"✅ Visual verification image saved to verification_step_{self.training_step}.jpg")
+        #         print("verification display end")
+        
+        # self.training_step += 1
         return losses
 
+    def predict(self, batch_inputs_dict: Dict[str, Tensor],
+                batch_data_samples: List[Det3DDataSample],
+                **kwargs) -> List[Det3DDataSample]:
+        """
+        Args:
+            batch_inputs_dict (dict): The model input dict which contains
+                `points`, `img` keys.
+            batch_data_samples (List[Det3DDataSample]): The Data
+                Samples. It usually includes information such as
+                `gt_instance_3d`, `gt_panoptic_seg_3d` and `gt_sem_seg_3d`.
+
+        Returns:
+            list[Det3DDataSample]: Detection results of the
+            input images. Each Det3DDataSample usually contains
+            'pred_instances_3d'.
+        """
+        # --- 1. loss 함수와 동일하게 필요한 데이터 준비 ---
+        target_device = batch_inputs_dict['imgs'].device
+        batch_input_metas = [item.metainfo for item in batch_data_samples]
+
+        # 추론 시점에서는 GT가 없으므로 'broken' 보정 정보만 가져옵니다.
+        broken_camera2lidar = torch.stack([s.broken_camera2lidar for s in batch_data_samples]).to(target_device)
+        broken_camera_intrinsics = torch.stack([s.broken_camera_intrinsics for s in batch_data_samples]).to(target_device)
+        
+        # --- 2. 2D 특징 추출 및 2D 객체 탐지 수행 ---
+        img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
+        reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
+            img_feats, batch_data_samples)
+        
+        detections_2d = self._generate_and_process_2d_dets(
+            reshaped_img_feats, 
+            reshaped_data_samples, 
+            batch_inputs_dict, 
+            visualize=False
+        )
+
+        detections_2d_orig_coords = self.convert_boxes_to_original_scale(
+            pred_results_list=detections_2d,
+            data_samples_list=reshaped_data_samples
+        )
+
+        # --- 3. 2D 탐지 결과로부터 쿼리 포인트 생성 및 정규화 ---
+        rois, _ = self._generate_rois_from_detections(detections_2d_orig_coords)
+        rois_center = self.get_center_points(rois)
+        trimed_center_pts = self.batch_rois_center_by_cam_id(rois_center, batch_size=200)
+
+        # loss 함수와 동일한 정규화 로직 적용
+        query_coords = trimed_center_pts[..., 2:]
+        q_x = (query_coords[..., 0] / 1600) / 2
+        q_y = query_coords[..., 1] / 900
+        if query_coords.shape[-1] > 2:
+            q_z = query_coords[..., 2]
+            query_input = torch.stack([q_x, q_y, q_z], dim=-1)
+        else:
+            query_input = torch.stack([q_x, q_y], dim=-1)
+
+        # --- 4. Calibration 오차 예측 ---
+        sbs_img, _, dense_depth_map = self.extract_sbs_img(
+            batch_inputs_dict, batch_input_metas, visualize=False)
+        B, N, C, H, W = sbs_img.shape
+        raw_corrs, _, _, enc_out = self.corr(sbs_img.view(B*N, C, H, W), query_input)
+
+        pred_delta_6dof = self.calib_head(enc_out).view(B, N, 6)
+        pred_delta_rot = pred_delta_6dof[..., :3]
+        pred_delta_trans = pred_delta_6dof[..., 3:]
+
+        # # ##### 검증용 display ######
+        # from .imageprocessing_unit import draw_correspondences
+        # # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
+        # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
+        # # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
+        # self.vis_step_counter += 1
+        # for cid in range(12):
+        #     # idx = id_to_idx[cid.item()]
+        #     # draw_correspondences(
+        #     #     trimed_corrs = gt_corrs[cid][:10,...],  # 첫 번째 배치 선택
+        #     #     sbs_img=sbs_img[cid],
+        #     #     save_path='correspondence_visualization_gt.jpg'
+        #     # )
+        #     bboxes_for_this_view = detections_2d_orig_coords[cid]
+        #     draw_correspondences(
+        #         trimed_corrs = pred_corrs[cid][:3,...],  # 첫 번째 배치 선택
+        #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
+        #         save_path='correspondence_visualization_pred.jpg',
+        #         bboxes_to_draw = bboxes_for_this_view, # 원본 좌표계 BBox 전달
+        #         score_thr = 0.4
+        #     )
+        #     # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
+        #     save_batch_predictions_to_file(
+        #             batch_inputs_dict=batch_inputs_dict,
+        #             reshaped_data_samples=reshaped_data_samples,
+        #             augmented_preds_list=detections_2d,
+        #             original_preds_list=detections_2d_orig_coords,
+        #             current_step=self.vis_step_counter,
+        #             save_dir='work_dirs/my_exp/vis_results',
+        #             view_index=cid, # 루프 변수 cid를 view_index로 사용
+        #             score_thr=0.4
+        #         )
+        #     print ("end")
+
+        # --- 5. 예측된 오차를 사용하여 '보정된' Calibration 생성 ---
+        corrected_calib_dict = self._get_corrected_calib_from_prediction(
+            pred_delta_rot,
+            pred_delta_trans,
+            broken_camera2lidar,
+            broken_camera_intrinsics
+        )
+        
+        # --- 6. 보정된 Calibration을 사용하여 3D 좌표 및 특징 생성 ---
+        # loss 함수와 동일한 후처리 로직 적용
+        raw_corrs_clone = raw_corrs.clone()
+        r_x = (raw_corrs_clone[..., 0] - 0.5) * 2 * 1600
+        r_y = raw_corrs_clone[..., 1] * 900
+        raw_pred_center_pts = torch.stack([r_x, r_y], dim=-1)
+
+        esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map, enc_out)
+        esitmated_uvz = torch.cat([raw_pred_center_pts, esitmated_z['depth']], dim=-1)
+
+        # '보정된' lidar2img를 사용하여 3D 좌표 변환
+        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
+        
+        det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
+        det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(
+            det_xyz, det_feat_sampled, B=B, N_cam=N)
+
+        # --- 7. 최종 3D 특징 추출 및 3D 객체 탐지 ---
+        # '보정된' calib 정보와 미리 계산된 이미지 특징을 함께 전달
+        feats = self.extract_feat(
+            batch_inputs_dict=batch_inputs_dict,
+            batch_input_metas=batch_input_metas,
+            corrected_calib=corrected_calib_dict,
+            precomputed_img_feats=img_feats)
+        
+        results_list_3d = self.bbox_head.predict(
+            feats, det_xyz_proc, det_feat_proc, batch_input_metas)
+
+        # --- 8. 최종 결과를 Det3DDataSample 형식에 맞게 정리 ---
+        results = self.add_pred_to_datasample(batch_data_samples,
+                                              results_list_3d)
+        return results
