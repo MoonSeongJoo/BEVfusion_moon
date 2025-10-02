@@ -12,6 +12,7 @@ def parse_args():
     parser.add_argument('json_path', help='Path to the COCO format json file (e.g., nuscenes_infos_train_mono3d.coco.json)')
     parser.add_argument('out_path', help='Path to save the new pkl file')
     parser.add_argument('--dataroot', default='./data/nuscenes', help='Root path of the nuScenes dataset for the SDK')
+    parser.add_argument('--version', default='v1.0-trainval', help='Version of the nuScenes dataset (e.g., v1.0-trainval, v1.0-test)')
     args = parser.parse_args()
     return args
 
@@ -29,7 +30,8 @@ def main():
         coco_data = json.load(f)
 
     print("Loading NuScenes SDK...")
-    nusc = NuScenes(version='v1.0-trainval', dataroot=args.dataroot, verbose=False)
+    # nusc = NuScenes(version='v1.0-trainval', dataroot=args.dataroot, verbose=False)
+    nusc = NuScenes(version=args.version, dataroot=args.dataroot, verbose=False)
 
     print("Creating annotation map from COCO json...")
     img_id_to_anns = {}

@@ -19,7 +19,8 @@ class_names = [
 
 custom_imports = dict(
     imports=['projects.BEVFusion.bevfusion.my_collate',
-             'projects.BEVFusion.bevfusion.cotr'],
+             'projects.BEVFusion.bevfusion.cotr',
+             'projects.BEVFusion.bevfusion.my_hooks'],
     allow_failed_imports=False)
 
 data_root = 'data/nuscenes/'
@@ -427,8 +428,8 @@ default_hooks = dict(
     )
 del _base_.custom_hooks
 
-# load_from =  "data/work_dirs/bevfusion/20250925_bevfusion_2d_detection_only/iter_1500.pth"
-load_from = None
+load_from =  "data/work_dirs/bevfusion/20250929_bevfusion_ours_base/iter_89000.pth"
+# load_from = None
 resume_from = None
 
 # log_level = 'WARNING' 
@@ -439,3 +440,7 @@ visualizer = dict(
         # --- ✨ 여기에 TensorBoard 백엔드를 추가합니다 ✨ ---
         dict(type='TensorboardVisBackend')
     ])
+
+custom_hooks = [
+    dict(type='ValidateBeforeTrainHook')
+]
