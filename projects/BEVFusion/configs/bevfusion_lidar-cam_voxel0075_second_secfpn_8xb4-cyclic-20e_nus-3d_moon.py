@@ -23,7 +23,7 @@ custom_imports = dict(
              'projects.BEVFusion.bevfusion.my_hooks'],
     allow_failed_imports=False)
 
-data_root = 'data/nuscenes/'
+data_root = '/workspace/mmdetection3d/data/nuscenes/'
 
 model = dict(
     type='BEVFusion',
@@ -197,7 +197,7 @@ train_pipeline = [
         with_label_3d=True,
         with_bbox=True,       # <-- 2D 박스 로드 옵션 추가
         with_label=True,      # <-- 2D 라벨 로드 옵션 추가
-        with_attr_label=False),
+        with_attr_label=False,),
     dict(
         type='CustomImageAug3D',
         final_dim=[256, 704],
@@ -265,7 +265,7 @@ train_pipeline = [
         ])
 ]
 
-test_pipeline = [
+val_pipeline = [
     dict(
         type='BEVLoadMultiViewImageFromFiles',
         to_float32=True,
@@ -294,7 +294,7 @@ test_pipeline = [
         with_label_3d=True,
         with_bbox=True,
         with_label=True,
-        with_attr_label=False),
+        with_attr_label=False,),
     # <<< [수정] Augmentation 타입을 CustomImageAug3D로 통일 (랜덤 옵션은 비활성화)
     dict(
         type='CustomImageAug3D',
@@ -308,14 +308,14 @@ test_pipeline = [
     dict(type='PointToMultiViewDepth', grid_config=grid_config, downsample=1),
     # <<< [수정] 필터 타입을 CustomPointsRangeFilter로 통일 (또는 유지)
     dict(type='CustomPointsRangeFilter', point_cloud_range=point_cloud_range),
-    # <<< [추가] 학습 시와 동일한 필터링 적용
-    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
-    dict(
-        type='ObjectNameFilter',
-        classes=[
-            'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
-            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-        ]),
+    # # <<< [추가] 학습 시와 동일한 필터링 적용
+    # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    # dict(
+    #     type='ObjectNameFilter',
+    #     classes=[
+    #         'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+    #         'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+    #     ]),
     # <<< [핵심 수정] Pack 단계를 CustomPack3DDetInputs로 통일하고 모든 키 포함
     dict(
         type='CustomPack3DDetInputs',
@@ -340,16 +340,49 @@ test_pipeline = [
         ])
 ]
 
+# 1. 각 Dataloader를 모든 정보(ann_file 포함)와 함께 명확하게 정의
 train_dataloader = dict(
     dataset=dict(
-        dataset=dict(pipeline=train_pipeline, modality=input_modality),),
-    collate_fn=dict(type='custom_collate')# <-- 이 라인을 추가!
+        dataset=dict(
+            type='NuScenesDataset',
+            data_root=data_root,
+            ann_file='nuscenes_infos_train_new_with_2d.pkl', # 경로 명시
+            # ann_file='debug_infos_train_with_2d.pkl',
+            pipeline=train_pipeline,
+            modality=input_modality,
+            test_mode=False,
+            box_type_3d='LiDAR')),
+    collate_fn=dict(type='custom_collate')
 )
+
 val_dataloader = dict(
-    dataset=dict(pipeline=test_pipeline, modality=input_modality),
-    collate_fn=dict(type='custom_collate')# <-- 이 라인을 추가!)
+    dataset=dict(
+        type='NuScenesDataset',
+        data_root=data_root,
+        ann_file='nuscenes_infos_val_new_with_2d.pkl', # 경로 명시
+        # ann_file='debug_infos_val_with_2d.pkl',
+        pipeline=val_pipeline,
+        modality=input_modality,
+        test_mode=False,
+        box_type_3d='LiDAR',
+        use_valid_flag=False,),
+    collate_fn=dict(type='custom_collate')
 )
+
+# 2. val 설정을 test에서도 사용하도록 명시적으로 재지정 (가장 중요!)
 test_dataloader = val_dataloader
+
+# 3. Evaluator도 명시적으로 재지정
+val_evaluator = dict(
+    type='NuScenesMetric',
+    data_root=data_root,
+    ann_file=data_root + 'nuscenes_infos_val_new_with_2d.pkl',
+    # ann_file=data_root + 'debug_infos_val_with_2d.pkl',
+    metric='bbox',
+    version='v1.0-trainval',
+    collect_dir='test_results_tmp',)  # <-- 이 라인을 추가하세요.)
+
+# test_evaluator = val_evaluator
 
 param_scheduler = [
     dict(
@@ -424,23 +457,34 @@ default_hooks = dict(
         type='CheckpointHook',
         interval=500,      # 1000번의 이터레이션마다 저장
         by_epoch=False,
-        max_keep_ckpts=3,)     # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
-    )
+        max_keep_ckpts=3,),    # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
+    # --- ▼▼▼ 이 부분을 아래와 같이 수정하세요 ▼▼▼ ---
+    visualization=dict(
+        type='Det3DVisualizationHook',
+        draw=True,      # <-- BEV 시각화 활성화 스위치
+        interval=1,      # <-- 매 1개 샘플마다 시각화 결과 저장
+        test_out_dir='visualization_results' , # <-- 이 라인을 추가!
+    ))
 del _base_.custom_hooks
 
-load_from =  "data/work_dirs/bevfusion/20250929_bevfusion_ours_base/iter_89000.pth"
+load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
 # load_from = None
 resume_from = None
 
 # log_level = 'WARNING' 
-visualizer = dict(
-    type='Det3DLocalVisualizer', # 3D 시각화를 위한 기본 Visualizer
-    vis_backends=[
-        dict(type='LocalVisBackend'),
-        # --- ✨ 여기에 TensorBoard 백엔드를 추가합니다 ✨ ---
-        dict(type='TensorboardVisBackend')
-    ])
-
-custom_hooks = [
-    dict(type='ValidateBeforeTrainHook')
+# 1. vis_backends 리스트를 먼저 정의합니다.
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    dict(type='TensorboardVisBackend')
 ]
+
+# 2. visualizer 딕셔너리에 'name' 필드를 추가하고, 위에서 정의한 백엔드를 연결합니다.
+visualizer = dict(
+    type='Det3DLocalVisualizer',
+    vis_backends=vis_backends,
+    name='visualizer'  # <-- 이 라인이 추가되었습니다!
+)
+
+# custom_hooks = [
+#     dict(type='ValidateBeforeTrainHook')
+# ]

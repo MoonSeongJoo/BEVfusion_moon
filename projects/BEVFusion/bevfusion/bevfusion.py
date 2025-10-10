@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from torchvision.transforms import functional as tvtf
 from mmengine.structures import InstanceData
 from mmdet.structures.bbox import bbox_overlaps ,bbox2roi
+from mmengine.runner import loops
 
 from mmdet3d.models import Base3DDetector
 from mmdet3d.registry import MODELS
@@ -1895,6 +1896,10 @@ class BEVFusion(Base3DDetector):
         
         results_list_3d = self.bbox_head.predict(
             feats, det_xyz_proc, det_feat_proc, batch_input_metas)
+        
+        # # ==================== 디버깅용 print문 추가 ====================
+        # print(f"\n[DEBUG] Available metainfo keys: {batch_data_samples[0].metainfo.keys()}\n")
+        # # =============================================================
 
         # --- 8. 최종 결과를 Det3DDataSample 형식에 맞게 정리 ---
         results = self.add_pred_to_datasample(batch_data_samples,

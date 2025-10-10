@@ -279,8 +279,9 @@ def get_available_scenes(nusc):
 
 #     return train_nusc_infos, val_nusc_infos
 
-# 기존 _fill_trainval_infos 함수를 이 코드로 전체 교체하세요.
+### 기존 _fill_trainval_infos 함수를 이 코드로 전체 교체하세요.
 
+##### version(old) :2d gt 생성 로직 미포함
 def _fill_trainval_infos(nusc,
                          train_scenes,
                          val_scenes,
@@ -457,6 +458,167 @@ def _fill_trainval_infos(nusc,
             val_nusc_infos.append(info)
 
     return train_nusc_infos, val_nusc_infos
+
+# ======================== 아래 코드로 함수 전체를 다시 교체하세요 (필터링 로직 추가) ========================
+
+# # ======================== 아래 코드로 함수 전체를 다시 교체하세요 (최종 완성 버전) ========================
+
+# def _fill_trainval_infos(nusc,
+#                          train_scenes,
+#                          val_scenes,
+#                          test=False,
+#                          max_sweeps=10):
+#     train_nusc_infos = []
+#     val_nusc_infos = []
+
+#     for sample in mmengine.track_iter_progress(nusc.sample):
+#         # ... (기본 정보 로딩 부분은 이전과 동일) ...
+#         lidar_token = sample['data']['LIDAR_TOP']
+#         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+#         cs_record = nusc.get('calibrated_sensor',
+#                              sd_rec['calibrated_sensor_token'])
+#         pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
+#         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
+#         mmengine.check_file_exist(lidar_path)
+#         info = {
+#             'lidar_path': lidar_path, 'num_features': 5, 'token': sample['token'],
+#             'sweeps': [], 'cams': dict(),
+#             'lidar2ego_translation': cs_record['translation'],
+#             'lidar2ego_rotation': cs_record['rotation'],
+#             'ego2global_translation': pose_record['translation'],
+#             'ego2global_rotation': pose_record['rotation'],
+#             'timestamp': sample['timestamp'],
+#         }
+#         l2e_r = info['lidar2ego_rotation']
+#         l2e_t = info['lidar2ego_translation']
+#         e2g_r = info['ego2global_rotation']
+#         e2g_t = info['ego2global_translation']
+#         l2e_r_mat = Quaternion(l2e_r).rotation_matrix
+#         e2g_r_mat = Quaternion(e2g_r).rotation_matrix
+#         camera_types = [
+#             'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK',
+#             'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
+#         ]
+#         for cam in camera_types:
+#             cam_token = sample['data'][cam]
+#             cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
+#             cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
+#                                          e2g_t, e2g_r_mat, cam)
+#             cam_info.update(cam_intrinsic=cam_intrinsic)
+#             info['cams'].update({cam: cam_info})
+#         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+#         sweeps = []
+#         while len(sweeps) < max_sweeps:
+#             if not sd_rec['prev'] == '':
+#                 sweep = obtain_sensor2top(nusc, sd_rec['prev'], l2e_t,
+#                                           l2e_r_mat, e2g_t, e2g_r_mat, 'lidar')
+#                 sweeps.append(sweep)
+#                 sd_rec = nusc.get('sample_data', sd_rec['prev'])
+#             else:
+#                 break
+#         info['sweeps'] = sweeps
+
+#         if not test:
+#             annotations = [
+#                 nusc.get('sample_annotation', token) for token in sample['anns']
+#             ]
+            
+#             valid_ann_indices = []
+#             valid_names = []
+#             for i, ann in enumerate(annotations):
+#                 mapped_name = NuScenesNameMapping.get(ann['category_name'], None)
+#                 if mapped_name is not None and mapped_name in nus_categories:
+#                     valid_ann_indices.append(i)
+#                     valid_names.append(mapped_name)
+
+#             if not valid_ann_indices:
+#                 info['ann_info'] = {
+#                     'gt_bboxes_3d': np.zeros((0, 7), dtype=np.float32),
+#                     'gt_labels_3d': np.zeros((0,), dtype=np.int64)
+#                 }
+#                 info['gt_names'] = np.zeros((0,), dtype='<U20')
+#                 info['gt_bboxes_3d'] = np.zeros((0, 7), dtype=np.float32)
+#                 info['num_lidar_pts'] = []
+#                 info['valid_flag'] = []
+#                 info['ann_info_2d_per_cam'] = {cam: {'gt_bboxes': np.zeros((0,4), dtype=np.float32), 'gt_labels': np.zeros((0,), dtype=np.int64)} for cam in camera_types}
+#                 if sample['scene_token'] in train_scenes:
+#                     train_nusc_infos.append(info)
+#                 else:
+#                     val_nusc_infos.append(info)
+#                 continue
+            
+#             annotations = [annotations[i] for i in valid_ann_indices]
+#             boxes = [boxes[i] for i in valid_ann_indices]
+#             names = np.array(valid_names)
+
+#             locs = np.array([b.center for b in boxes]).reshape(-1, 3)
+#             dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+#             rots = np.array([b.orientation.yaw_pitch_roll[0] for b in boxes]).reshape(-1, 1)
+            
+#             gt_bboxes_3d = np.concatenate([locs, dims[:, [1, 0, 2]], rots], axis=1)
+#             gt_labels_3d = np.array([nus_categories.index(name) for name in names])
+            
+#             num_lidar_pts = np.array([a['num_lidar_pts'] for a in annotations])
+#             valid_flag = np.array([(a['num_lidar_pts'] + a['num_radar_pts']) > 0 for a in annotations], dtype=bool)
+
+#             # --- ✨✨ 핵심 수정: 두 형식 모두에 정보 저장 ✨✨ ---
+#             # 1. Dataset 클래스 초기화를 위한 최상위 레벨 저장
+#             info['gt_names'] = names
+#             info['gt_bboxes_3d'] = gt_bboxes_3d
+#             info['gt_labels_3d'] = gt_labels_3d
+#             info['num_lidar_pts'] = num_lidar_pts
+#             info['valid_flag'] = valid_flag
+
+#             # 2. LoadAnnotations3D 파이프라인을 위한 'ann_info' 내부 저장
+#             ann_info = {
+#                 'gt_bboxes_3d': gt_bboxes_3d,
+#                 'gt_labels_3d': gt_labels_3d
+#             }
+#             info['ann_info'] = ann_info
+#             # --------------------------------------------------------
+
+#             # (2D GT 생성 로직은 수정 불필요)
+#             ann_info_2d_per_cam = {}
+#             for cam_type in camera_types:
+#                 gt_bboxes_2d = []
+#                 cam_token = info['cams'][cam_type]['sample_data_token']
+#                 cam_calibrated_sensor = nusc.get('calibrated_sensor', nusc.get('sample_data', cam_token)['calibrated_sensor_token'])
+#                 cam_ego_pose = nusc.get('ego_pose', nusc.get('sample_data', cam_token)['ego_pose_token'])
+#                 cam_intrinsic = np.array(cam_calibrated_sensor['camera_intrinsic'])
+#                 for i, box in enumerate(boxes):
+#                     box_cam = box.copy()
+#                     box_cam.translate(-np.array(cam_ego_pose['translation']))
+#                     box_cam.rotate(Quaternion(cam_ego_pose['rotation']).inverse)
+#                     box_cam.translate(-np.array(cam_calibrated_sensor['translation']))
+#                     box_cam.rotate(Quaternion(cam_calibrated_sensor['rotation']).inverse)
+#                     if box_cam.center[2] > 0.1:
+#                         corners_2d = view_points(box_cam.corners(), cam_intrinsic, True)[:2, :]
+#                         on_img = (corners_2d[0, :] >= 0) & (corners_2d[0, :] < 1600) & (corners_2d[1, :] >= 0) & (corners_2d[1, :] < 900)
+#                         if not np.any(on_img): 
+#                             gt_bboxes_2d.append(np.array([-1,-1,-1,-1]))
+#                             continue
+#                         min_uv = np.min(corners_2d, axis=1)
+#                         max_uv = np.max(corners_2d, axis=1)
+#                         bbox_2d = np.concatenate([min_uv, max_uv])
+#                         gt_bboxes_2d.append(bbox_2d)
+#                     else:
+#                         gt_bboxes_2d.append(np.array([-1,-1,-1,-1]))
+#                 valid_indices_2d = [i for i, bbox in enumerate(gt_bboxes_2d) if not np.all(bbox == -1)]
+#                 valid_labels_2d = np.array([gt_labels_3d[i] for i in valid_indices_2d])
+#                 ann_info_2d_per_cam[cam_type] = {
+#                     'gt_bboxes': np.array([gt_bboxes_2d[i] for i in valid_indices_2d], dtype=np.float32),
+#                     'gt_labels': valid_labels_2d
+#                 }
+#             info['ann_info_2d_per_cam'] = ann_info_2d_per_cam
+            
+#         if sample['scene_token'] in train_scenes:
+#             train_nusc_infos.append(info)
+#         else:
+#             val_nusc_infos.append(info)
+
+#     return train_nusc_infos, val_nusc_infos
+
+# # ======================== 함수 교체는 여기까지 ========================
 
 def obtain_sensor2top(nusc,
                       sensor_token,

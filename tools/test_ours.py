@@ -140,6 +140,36 @@ def main():
         # build customized runner from the registry
         # if 'runner_type' is set in the cfg
         runner = RUNNERS.build(cfg)
+    
+    # --- ▼▼▼▼▼ 여기에 아래 코드를 추가하세요 ▼▼▼▼▼ ---
+
+    # ===============================================================
+    # ============== 시각화 강제 활성화 디버깅 코드 =================
+    print("\n\n" + "="*50)
+    print("      DEBUG: FORCING VISUALIZATION HOOK ACTIVATION")
+    print("="*50 + "\n")
+
+    # 시각화 훅을 직접 찾아서 속성을 강제로 덮어씁니다.
+    for hook in runner.hooks:
+        # 우리가 사용하는 시각화 훅의 정확한 클래스 이름을 찾습니다.
+        if 'VisualizationHook' in hook.__class__.__name__:
+            print(f"DEBUG: Found hook: {hook.__class__.__name__}")
+            
+            # 1. 시각화 스위치를 강제로 켭니다.
+            hook.draw = True
+            print(f"DEBUG: hook.draw forced to -> {hook.draw}")
+            
+            # 2. 출력 경로를 강제로 설정합니다.
+            hook.test_out_dir = './visualization_forced'
+            print(f"DEBUG: hook.test_out_dir forced to -> {hook.test_out_dir}")
+            
+            # 3. 점수 커트라인을 강제로 설정합니다.
+            if hasattr(hook, 'score_thr'):
+                hook.score_thr = 0.01
+                print(f"DEBUG: hook.score_thr forced to -> {hook.score_thr}")
+
+    # ===============================================================
+    # ===============================================================
 
     # start testing
     runner.test()

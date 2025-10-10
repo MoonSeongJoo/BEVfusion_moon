@@ -157,74 +157,138 @@ class Det3DVisualizationHook(Hook):
                 step=total_curr_iter,
                 show_pcd_rgb=self.show_pcd_rgb)
 
+    # def after_test_iter(self, runner: Runner, batch_idx: int, data_batch: dict,
+    #                     outputs: Sequence[Det3DDataSample]) -> None:
+    #     """Run after every testing iterations.
+
+    #     Args:
+    #         runner (:obj:`Runner`): The runner of the testing process.
+    #         batch_idx (int): The index of the current batch in the val loop.
+    #         data_batch (dict): Data from dataloader.
+    #         outputs (Sequence[:obj:`DetDataSample`]): A batch of data samples
+    #             that contain annotations and predictions.
+    #     """
+    #     if self.draw is False:
+    #         return
+
+    #     if self.test_out_dir is not None:
+    #         self.test_out_dir = osp.join(runner.work_dir, runner.timestamp,
+    #                                      self.test_out_dir)
+    #         mkdir_or_exist(self.test_out_dir)
+
+    #     for data_sample in outputs:
+    #         self._test_index += 1
+
+    #         data_input = dict()
+    #         assert 'img_path' in data_sample or 'lidar_path' in data_sample, \
+    #             "'data_sample' must contain 'img_path' or 'lidar_path'"
+
+    #         out_file = o3d_save_path = None
+
+    #         if self.vis_task in [
+    #                 'mono_det', 'multi-view_det', 'multi-modality_det'
+    #         ]:
+    #             assert 'img_path' in data_sample, \
+    #                 'img_path is not in data_sample'
+    #             img_path = data_sample.img_path
+    #             if isinstance(img_path, list):
+    #                 img = []
+    #                 for single_img_path in img_path:
+    #                     img_bytes = get(
+    #                         single_img_path, backend_args=self.backend_args)
+    #                     single_img = mmcv.imfrombytes(
+    #                         img_bytes, channel_order='rgb')
+    #                     img.append(single_img)
+    #             else:
+    #                 img_bytes = get(img_path, backend_args=self.backend_args)
+    #                 img = mmcv.imfrombytes(img_bytes, channel_order='rgb')
+    #             data_input['img'] = img
+    #             if self.test_out_dir is not None:
+    #                 if isinstance(img_path, list):
+    #                     img_path = img_path[0]
+    #                 out_file = osp.basename(img_path)
+    #                 out_file = osp.join(self.test_out_dir, out_file)
+
+    #         if self.vis_task in [
+    #                 'lidar_det', 'multi-modality_det', 'lidar_seg'
+    #         ]:
+    #             assert 'lidar_path' in data_sample, \
+    #                 'lidar_path is not in data_sample'
+    #             lidar_path = data_sample.lidar_path
+    #             num_pts_feats = data_sample.num_pts_feats
+    #             pts_bytes = get(lidar_path, backend_args=self.backend_args)
+    #             points = np.frombuffer(pts_bytes, dtype=np.float32)
+    #             points = points.reshape(-1, num_pts_feats)
+    #             data_input['points'] = points
+    #             if self.test_out_dir is not None:
+    #                 o3d_save_path = osp.basename(lidar_path).split(
+    #                     '.')[0] + '.png'
+    #                 o3d_save_path = osp.join(self.test_out_dir, o3d_save_path)
+
+    #         self._visualizer.add_datasample(
+    #             'test sample',
+    #             data_input,
+    #             data_sample=data_sample,
+    #             draw_gt=self.draw_gt,
+    #             draw_pred=self.draw_pred,
+    #             show=self.show,
+    #             vis_task=self.vis_task,
+    #             wait_time=self.wait_time,
+    #             pred_score_thr=self.score_thr,
+    #             out_file=out_file,
+    #             o3d_save_path=o3d_save_path,
+    #             step=self._test_index,
+    #             show_pcd_rgb=self.show_pcd_rgb)
+
+    # 기존 after_test_iter 함수를 지우고 이 코드로 완전히 교체하세요.
     def after_test_iter(self, runner: Runner, batch_idx: int, data_batch: dict,
                         outputs: Sequence[Det3DDataSample]) -> None:
-        """Run after every testing iterations.
+        """[최종 수정본] 버그를 우회하고 지정된 경로에 직접 저장하는 함수"""
 
-        Args:
-            runner (:obj:`Runner`): The runner of the testing process.
-            batch_idx (int): The index of the current batch in the val loop.
-            data_batch (dict): Data from dataloader.
-            outputs (Sequence[:obj:`DetDataSample`]): A batch of data samples
-                that contain annotations and predictions.
-        """
+        # 설정 파일의 'draw=True' 옵션을 확인합니다.
         if self.draw is False:
             return
 
-        if self.test_out_dir is not None:
-            self.test_out_dir = osp.join(runner.work_dir, runner.timestamp,
-                                         self.test_out_dir)
-            mkdir_or_exist(self.test_out_dir)
+        # 설정 파일의 'test_out_dir' 값을 유일한 출력 경로로 사용합니다.
+        # work_dir나 timestamp와 합치는 버그가 있는 로직을 완전히 제거합니다.
+        output_dir = self.test_out_dir
+        if output_dir is None:
+            # 출력 경로가 지정되지 않으면 아무것도 하지 않습니다.
+            return
+        
+        # 출력 폴더가 존재하는지 확인하고, 없으면 생성합니다.
+        mkdir_or_exist(output_dir)
 
+        # --- (이 아래는 기존 코드와 거의 동일하나, output_dir을 사용하도록 수정) ---
         for data_sample in outputs:
             self._test_index += 1
 
             data_input = dict()
-            assert 'img_path' in data_sample or 'lidar_path' in data_sample, \
-                "'data_sample' must contain 'img_path' or 'lidar_path'"
-
             out_file = o3d_save_path = None
-
-            if self.vis_task in [
-                    'mono_det', 'multi-view_det', 'multi-modality_det'
-            ]:
-                assert 'img_path' in data_sample, \
-                    'img_path is not in data_sample'
+            
+            # 이미지 데이터 처리
+            if 'img_path' in data_sample:
                 img_path = data_sample.img_path
-                if isinstance(img_path, list):
-                    img = []
-                    for single_img_path in img_path:
-                        img_bytes = get(
-                            single_img_path, backend_args=self.backend_args)
-                        single_img = mmcv.imfrombytes(
-                            img_bytes, channel_order='rgb')
-                        img.append(single_img)
-                else:
-                    img_bytes = get(img_path, backend_args=self.backend_args)
-                    img = mmcv.imfrombytes(img_bytes, channel_order='rgb')
+                img_bytes = get(img_path[0] if isinstance(img_path, list) else img_path, backend_args=self.backend_args)
+                img = mmcv.imfrombytes(img_bytes, channel_order='rgb')
                 data_input['img'] = img
-                if self.test_out_dir is not None:
-                    if isinstance(img_path, list):
-                        img_path = img_path[0]
-                    out_file = osp.basename(img_path)
-                    out_file = osp.join(self.test_out_dir, out_file)
-
-            if self.vis_task in [
-                    'lidar_det', 'multi-modality_det', 'lidar_seg'
-            ]:
-                assert 'lidar_path' in data_sample, \
-                    'lidar_path is not in data_sample'
+                
+                # 파일 경로 생성 시, 우리가 지정한 output_dir을 사용합니다.
+                base_name = osp.basename(img_path[0] if isinstance(img_path, list) else img_path)
+                out_file = osp.join(output_dir, base_name)
+            
+            # 포인트 클라우드 데이터 처리
+            if 'lidar_path' in data_sample:
                 lidar_path = data_sample.lidar_path
-                num_pts_feats = data_sample.num_pts_feats
                 pts_bytes = get(lidar_path, backend_args=self.backend_args)
-                points = np.frombuffer(pts_bytes, dtype=np.float32)
-                points = points.reshape(-1, num_pts_feats)
+                points = np.frombuffer(pts_bytes, dtype=np.float32).reshape(-1, data_sample.num_pts_feats)
                 data_input['points'] = points
-                if self.test_out_dir is not None:
-                    o3d_save_path = osp.basename(lidar_path).split(
-                        '.')[0] + '.png'
-                    o3d_save_path = osp.join(self.test_out_dir, o3d_save_path)
-
+                
+                # 파일 경로 생성 시, 우리가 지정한 output_dir을 사용합니다.
+                base_name = osp.basename(lidar_path).split('.')[0] + '_bev.png'
+                o3d_save_path = osp.join(output_dir, base_name)
+            
+            # Visualizer 호출
             self._visualizer.add_datasample(
                 'test sample',
                 data_input,
@@ -236,6 +300,6 @@ class Det3DVisualizationHook(Hook):
                 wait_time=self.wait_time,
                 pred_score_thr=self.score_thr,
                 out_file=out_file,
-                o3d_save_path=o3d_save_path,
+                o3d_save_path=o3d_save_path, # BEV 이미지를 위해 o3d_save_path 사용
                 step=self._test_index,
                 show_pcd_rgb=self.show_pcd_rgb)
