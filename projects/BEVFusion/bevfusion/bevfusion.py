@@ -166,32 +166,13 @@ class BEVFusion(Base3DDetector):
             print("Freezing all modules EXCEPT the Image 2D Detection pipeline.")
             
             # # 동결할 모듈 목록 (2D 탐지 관련 모듈 제외)
-            # modules_to_freeze = {
-            #     # LiDAR Path
-            #     'pts_voxel_layer': self.pts_voxel_layer,
-            #     'pts_voxel_encoder': self.pts_voxel_encoder,
-            #     'pts_middle_encoder': self.pts_middle_encoder,
-            #     'pts_backbone': self.pts_backbone,
-            #     'pts_neck': self.pts_neck,
-                
-            #     # 3D Detection Head
-            #     'bbox_head': self.bbox_head,
-                
-            #     # Fusion & View Transform
-            #     'view_transform': self.view_transform,
-            #     'fusion_layer': self.fusion_layer,
-                
-            #     # Custom Modules
-            #     'corr': self.corr,
-            #     'z_estimator': self.z_estimator,
-            # }
             modules_to_freeze = {
-                # # LiDAR Path
-                # 'pts_voxel_layer': self.pts_voxel_layer,
-                # 'pts_voxel_encoder': self.pts_voxel_encoder,
-                # 'pts_middle_encoder': self.pts_middle_encoder,
-                # 'pts_backbone': self.pts_backbone,
-                # 'pts_neck': self.pts_neck,
+                # LiDAR Path
+                'pts_voxel_layer': self.pts_voxel_layer,
+                'pts_voxel_encoder': self.pts_voxel_encoder,
+                'pts_middle_encoder': self.pts_middle_encoder,
+                'pts_backbone': self.pts_backbone,
+                'pts_neck': self.pts_neck,
                 
                 # # 3D Detection Head
                 # 'bbox_head': self.bbox_head,
@@ -200,10 +181,29 @@ class BEVFusion(Base3DDetector):
                 # 'view_transform': self.view_transform,
                 # 'fusion_layer': self.fusion_layer,
                 
-                # # Custom Modules
+                # Custom Modules
                 'corr': self.corr,
                 # 'z_estimator': self.z_estimator,
             }
+            # modules_to_freeze = {
+            #     # # LiDAR Path
+            #     # 'pts_voxel_layer': self.pts_voxel_layer,
+            #     # 'pts_voxel_encoder': self.pts_voxel_encoder,
+            #     # 'pts_middle_encoder': self.pts_middle_encoder,
+            #     # 'pts_backbone': self.pts_backbone,
+            #     # 'pts_neck': self.pts_neck,
+                
+            #     # # 3D Detection Head
+            #     # 'bbox_head': self.bbox_head,
+                
+            #     # # Fusion & View Transform
+            #     # 'view_transform': self.view_transform,
+            #     # 'fusion_layer': self.fusion_layer,
+                
+            #     # # Custom Modules
+            #     'corr': self.corr,
+            #     # 'z_estimator': self.z_estimator,
+            # }
 
             # 선택된 모듈들의 파라미터 업데이트를 중지
             for name, module in modules_to_freeze.items():
@@ -1612,8 +1612,8 @@ class BEVFusion(Base3DDetector):
         pred_delta_trans = pred_delta_6dof[..., 3:]
 
         # Calibration Loss 추가
-        losses['loss_calib_rot'] = F.l1_loss(pred_delta_rot, gt_delta_rot, reduction='mean') * 1.0
-        losses['loss_calib_trans'] = F.l1_loss(pred_delta_trans, gt_delta_trans, reduction='mean') * 1.0
+        losses['loss_calib_rot'] = F.l1_loss(pred_delta_rot, gt_delta_rot, reduction='mean') * 10.0
+        losses['loss_calib_trans'] = F.l1_loss(pred_delta_trans, gt_delta_trans, reduction='mean') * 2.0
 
         # # ##### 검증용 display ######
         # from .imageprocessing_unit import draw_correspondences
@@ -1689,7 +1689,7 @@ class BEVFusion(Base3DDetector):
 
         # # --- ✨ VERIFICATION 2: 최종 시각적 검증 (GT / Broken / Corrected 비교) ---
         # # 100 스텝마다 첫 번째 샘플의 첫 번째 카메라만 시각화하여 확인
-        # if hasattr(self, 'training_step') and self.training_step % 500 == 0:
+        # if hasattr(self, 'training_step') and self.training_step % 50 == 0:
         #     with torch.no_grad():
         #         import matplotlib.pyplot as plt
         #         import cv2

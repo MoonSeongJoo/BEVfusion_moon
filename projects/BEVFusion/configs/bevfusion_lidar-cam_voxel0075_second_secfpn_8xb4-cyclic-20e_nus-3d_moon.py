@@ -453,11 +453,19 @@ default_hooks = dict(
                 interval=50,
                 ),
     # checkpoint=dict(type='CheckpointHook', interval=1),
+    # checkpoint=dict(
+    #     type='CheckpointHook',
+    #     interval=500,      # 1000번의 이터레이션마다 저장
+    #     by_epoch=False,
+    #     max_keep_ckpts=3,),    # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
     checkpoint=dict(
         type='CheckpointHook',
-        interval=500,      # 1000번의 이터레이션마다 저장
+        interval=500,           # 500 이터레이션마다 체크포인트 저장 조건 확인
         by_epoch=False,
-        max_keep_ckpts=3,),    # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
+        save_best='train/loss',   # 'val/loss'를 기준으로 가장 좋은 모델을 저장
+        rule='less',            # loss는 낮을수록 좋으므로 'less'로 설정
+        max_keep_ckpts=3,       # 가장 좋은 체크포인트 3개만 유지
+    ),
     # --- ▼▼▼ 이 부분을 아래와 같이 수정하세요 ▼▼▼ ---
     visualization=dict(
         type='Det3DVisualizationHook',
@@ -467,7 +475,7 @@ default_hooks = dict(
     ))
 del _base_.custom_hooks
 
-load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
+load_from =  "data/work_dirs/bevfusion/20251010_bevfusion_pre_trained/iter_1500.pth"
 # load_from = None
 resume_from = None
 
