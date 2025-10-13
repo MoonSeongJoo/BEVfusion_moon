@@ -1614,8 +1614,6 @@ class BEVFusion(Base3DDetector):
         sbs_img, pertubed_points,dense_depth_map = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
         B,N,C,H,W = sbs_img.shape
         
-        # raw_corrs, cycle, corr_mask, enc_out = self.corr(sbs_img.view(B*N,C,H,W), query_input)
-
         # --- ✨ FIX 2: 활성 카메라가 있을 때만 네트워크 학습 수행 ---
         if len(active_cam_indices) > 0:
             # 활성 카메라 인덱스를 사용해 이미지와 쿼리 필터링
@@ -1628,20 +1626,42 @@ class BEVFusion(Base3DDetector):
             
             # 필터링된 데이터로 네트워크 호출
             raw_corrs, cycle, corr_mask, enc_out = self.corr(sbs_view, query_input_filtered)
+            # <<< START: MODIFICATION - 선택적 Loss 계산 >>>
+            pred_delta_6dof_filtered = self.calib_head(enc_out) # 모양: [활성 카메라 수, 6]
+            
+            # 1.Loss 계산은 '필터링된' 값들을 사용해 정확하게 수행
+            pred_rot_filtered = pred_delta_6dof_filtered[..., :3]
+            pred_trans_filtered = pred_delta_6dof_filtered[..., 3:]
+
+            gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
+            gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
+
+            losses['loss_calib_rot'] = F.l1_loss(pred_rot_filtered, gt_rot_filtered, reduction='mean') * 10.0
+            losses['loss_calib_trans'] = F.l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 2.0
+
+            # 2. (✨ 중요 ✨) 전체 카메라에 대한 예측 텐서를 0으로 생성 후, '재구성'
+            pred_delta_6dof = torch.zeros(B, N, 6, device=enc_out.device)
+            if B == 1:
+                # 필터링된 예측 결과를 올바른 위치에 다시 채워넣음
+                pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_filtered
+
+            # 3. (이제 가능) '재구성된 전체 텐서'에서 rot, trans를 분리
+            #    이 변수들이 corrected_calib_dict 함수로 전달됨
+            pred_delta_rot = pred_delta_6dof[..., :3]
+            pred_delta_trans = pred_delta_6dof[..., 3:]
+            
         else:
-            # 어떤 카메라도 2D 객체를 탐지하지 못한 경우, 빈 결과 또는 0을 반환하여
-            # loss 계산 시 에러가 나지 않도록 처리해야 합니다.
-            # (모델의 출력 스펙에 맞게 조정 필요)
-            raw_corrs, cycle, corr_mask, enc_out = None, None, None, None # 예시
-            # 또는 loss에 영향을 주지 않는 zero tensor를 생성할 수도 있습니다.
+            # 2D 객체가 없는 경우, 모든 예측값과 loss를 0으로 설정
+            raw_corrs, cycle, corr_mask, enc_out = None, None, None, None
+            pred_delta_6dof = torch.zeros(B, N, 6, device=sbs_img.device)
+            
+            # 전체 텐서를 0으로 만들었으므로, rot/trans도 자동으로 0이 됨
+            pred_delta_rot = pred_delta_6dof[..., :3]
+            pred_delta_trans = pred_delta_6dof[..., 3:]
 
-        pred_delta_6dof = self.calib_head(enc_out).view(B, N, 6)
-        pred_delta_rot = pred_delta_6dof[..., :3]
-        pred_delta_trans = pred_delta_6dof[..., 3:]
-
-        # Calibration Loss 추가
-        losses['loss_calib_rot'] = F.l1_loss(pred_delta_rot, gt_delta_rot, reduction='mean') * 10.0
-        losses['loss_calib_trans'] = F.l1_loss(pred_delta_trans, gt_delta_trans, reduction='mean') * 2.0
+            # Loss도 0으로 설정
+            losses['loss_calib_rot'] = torch.tensor(0.0, device=sbs_img.device, requires_grad=True)
+            losses['loss_calib_trans'] = torch.tensor(0.0, device=sbs_img.device, requires_grad=True)
 
         # # ##### 검증용 display ######
         # from .imageprocessing_unit import draw_correspondences
@@ -1938,16 +1958,15 @@ class BEVFusion(Base3DDetector):
                 batch_data_samples: List[Det3DDataSample],
                 **kwargs) -> List[Det3DDataSample]:
         """
-        (함수 설명은 기존과 동일)
+        (Function description remains the same)
         """
-        # --- 1. 데이터 준비 (기존과 동일) ---
+        # --- 1. & 2. Data Prep and 2D Detections (Same as before) ---
         target_device = batch_inputs_dict['imgs'].device
         batch_input_metas = [item.metainfo for item in batch_data_samples]
 
         broken_camera2lidar = torch.stack([s.broken_camera2lidar for s in batch_data_samples]).to(target_device)
         broken_camera_intrinsics = torch.stack([s.broken_camera_intrinsics for s in batch_data_samples]).to(target_device)
         
-        # --- 2. 2D 특징 추출 및 객체 탐지 (기존과 동일) ---
         img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
         reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
             img_feats, batch_data_samples)
@@ -1958,7 +1977,7 @@ class BEVFusion(Base3DDetector):
         detections_2d_orig_coords = self.convert_boxes_to_original_scale(
             pred_results_list=detections_2d, data_samples_list=reshaped_data_samples)
 
-        # --- 3. 쿼리 포인트 생성 및 정규화 (기존과 동일) ---
+        # --- 3. Query Point Generation (Same as before) ---
         rois, _ = self._generate_rois_from_detections(detections_2d_orig_coords)
         rois_center = self.get_center_points(rois)
         trimed_center_pts = self.batch_rois_center_by_cam_id(rois_center, batch_size=200)
@@ -1972,53 +1991,57 @@ class BEVFusion(Base3DDetector):
         else:
             query_input = torch.stack([q_x, q_y], dim=-1)
 
-        # --- 4. Calibration 오차 예측 (✨ 수정된 로직 적용) ---
         sbs_img, _, dense_depth_map = self.extract_sbs_img(
             batch_inputs_dict, batch_input_metas, visualize=False)
         B, N, C, H, W = sbs_img.shape
 
-        # <<< START: MODIFICATION >>>
-        # 활성 카메라 인덱스 추출 (loss 함수와 동일)
+        # ==================== START: LOGIC ALIGNMENT WITH LOSS FUNCTION ====================
+        
+        # --- 4. Calibration Head Prediction Pipeline ---
+        
+        # Find active cameras based on 2D detections
         if rois_center.numel() > 0:
             active_cam_indices = torch.unique(rois_center[:, 0]).long()
         else:
             active_cam_indices = torch.tensor([], dtype=torch.long, device=rois_center.device)
-
-        # 최종 출력을 담을 전체 크기의 텐서 미리 생성
-        # self.corr.d_model은 corr 네트워크의 feature dimension 입니다. (예: 256)
-        d_model = self.corr.transformer.d_model 
-        raw_corrs = torch.zeros(B * N, query_input.shape[1], query_input.shape[2], device=query_input.device)
-        enc_out = torch.zeros(B * N, H * W, d_model, device=query_input.device)
-
-        # 활성 카메라가 있을 때만 네트워크를 통과시킴
+        
+        # Handle the two cases: with or without active cameras
         if len(active_cam_indices) > 0:
-            # B=1을 가정하고 필터링. (대부분의 추론 코드는 배치 크기 1로 동작)
+            # Filter inputs for active cameras
             sbs_img_filtered = sbs_img[:, active_cam_indices]
             query_input_filtered = query_input[active_cam_indices]
             
             num_active_cams = sbs_img_filtered.shape[1]
             sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
             
-            raw_corrs_filtered, _, _, enc_out_filtered = self.corr(sbs_view, query_input_filtered)
+            # Call the correlation network with filtered data
+            raw_corrs, _, _, enc_out = self.corr(sbs_view, query_input_filtered)
+            
+            # Predict calibration delta for active cameras
+            pred_delta_6dof_filtered = self.calib_head(enc_out)
 
-            # 결과를 전체 크기 텐서의 올바른 위치에 다시 채워넣음 (scatter)
-            # B=1 이라고 가정합니다.
+            # Reconstruct full-size tensors for the downstream pipeline
+            pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
+            
             if B == 1:
-                raw_corrs[active_cam_indices] = raw_corrs_filtered
-                enc_out[active_cam_indices] = enc_out_filtered
-            else:
-                # 배치 크기가 1보다 큰 경우에 대한 처리가 필요하다면 여기에 로직을 추가해야 합니다.
-                # 이 코드는 B=1에서 정상 동작합니다.
-                pass
+                pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_filtered
 
-        # 이제부터는 항상 [B*N, ...] 크기를 갖는 enc_out과 raw_corrs를 사용
-        pred_delta_6dof = self.calib_head(enc_out).view(B, N, 6)
-        # <<< END: MODIFICATION >>>
+        else:
+            # No active cameras, create zero tensors for all outputs
+            d_model = 312
+            feat_h, feat_w = 12, 64 # Default feature map size
+            
+            pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
+            raw_corrs = torch.zeros(B * N, query_input.shape[1], query_input.shape[2], device=target_device)
+            enc_out = torch.zeros(B * N, feat_h * feat_w, d_model, device=target_device)
 
+        # Split the (now fully reconstructed) tensor for the calibration correction function
         pred_delta_rot = pred_delta_6dof[..., :3]
         pred_delta_trans = pred_delta_6dof[..., 3:]
-        
-        # --- 5. 보정된 Calibration 생성 (기존과 동일) ---
+
+        # ===================== END: LOGIC ALIGNMENT WITH LOSS FUNCTION =====================
+
+        # --- 5. Correct Calibration Matrices (Now safe to run) ---
         corrected_calib_dict = self._get_corrected_calib_from_prediction(
             pred_delta_rot,
             pred_delta_trans,
@@ -2026,7 +2049,7 @@ class BEVFusion(Base3DDetector):
             broken_camera_intrinsics
         )
         
-        # --- 6. 3D 좌표 및 특징 생성 (기존과 동일) ---
+        # --- 6. Generate 3D Coordinates and Features (Now safe to run) ---
         raw_corrs_clone = raw_corrs.clone()
         r_x = (raw_corrs_clone[..., 0] - 0.5) * 2 * 1600
         r_y = raw_corrs_clone[..., 1] * 900
@@ -2040,7 +2063,7 @@ class BEVFusion(Base3DDetector):
         det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(
             det_xyz, det_feat_sampled, B=B, N_cam=N)
 
-        # --- 7. 최종 3D 특징 추출 및 객체 탐지 (기존과 동일) ---
+        # --- 7. & 8. Final 3D Detection and Formatting (Same as before) ---
         feats = self.extract_feat(
             batch_inputs_dict=batch_inputs_dict,
             batch_input_metas=batch_input_metas,
@@ -2050,7 +2073,6 @@ class BEVFusion(Base3DDetector):
         results_list_3d = self.bbox_head.predict(
             feats, det_xyz_proc, det_feat_proc, batch_input_metas)
         
-        # --- 8. 최종 결과 정리 (기존과 동일) ---
         results = self.add_pred_to_datasample(batch_data_samples,
                                             results_list_3d)
         return results
