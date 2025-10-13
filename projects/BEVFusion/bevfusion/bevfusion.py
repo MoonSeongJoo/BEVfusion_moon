@@ -1044,8 +1044,9 @@ class BEVFusion(Base3DDetector):
     
     def batch_rois_center_by_cam_id(self, rois_center, batch_size=100):
         """
-        rois_center 텐서에서 직접 카메라 ID를 읽어, 존재하는 카메라에 대해서만
-        데이터를 배치(batch) 형태로 변환합니다.
+        rois_center 텐서에서 카메라 ID를 읽어, 항상 6개의 카메라에 대한
+        고정된 크기의 배치(batch) 텐서를 생성합니다.
+        존재하지 않는 카메라 ID의 슬롯은 0으로 채워집니다.
         """
         device = rois_center.device
         
@@ -1583,8 +1584,15 @@ class BEVFusion(Base3DDetector):
 
         rois , proposla_list = self._generate_rois_from_detections(detections_2d_orig_coords)
         rois_center = self.get_center_points(rois)
+        
+        # --- ✨ FIX 1: 활성 카메라 인덱스 추출 ---
+        # rois_center가 비어있지 않은 경우에만 활성 카메라 인덱스를 찾습니다.
+        if rois_center.numel() > 0:
+            active_cam_indices = torch.unique(rois_center[:, 0]).long()
+        else:
+            active_cam_indices = torch.tensor([], dtype=torch.long, device=rois_center.device)
+        
         trimed_center_pts =self.batch_rois_center_by_cam_id(rois_center,batch_size=200)
-
         # query_input = trimed_center_pts[..., 2:].clone()
         # query_input[..., 0] /= 1600
         # query_input[..., 1] /= 900
@@ -1605,7 +1613,27 @@ class BEVFusion(Base3DDetector):
 
         sbs_img, pertubed_points,dense_depth_map = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
         B,N,C,H,W = sbs_img.shape
-        raw_corrs, cycle, corr_mask, enc_out = self.corr(sbs_img.view(B*N,C,H,W), query_input)
+        
+        # raw_corrs, cycle, corr_mask, enc_out = self.corr(sbs_img.view(B*N,C,H,W), query_input)
+
+        # --- ✨ FIX 2: 활성 카메라가 있을 때만 네트워크 학습 수행 ---
+        if len(active_cam_indices) > 0:
+            # 활성 카메라 인덱스를 사용해 이미지와 쿼리 필터링
+            sbs_img_filtered = sbs_img[:, active_cam_indices]  # (B, num_active_cams, C, H, W)
+            query_input_filtered = query_input[active_cam_indices] # (num_active_cams, 200, 2)
+            
+            # B=1이라고 가정하고, 필터링된 이미지의 view를 조정
+            num_active_cams = sbs_img_filtered.shape[1]
+            sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
+            
+            # 필터링된 데이터로 네트워크 호출
+            raw_corrs, cycle, corr_mask, enc_out = self.corr(sbs_view, query_input_filtered)
+        else:
+            # 어떤 카메라도 2D 객체를 탐지하지 못한 경우, 빈 결과 또는 0을 반환하여
+            # loss 계산 시 에러가 나지 않도록 처리해야 합니다.
+            # (모델의 출력 스펙에 맞게 조정 필요)
+            raw_corrs, cycle, corr_mask, enc_out = None, None, None, None # 예시
+            # 또는 loss에 영향을 주지 않는 zero tensor를 생성할 수도 있습니다.
 
         pred_delta_6dof = self.calib_head(enc_out).view(B, N, 6)
         pred_delta_rot = pred_delta_6dof[..., :3]

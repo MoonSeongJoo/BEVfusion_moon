@@ -419,7 +419,7 @@ param_scheduler = [
 ]
 
 # runtime settings
-train_cfg = dict(by_epoch=True, max_epochs=24, val_interval=24,)
+train_cfg = dict(by_epoch=True, max_epochs=24, val_interval=1,)
 val_cfg = dict()
 test_cfg = dict()
 
@@ -475,7 +475,7 @@ default_hooks = dict(
     ))
 del _base_.custom_hooks
 
-load_from =  "data/work_dirs/bevfusion/20251010_bevfusion_pre_trained/iter_1500.pth"
+load_from =  "data/work_dirs/bevfusion/20250929_bevfusion_ours_base/iter_372000.pth"
 # load_from = None
 resume_from = None
 
