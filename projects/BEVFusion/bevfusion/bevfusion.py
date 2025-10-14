@@ -1042,6 +1042,82 @@ class BEVFusion(Base3DDetector):
         center_points = torch.stack([cam_ids, obj_ids, center_x, center_y], dim=1)
         return center_points
     
+    ##### old code ######
+    # def batch_rois_center_by_cam_id(self, rois_center, batch_size=100):
+    #     """
+    #     rois_center 텐서에서 카메라 ID를 읽어, 항상 6개의 카메라에 대한
+    #     고정된 크기의 배치(batch) 텐서를 생성합니다.
+    #     존재하지 않는 카메라 ID의 슬롯은 0으로 채워집니다.
+    #     """
+    #     device = rois_center.device
+        
+    #     # 입력 텐서가 비어있는 경우, 빈 텐서를 반환
+    #     if rois_center.shape[0] == 0:
+    #         # num_cams를 알 수 없으므로 기본값 6으로 설정하거나, 호출하는 쪽에서 처리
+    #         return torch.zeros((6, batch_size, 4), device=device)
+
+    #     # 1. rois_center의 0열에서 모든 카메라 인덱스를 추출합니다.
+    #     cam_indices_tensor = rois_center[:, 0]
+        
+    #     # 2. 존재하는 고유한 카메라 ID 목록을 찾습니다.
+    #     unique_cam_ids = torch.unique(cam_indices_tensor).long().cpu().tolist()
+        
+    #     # 3. 최대 카메라 ID를 기반으로 출력 텐서의 크기를 결정합니다.
+    #     #    예: [0, 1, 5]가 있다면, 크기가 6인 텐서 (0~5)를 생성합니다.
+    #     max_cam_id = int(torch.max(cam_indices_tensor).item())
+    #     num_total_cams = max_cam_id + 1
+        
+    #     batched_centers = torch.zeros((num_total_cams, batch_size, 4), device=device)
+        
+    #     # 원본 객체 ID 저장 (검증 로직은 그대로 유지)
+    #     original_obj_ids = rois_center[:, 1].cpu().numpy()
+        
+    #     # 4. 하드코딩된 range(num_cams) 대신, 실제 존재하는 카메라 ID들을 순회합니다.
+    #     for cam_id in unique_cam_ids:
+    #         cam_mask = (rois_center[:, 0] == cam_id)
+    #         cam_centers = rois_center[cam_mask]
+    #         n = cam_centers.size(0)
+            
+    #         if n == 0:
+    #             continue
+                
+    #         # --- (내부 샘플링 로직은 기존과 동일) ---
+    #         obj_ids = cam_centers[:, 1].cpu().numpy()
+    #         unique_obj_ids = np.unique(obj_ids)
+    #         num_unique_objs = len(unique_obj_ids)
+            
+    #         if num_unique_objs <= batch_size:
+    #             if n < batch_size:
+    #                 repeat_factor = (batch_size + n - 1) // n
+    #                 cam_centers = cam_centers.repeat(repeat_factor, 1)[:batch_size]
+    #         else:
+    #             selected_indices = []
+    #             for obj_id in unique_obj_ids:
+    #                 obj_indices = np.where(obj_ids == obj_id)[0]
+    #                 selected_idx = np.random.choice(obj_indices)
+    #                 selected_indices.append(selected_idx)
+                    
+    #             if len(selected_indices) < batch_size:
+    #                 remaining = batch_size - len(selected_indices)
+    #                 all_indices = np.arange(n)
+    #                 # 이미 선택된 인덱스를 제외하고 남은 풀에서 추가 선택
+    #                 pool = np.setdiff1d(all_indices, selected_indices)
+    #                 # 만약 풀이 부족하면 복원 추출 허용
+    #                 replace = len(pool) < remaining
+    #                 extra_indices = np.random.choice(
+    #                     pool,
+    #                     size=remaining,
+    #                     replace=replace
+    #                 )
+    #                 selected_indices.extend(extra_indices)
+                    
+    #             selected_indices = torch.tensor(selected_indices, device=device, dtype=torch.long)
+    #             cam_centers = cam_centers[selected_indices]
+            
+    #         batched_centers[cam_id, :cam_centers.size(0)] = cam_centers[:batch_size]
+        
+    #     return batched_centers
+    
     def batch_rois_center_by_cam_id(self, rois_center, batch_size=100):
         """
         rois_center 텐서에서 카메라 ID를 읽어, 항상 6개의 카메라에 대한
@@ -1050,10 +1126,15 @@ class BEVFusion(Base3DDetector):
         """
         device = rois_center.device
         
-        # 입력 텐서가 비어있는 경우, 빈 텐서를 반환
+        # ✨ 1. 카메라 수를 6으로 고정합니다.
+        NUM_CAMS = 6 
+        
+        # ✨ 2. 출력 텐서를 고정된 [6, batch_size, 4] 크기로 생성합니다.
+        batched_centers = torch.zeros((NUM_CAMS, batch_size, 4), device=device)
+
+        # 입력 텐서가 비어있는 경우, 위에서 생성한 제로 텐서를 그대로 반환
         if rois_center.shape[0] == 0:
-            # num_cams를 알 수 없으므로 기본값 6으로 설정하거나, 호출하는 쪽에서 처리
-            return torch.zeros((6, batch_size, 4), device=device)
+            return batched_centers
 
         # 1. rois_center의 0열에서 모든 카메라 인덱스를 추출합니다.
         cam_indices_tensor = rois_center[:, 0]
@@ -1061,18 +1142,14 @@ class BEVFusion(Base3DDetector):
         # 2. 존재하는 고유한 카메라 ID 목록을 찾습니다.
         unique_cam_ids = torch.unique(cam_indices_tensor).long().cpu().tolist()
         
-        # 3. 최대 카메라 ID를 기반으로 출력 텐서의 크기를 결정합니다.
-        #    예: [0, 1, 5]가 있다면, 크기가 6인 텐서 (0~5)를 생성합니다.
-        max_cam_id = int(torch.max(cam_indices_tensor).item())
-        num_total_cams = max_cam_id + 1
+        # ✨ 3. 입력 데이터에 기반해 크기를 정하던 로직은 삭제되었습니다.
         
-        batched_centers = torch.zeros((num_total_cams, batch_size, 4), device=device)
-        
-        # 원본 객체 ID 저장 (검증 로직은 그대로 유지)
-        original_obj_ids = rois_center[:, 1].cpu().numpy()
-        
-        # 4. 하드코딩된 range(num_cams) 대신, 실제 존재하는 카메라 ID들을 순회합니다.
+        # 4. 실제 존재하는 카메라 ID들을 순회하며 batched_centers의 해당 위치를 채웁니다.
         for cam_id in unique_cam_ids:
+            # cam_id가 6 이상인 예외적인 데이터가 들어올 경우를 대비
+            if cam_id >= NUM_CAMS:
+                continue
+                
             cam_mask = (rois_center[:, 0] == cam_id)
             cam_centers = rois_center[cam_mask]
             n = cam_centers.size(0)
@@ -1099,9 +1176,7 @@ class BEVFusion(Base3DDetector):
                 if len(selected_indices) < batch_size:
                     remaining = batch_size - len(selected_indices)
                     all_indices = np.arange(n)
-                    # 이미 선택된 인덱스를 제외하고 남은 풀에서 추가 선택
                     pool = np.setdiff1d(all_indices, selected_indices)
-                    # 만약 풀이 부족하면 복원 추출 허용
                     replace = len(pool) < remaining
                     extra_indices = np.random.choice(
                         pool,
@@ -1113,8 +1188,8 @@ class BEVFusion(Base3DDetector):
                 selected_indices = torch.tensor(selected_indices, device=device, dtype=torch.long)
                 cam_centers = cam_centers[selected_indices]
             
-            batched_centers[cam_id, :cam_centers.size(0)] = cam_centers[:batch_size]
-        
+            batched_centers[cam_id] = cam_centers[:batch_size]
+
         return batched_centers
     
     def remove_duplicate_objs(self,corrs_pred_with_obj):
