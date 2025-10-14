@@ -27,7 +27,8 @@ class ZEstimator(BaseModule):
         self.depth_predictor = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, 1)
+            nn.Linear(256, 1),
+            nn.ReLU()  # ✨ FIX: 음수 값을 0으로 만들기 위해 ReLU 추가
         )
         # 신뢰도 예측을 위한 작은 MLP (옵션)
         self.confidence_predictor = nn.Sequential(
