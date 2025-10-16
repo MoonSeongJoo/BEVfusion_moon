@@ -27,50 +27,49 @@ from .imageprocessing_unit import (dense_map_from_depth_batch_v2,
                                    )
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import torch
 import os
 import math
 
-class CalibrationCorrectionHead(nn.Module):
-    """
-    특징 맵을 입력받아 6-DoF 보정 파라미터를 예측하는 헤드.
+# class CalibrationCorrectionHead(nn.Module):
+#     """
+#     특징 맵을 입력받아 6-DoF 보정 파라미터를 예측하는 헤드.
 
-    Args:
-        in_channels (int): 입력 특징 맵의 채널 수.
-        hidden_dim (int): MLP의 중간층 차원.
-        out_dim (int): 출력 차원. 기본값은 6 (rot 3 + trans 3).
-    """
-    def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
-        super().__init__()
+#     Args:
+#         in_channels (int): 입력 특징 맵의 채널 수.
+#         hidden_dim (int): MLP의 중간층 차원.
+#         out_dim (int): 출력 차원. 기본값은 6 (rot 3 + trans 3).
+#     """
+#     def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
+#         super().__init__()
         
-        # 1. 공간 차원(H, W)을 없애고 채널 정보만 남기기 위한 풀링 레이어
-        self.pool = nn.AdaptiveAvgPool2d(1)
+#         # 1. 공간 차원(H, W)을 없애고 채널 정보만 남기기 위한 풀링 레이어
+#         self.pool = nn.AdaptiveAvgPool2d(1)
         
-        # 2. 풀링된 특징 벡터를 최종 6-DoF 값으로 매핑하는 MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim)
-        )
+#         # 2. 풀링된 특징 벡터를 최종 6-DoF 값으로 매핑하는 MLP
+#         self.mlp = nn.Sequential(
+#             nn.Linear(in_channels, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, out_dim)
+#         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): 입력 특징 맵 (B*N, C, H, W)
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             x (torch.Tensor): 입력 특징 맵 (B*N, C, H, W)
         
-        Returns:
-            torch.Tensor: 예측된 6-DoF 파라미터 (B*N, 6)
-        """
-        # (B*N, C, H, W) -> (B*N, C, 1, 1)
-        x = self.pool(x)
+#         Returns:
+#             torch.Tensor: 예측된 6-DoF 파라미터 (B*N, 6)
+#         """
+#         # (B*N, C, H, W) -> (B*N, C, 1, 1)
+#         x = self.pool(x)
         
-        # (B*N, C, 1, 1) -> (B*N, C)
-        x = torch.flatten(x, 1)
+#         # (B*N, C, 1, 1) -> (B*N, C)
+#         x = torch.flatten(x, 1)
         
-        # (B*N, C) -> (B*N, 6)
-        pred_delta_6dof = self.mlp(x)
+#         # (B*N, C) -> (B*N, 6)
+#         pred_delta_6dof = self.mlp(x)
         
-        return pred_delta_6dof
+#         return pred_delta_6dof
 
 @MODELS.register_module()
 class BEVFusion(Base3DDetector):
@@ -92,6 +91,7 @@ class BEVFusion(Base3DDetector):
         img_bbox_head: Optional[dict] = None,
         corr: Optional[dict] = None,
         z_estimator: Optional[dict] = None,
+        calib_head: Optional[dict] = None,
         init_cfg: OptMultiConfig = None,
         seg_head: Optional[dict] = None,
         train_cfg=None,  
@@ -128,6 +128,7 @@ class BEVFusion(Base3DDetector):
         self.img_bbox_head = MODELS.build(img_bbox_head)
         self.corr = MODELS.build(corr)
         self.z_estimator = MODELS.build(z_estimator)
+        self.calib_head = MODELS.build(calib_head)
         
         self.class_names = class_names
         self.name_to_idx = {name: i for i, name in enumerate(self.class_names)}
@@ -138,8 +139,6 @@ class BEVFusion(Base3DDetector):
         feat_dim_original = 312 # 입력 차원은 det_feat의 원래 특징 차원입니다 (12 * 64 = 768).
         hidden_channel = bbox_head['hidden_channel'] # (128) 출력 차원은 TransFusionHead의 hidden_channel과 반드시 일치해야 합니다.
         self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
-
-        self.calib_head = CalibrationCorrectionHead(in_channels=312) 
 
         # =====================================================================
         # ✨ START: Code added for selective module freezing
@@ -156,6 +155,7 @@ class BEVFusion(Base3DDetector):
 
         self.vis_step_counter = 0
         self.training_step = 0
+        self.pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
     
     def _freeze_modules(self):
             """
@@ -1793,6 +1793,32 @@ class BEVFusion(Base3DDetector):
         esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map,enc_out)
         esitmated_uvz =torch.cat([raw_pred_center_pts, esitmated_z['depth']],dim=-1)
 
+        # ✨✨✨ START: Z-Estimator를 위한 희소 감독(Sparse Supervision) Loss ✨✨✨
+
+        # 1. z_estimator의 예측값과 LiDAR 투영 깊이 값을 가져옵니다.
+        z_estimated = esitmated_z['z_estimated_real'] # 모델의 예측
+        z_lidar_sparse_gt = esitmated_z['z_lidar_real'] # 신뢰할 수 있는 희소한 정답
+
+        # 2. 신뢰할 수 있는 지점(LiDAR 포인트가 실제로 있는 곳)에 대한 마스크를 생성합니다.
+        valid_mask = (z_lidar_sparse_gt > 0).squeeze(-1)
+
+        # 3. 신뢰할 수 있는 지점들에서만 L1 Loss를 계산합니다.
+        if valid_mask.any():
+            # 이 Loss는 모델에게 "적어도 LiDAR 포인트가 있는 곳에서는 값을 맞춰라!"고 가르칩니다.
+            loss_z_estimation = F.l1_loss(
+                z_estimated.squeeze(-1)[valid_mask], 
+                z_lidar_sparse_gt.squeeze(-1)[valid_mask], 
+                reduction='mean'
+            )
+        else:
+            # 이번 배치에 유효한 LiDAR 포인트가 하나도 없으면 loss는 0
+            loss_z_estimation = torch.tensor(0.0, device=target_device)
+
+        # 4. 계산된 loss를 전체 losses 딕셔너리에 추가합니다.
+        losses['loss_z_estimation'] = loss_z_estimation * 0.1 # loss 가중치는 조절 가능
+
+        # ✨✨✨ END: Z-Estimator Loss 추가 ✨✨✨
+
         corrected_calib_dict = self._get_corrected_calib_from_prediction(
                         pred_delta_rot,
                         pred_delta_trans,
@@ -1802,9 +1828,17 @@ class BEVFusion(Base3DDetector):
 
         # ✨ '보정된' lidar2imag를 사용하여 3D 좌표 변환 수행
         det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
-        #    이때 query_input은 -1~1 범위로 정규화된 상태여야 합니다.
+        det_xyz_ref = det_xyz.clone()
+        det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
+                self.pc_range[3] - self.pc_range[0])
+        det_xyz_ref[..., 1:2] = (det_xyz_ref[..., 1:2] - self.pc_range[1]) / (
+                self.pc_range[4] - self.pc_range[1])
+        det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
+                self.pc_range[5] - self.pc_range[2])
+        det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
+        
         det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
-        det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz,det_feat_sampled,B=B,N_cam=N)
+        det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz_ref_clamped,det_feat_sampled,B=B,N_cam=N)
 
         feats = self.extract_feat(batch_inputs_dict=batch_inputs_dict,
                                 batch_input_metas=batch_input_metas,

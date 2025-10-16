@@ -13,6 +13,7 @@ from .my_collate import custom_collate
 from .custom_data_preprocessor import CustomDet3DDataPreprocessor
 from .cotr import COTR
 from .zestimator import ZEstimator
+from .calib_head import CalibrationCorrectionHead
 
 __all__ = [
     'BEVFusion', 'TransFusionHead', 'ConvFuser', 'ImageAug3D', 'GridMask',
@@ -21,5 +22,5 @@ __all__ = [
     'BEVLoadMultiViewImageFromFiles', 'BEVFusionSparseEncoder',
     'TransformerDecoderLayer', 'BEVFusionRandomFlip3D',
     'BEVFusionGlobalRotScaleTrans' ,'custom_collate', 'CustomDet3DDataPreprocessor','COTR'
-    ,'ZEstimator'
+    ,'ZEstimator' ,'CalibrationCorrectionHead'
 ]

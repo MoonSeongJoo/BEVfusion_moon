@@ -166,6 +166,12 @@ model = dict(
             type='Pretrained',
             checkpoint='data/weights/zestimator_corrected.pth')
     ),
+    calib_head=dict(
+        type='CalibrationCorrectionHead',
+        in_channels=312,
+        hidden_dim=256,
+        out_dim=6,
+    ),
     fusion_layer=dict(
         type='ConvFuser', in_channels=[80, 256], out_channels=256)
 )
@@ -419,7 +425,7 @@ param_scheduler = [
 ]
 
 # runtime settings
-train_cfg = dict(by_epoch=True, max_epochs=24, val_interval=1,)
+train_cfg = dict(by_epoch=True, max_epochs=24, val_interval=24,)
 val_cfg = dict()
 test_cfg = dict()
 
@@ -438,7 +444,10 @@ optim_wrapper = dict(
             # 이미지 백본은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
             # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
-            'corr': dict(lr_mult=0.1, decay_mult=1.0),
+            # 'corr': dict(lr_mult=0.1, decay_mult=1.0),
+            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
+            'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
+            'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
         }),
     clip_grad=dict(max_norm=35, norm_type=2))
 
@@ -475,7 +484,8 @@ default_hooks = dict(
     ))
 del _base_.custom_hooks
 
-load_from =  "data/work_dirs/bevfusion/20251010_bevfusion_pre_trained/iter_12500.pth"
+# load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
+load_from =  "data/work_dirs/bevfusion/20251016_bevfusion_new/iter_2500.pth"
 # load_from = None
 resume_from = None
 
