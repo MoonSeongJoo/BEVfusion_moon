@@ -18,6 +18,7 @@ from mmdet3d.models.dense_heads.centerpoint_head import SeparateHead
 from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
+from .imageprocessing_unit import visualize_full_pipeline
 
 
 def clip_sigmoid(x, eps=1e-4):
@@ -191,6 +192,8 @@ class TransFusionHead(nn.Module):
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
 
+        self.training_step = 0
+
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
         # NOTE: modified
@@ -232,7 +235,7 @@ class TransFusionHead(nn.Module):
                 build_assigner(res) for res in self.train_cfg.assigner
             ]
 
-    def forward_single(self, inputs,det_xyz, det_feats, metas):
+    def forward_single(self, inputs,det_xyz, det_feats, metas,batch_gt_instances_3d):
         """Forward function for CenterPoint.
         Args:
             inputs (torch.Tensor): Input feature map with the shape of
@@ -303,6 +306,8 @@ class TransFusionHead(nn.Module):
                 -1, -1, bev_pos.shape[-1]),
             dim=1,
         )
+        ###### 시각화 하기 위한 변수 따기 ##########
+        lidar_only_query_feat = query_feat.clone()
         
         # <<< [최종 수정] 2단계 퓨전 아키텍처 구현 >>>
         if det_xyz is not None and det_feats is not None:
@@ -331,7 +336,9 @@ class TransFusionHead(nn.Module):
 
             # 4. 다음 단계를 위해 텐서 모양 복원 [B, 128, C] -> [B, C, 128]
             query_feat = bev_query_feat.permute(0, 2, 1).contiguous()
-
+            # ✨ 2. "중간 보고" 캡처 (After Camera Fusion)
+            fused_query_feat = query_feat.clone()
+        
         #################################
         # transformer decoder layer (Fusion feature as K,V)
         #################################
@@ -344,6 +351,33 @@ class TransFusionHead(nn.Module):
                 key=fusion_feat_flatten,
                 query_pos=query_pos,
                 key_pos=bev_pos)
+            
+                    # ✨ 2. 시각화 코드를 호출합니다.
+
+            if self.training_step % 50 == 0 :
+                with torch.no_grad():
+                    # 배치의 첫 번째 샘플만 시각화
+                    gt_instances_3d = batch_gt_instances_3d[0]
+                    # ✨ FIX: train_cfg에서 좌표 변환에 필요한 정보를 가져옵니다.
+                    pc_range = self.train_cfg['point_cloud_range']
+                    voxel_size = self.train_cfg['voxel_size']
+                    
+                    visualize_full_pipeline(
+                                    cam_proposals_xyz=det_xyz[0],
+                                    cam_proposals_feat=det_feats[0],
+                                    query_pos=query_pos[0],
+                                    lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
+                                    fused_feat=fused_query_feat[0].permute(1, 0),
+                                    final_feat=query_feat[0].permute(1, 0),
+                                    gt_bboxes_3d=gt_instances_3d.bboxes_3d,
+                                    pc_range=pc_range,
+                                    voxel_size=voxel_size,
+                                    step=self.training_step,
+                                    save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
+                                )
+                    print ("end")
+            
+            self.training_step += 1
 
             # Prediction
             res_layer = self.prediction_heads[i](query_feat)
@@ -393,11 +427,11 @@ class TransFusionHead(nn.Module):
     #     res = multi_apply(self.forward_single, feats, [metas])
     #     assert len(res) == 1, 'only support one level features.'
     #     return res
-    def forward(self, feats, det_xyz=None, det_feats=None, metas=None):
+    def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None):
         if isinstance(feats, torch.Tensor):
             feats = [feats]
         # multi_apply 호출 시에도 순서만 맞춰주면 됩니다.
-        res = multi_apply(self.forward_single, feats, [det_xyz], [det_feats], [metas])
+        res = multi_apply(self.forward_single, feats, [det_xyz], [det_feats], [metas],[batch_gt_instances_3d])
         
         assert len(res) == 1, 'only support one level features.'
         return res
@@ -830,7 +864,7 @@ class TransFusionHead(nn.Module):
         for data_sample in batch_data_samples:
             batch_input_metas.append(data_sample.metainfo)
             batch_gt_instances_3d.append(data_sample.gt_instances_3d)
-        preds_dicts = self(batch_feats,det_xyz, det_feats,batch_input_metas)
+        preds_dicts = self(batch_feats,det_xyz, det_feats,batch_input_metas,batch_gt_instances_3d)
         loss = self.loss_by_feat(preds_dicts, batch_gt_instances_3d)
 
         return loss

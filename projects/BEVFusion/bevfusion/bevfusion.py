@@ -24,6 +24,7 @@ from .imageprocessing_unit import (dense_map_from_depth_batch_v2,
                                    display_depth_maps,
                                    save_batch_predictions_to_file,
                                    axis_angle_to_rotation_matrix,
+                                   visualize_bev_proposals,
                                    )
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -1794,7 +1795,6 @@ class BEVFusion(Base3DDetector):
         esitmated_uvz =torch.cat([raw_pred_center_pts, esitmated_z['depth']],dim=-1)
 
         # ✨✨✨ START: Z-Estimator를 위한 희소 감독(Sparse Supervision) Loss ✨✨✨
-
         # 1. z_estimator의 예측값과 LiDAR 투영 깊이 값을 가져옵니다.
         z_estimated = esitmated_z['z_estimated_real'] # 모델의 예측
         z_lidar_sparse_gt = esitmated_z['z_lidar_real'] # 신뢰할 수 있는 희소한 정답
@@ -1828,6 +1828,33 @@ class BEVFusion(Base3DDetector):
 
         # ✨ '보정된' lidar2imag를 사용하여 3D 좌표 변환 수행
         det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
+       
+        # ###### BEV display logic 추가 #############################
+        # if self.training_step % 50 == 0 :
+        #         with torch.no_grad(): # 그래디언트 계산 비활성화
+        #             # ✨ FIX: det_xyz를 먼저 계산해야 시각화에 사용할 수 있습니다.
+        #             # 이 계산은 아래 corrected_calib_dict가 생성된 후에 나옵니다.
+        #             # 따라서 시각화를 위해 여기서 임시로 'broken' calib을 사용해 계산합니다.
+        #             det_xyz_for_vis = det_xyz.clone() 
+        #             # 배치의 첫 번째 샘플만 시각화
+        #             # first_sample_det_xyz = det_xyz_for_vis.view(B, N, -1, 3)[0].view(-1, 3)
+        #             first_sample_det_xyz = det_xyz_for_vis.reshape(B, N, -1, 3)[0].reshape(-1, 3)
+                    
+        #             # ✨ FIX: batch_data_samples에서 직접 Ground Truth를 가져옵니다.
+        #             first_sample_gt_instances = batch_data_samples[0].gt_instances_3d
+                    
+        #             save_filename = f"work_dirs/bev_proposal_step_after_{self.training_step}.png"
+                    
+        #             visualize_bev_proposals(
+        #                 det_xyz=first_sample_det_xyz,
+        #                 gt_bboxes_3d=first_sample_gt_instances.bboxes_3d,
+        #                 step=self.training_step,
+        #                 save_path=save_filename
+        #             )
+        #             print ("end")
+        # self.training_step += 1
+        # ################### end #####################################
+
         det_xyz_ref = det_xyz.clone()
         det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
                 self.pc_range[3] - self.pc_range[0])

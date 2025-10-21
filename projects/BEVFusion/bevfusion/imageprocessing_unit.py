@@ -5361,3 +5361,201 @@ def axis_angle_to_rotation_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
     rotation_matrix = I + sin_angle * K + (1 - cos_angle) * torch.matmul(K, K)
     
     return rotation_matrix
+
+def visualize_bev_proposals(det_xyz, gt_bboxes_3d, step, save_path="bev_visualization.png"):
+    """
+    카메라 제안(det_xyz)과 정답 박스를 BEV 평면에 시각화합니다.
+
+    Args:
+        det_xyz (torch.Tensor): [num_proposals, 3] 모양의 카메라 제안 포인트.
+        gt_bboxes_3d (Box3DMode): Ground truth 3D 바운딩 박스 객체.
+        step (int): 현재 학습 스텝 (파일 이름에 사용).
+        save_path (str): 이미지를 저장할 경로.
+    """
+    # 텐서를 CPU의 NumPy 배열로 변환
+    points = det_xyz.detach().cpu().numpy()
+    gt_boxes = gt_bboxes_3d.tensor.cpu().numpy()
+
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.set_facecolor('black') # 배경을 검은색으로
+
+    # 1. 카메라 제안(det_xyz)을 스캐터 플롯으로 그립니다.
+    # Z 좌표(높이)를 색상으로 사용합니다.
+    scatter = ax.scatter(
+        points[:, 0],  # X 좌표
+        points[:, 1],  # Y 좌표
+        c=points[:, 2],  # Z 좌표를 색상으로 매핑
+        cmap='viridis',  # 색상 맵 (viridis, jet 등)
+        s=1,             # 점 크기
+        alpha=0.7,       # 투명도
+        label='Camera Proposals'
+    )
+    
+    # 색상 막대(Colorbar)를 추가하여 Z값의 의미를 표시
+    cbar = fig.colorbar(scatter, ax=ax, orientation='vertical', shrink=0.7)
+    cbar.set_label('Z coordinate (Height)')
+
+    # 2. Ground Truth 바운딩 박스를 그립니다. (녹색)
+    for i in range(len(gt_boxes)):
+        # MMDetection3D의 Box 객체는 보통 .corners 속성을 가집니다.
+        # BEV 평면의 코너 (앞 왼쪽, 뒤 왼쪽, 뒤 오른쪽, 앞 오른쪽)
+        corners = gt_bboxes_3d[i].corners.cpu().numpy()
+        # ================================================================
+        # # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼ 디버깅용 임시 코드 시작 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+        # # 목적: 8개 코너의 위치와 번호(0~7)를 직접 그려서 확인합니다.
+        
+        # # 1. 8개 코너의 X, Y 좌표를 모두 가져옵니다.
+        # bev_all_8_corners = corners[0, :, :2]
+        
+        # # 2. 8개 코너를 알아보기 쉽게 빨간 점으로 그립니다.
+        # ax.scatter(bev_all_8_corners[:, 0], bev_all_8_corners[:, 1], c='red', s=20, zorder=3)
+        
+        # # 3. 각 빨간 점 옆에 인덱스 번호(0~7)를 흰색 텍스트로 표시합니다.
+        # for j in range(8):
+        #     ax.text(bev_all_8_corners[j, 0] + 0.5, bev_all_8_corners[j, 1] + 0.5, str(j), color='white', fontsize=12)
+            
+        # # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ 디버깅용 임시 코드 끝 ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+        # ================================================================
+        bev_corners = corners[0, [0, 1, 2, 3], :2]
+        
+        # Polygon을 사용하여 회전된 사각형을 그립니다.
+        polygon = patches.Polygon(
+            bev_corners, 
+            edgecolor='lime', # 라임색
+            facecolor='none', 
+            linewidth=2,
+            label='Ground Truth' if i == 0 else "" # 범례 중복 방지
+        )
+        ax.add_patch(polygon)
+        
+    # 3. 자차(Ego Vehicle) 위치를 표시합니다. (흰색)
+    ego_vehicle = patches.Rectangle(
+        (-1.0, -2.5), 2.0, 5.0, # 대략적인 차량 크기
+        edgecolor='white', 
+        facecolor='none', 
+        linewidth=2,
+        label='Ego Vehicle'
+    )
+    ax.add_patch(ego_vehicle)
+    
+    # 4. 플롯 설정
+    ax.set_xlim(-51.2, 51.2) # nuScenes의 일반적인 BEV 범위
+    ax.set_ylim(-51.2, 51.2)
+    ax.set_aspect('equal', adjustable='box') # 가로세로 비율을 1:1로
+    ax.set_title(f"BEV Camera Proposals @ Step {step}")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    
+    # 범례 핸들 중복 제거
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys())
+    
+    # 이미지 저장 및 닫기
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ BEV visualization saved to {save_path}")
+
+def visualize_full_pipeline(
+    cam_proposals_xyz, cam_proposals_feat,  # <-- 추가된 인자
+    query_pos, lidar_only_feat, fused_feat, final_feat, 
+    gt_bboxes_3d, pc_range, voxel_size, step, save_path
+):
+    """
+    카메라 퓨전 전/후의 BEV 쿼리 특징을 시각화합니다.
+    """
+    # 텐서를 CPU의 NumPy 배열로 변환
+    cam_xyz = cam_proposals_xyz.detach().cpu().numpy()
+    cam_feat = cam_proposals_feat.detach().cpu().numpy()
+    pos = query_pos.detach().cpu().numpy()
+    feat1 = lidar_only_feat.detach().cpu().numpy()
+    feat2 = fused_feat.detach().cpu().numpy()
+    feat3 = final_feat.detach().cpu().numpy()
+    gt_boxes = gt_bboxes_3d.tensor.cpu().numpy()
+
+    # --- ✨✨✨ START: FIX - 카메라 제안 좌표 역정규화 ✨✨✨ ---
+    # 입력된 cam_xyz는 [0, 1]로 정규화된 상태입니다.
+    # 이를 pc_range를 이용해 다시 실제 미터(m) 단위 좌표로 변환합니다.
+    cam_metric_x = cam_xyz[:, 0] * (pc_range[3] - pc_range[0]) + pc_range[0]
+    cam_metric_y = cam_xyz[:, 1] * (pc_range[4] - pc_range[1]) + pc_range[1]
+    # Z 좌표는 색상으로만 사용되므로 변환이 필수는 아니지만, 일관성을 위해 변환할 수 있습니다.
+    # cam_metric_z = cam_xyz[:, 2] * (pc_range[5] - pc_range[2]) + pc_range[2]
+    # --- ✨✨✨ END: FIX --- ✨✨✨
+
+    # 각 특징 벡터의 L2 Norm(크기)을 계산
+    cam_norms = np.linalg.norm(cam_feat, axis=-1)
+    lidar_norms = np.linalg.norm(feat1, axis=-1)
+    fused_norms = np.linalg.norm(feat2, axis=-1)
+    final_norms = np.linalg.norm(feat3, axis=-1)
+
+    all_norms = np.concatenate([cam_norms, lidar_norms, fused_norms, final_norms])
+    vmin = all_norms.min()
+    vmax = all_norms.max()
+
+    # ✨ FIX: 1x4 서브플롯 생성
+    fig, (ax0, ax1, ax2, ax3) = plt.subplots(1, 4, figsize=(48, 12))
+    fig.suptitle(f"BEV Feature Pipeline @ Step {step}", fontsize=20)
+
+    # --- Plot 0: 초기 (Camera-Only Proposals) ---
+    ax0.set_title("0. Initial (Camera-Only)")
+    ax0.set_facecolor('black')
+    # ✨ FIX: 역정규화된 미터 단위 좌표를 사용하여 그립니다.
+    scatter0 = ax0.scatter(
+        cam_metric_x, 
+        cam_metric_y, 
+        c=cam_norms, 
+        cmap='viridis', 
+        s=5, 
+        alpha=0.7, 
+        vmin=vmin, 
+        vmax=vmax
+    )
+    fig.colorbar(scatter0, ax=ax0, label='Feature Norm (Strength)')
+
+    # --- Plot 1: 초기 (LiDAR-Only Queries) ---
+    ax1.set_title("1. Initial (LiDAR-Only)")
+    ax1.set_facecolor('black')
+    out_size_factor = 4 # Transfusion의 경우
+    metric_x = pos[:, 0] * voxel_size[0] * out_size_factor + pc_range[0]
+    metric_y = pos[:, 1] * voxel_size[1] * out_size_factor + pc_range[1]
+    scatter1 = ax1.scatter(metric_x, metric_y, c=lidar_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
+    fig.colorbar(scatter1, ax=ax1, label='Feature Norm (Strength)')
+
+    # --- Plot 2: 중간 (After Camera Fusion) ---
+    ax2.set_title("2. Mid-Fusion (LiDAR + Camera)")
+    ax2.set_facecolor('black')
+    scatter2 = ax2.scatter(metric_x, metric_y, c=fused_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
+    fig.colorbar(scatter2, ax=ax2, label='Feature Norm (Strength)')
+    
+    # --- Plot 3: 최종 (After Decoder Refinement) ---
+    ax3.set_title("3. Final (Refined)")
+    ax3.set_facecolor('black')
+    scatter3 = ax3.scatter(metric_x, metric_y, c=final_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
+    fig.colorbar(scatter3, ax=ax3, label='Feature Norm (Strength)')
+
+    # ✨ FIX: 모든 플롯에 공통 요소 그리기
+    for ax in [ax0, ax1, ax2, ax3]:
+        # ... (GT Box, Ego Vehicle, 축 설정 등 공통 로직은 이전과 동일) ...
+        for i in range(len(gt_boxes)):
+            corners = gt_bboxes_3d[i].corners.cpu().numpy()
+            bev_corners = corners[0, [0, 1, 2, 3], :2]
+            polygon = patches.Polygon(bev_corners, edgecolor='lime', facecolor='none', linewidth=2,
+                                      label='Ground Truth' if i == 0 else "")
+            ax.add_patch(polygon)
+        
+        ego_vehicle = patches.Rectangle((-1.0, -2.5), 2.0, 5.0, edgecolor='white', facecolor='none',
+                                        linewidth=2, label='Ego Vehicle')
+        ax.add_patch(ego_vehicle)
+        
+        ax.set_xlim(pc_range[0], pc_range[3])
+        ax.set_ylim(pc_range[1], pc_range[4])
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ Full pipeline visualization saved to {save_path}")
