@@ -352,30 +352,29 @@ class TransFusionHead(nn.Module):
                 query_pos=query_pos,
                 key_pos=bev_pos)
             
-                    # ✨ 2. 시각화 코드를 호출합니다.
-
-            if self.training_step % 50 == 0 :
-                with torch.no_grad():
-                    # 배치의 첫 번째 샘플만 시각화
-                    gt_instances_3d = batch_gt_instances_3d[0]
-                    # ✨ FIX: train_cfg에서 좌표 변환에 필요한 정보를 가져옵니다.
-                    pc_range = self.train_cfg['point_cloud_range']
-                    voxel_size = self.train_cfg['voxel_size']
+            ## ✨ 2. 시각화 코드를 호출합니다.
+            # if self.training_step % 50 == 0 :
+            #     with torch.no_grad():
+            #         # 배치의 첫 번째 샘플만 시각화
+            #         gt_instances_3d = batch_gt_instances_3d[0]
+            #         # ✨ FIX: train_cfg에서 좌표 변환에 필요한 정보를 가져옵니다.
+            #         pc_range = self.train_cfg['point_cloud_range']
+            #         voxel_size = self.train_cfg['voxel_size']
                     
-                    visualize_full_pipeline(
-                                    cam_proposals_xyz=det_xyz[0],
-                                    cam_proposals_feat=det_feats[0],
-                                    query_pos=query_pos[0],
-                                    lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
-                                    fused_feat=fused_query_feat[0].permute(1, 0),
-                                    final_feat=query_feat[0].permute(1, 0),
-                                    gt_bboxes_3d=gt_instances_3d.bboxes_3d,
-                                    pc_range=pc_range,
-                                    voxel_size=voxel_size,
-                                    step=self.training_step,
-                                    save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
-                                )
-                    print ("end")
+            #         visualize_full_pipeline(
+            #                         cam_proposals_xyz=det_xyz[0],
+            #                         cam_proposals_feat=det_feats[0],
+            #                         query_pos=query_pos[0],
+            #                         lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
+            #                         fused_feat=fused_query_feat[0].permute(1, 0),
+            #                         final_feat=query_feat[0].permute(1, 0),
+            #                         gt_bboxes_3d=gt_instances_3d.bboxes_3d,
+            #                         pc_range=pc_range,
+            #                         voxel_size=voxel_size,
+            #                         step=self.training_step,
+            #                         save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
+            #                     )
+            #         print ("end")
             
             self.training_step += 1
 

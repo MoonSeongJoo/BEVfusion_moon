@@ -19,6 +19,7 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures import Det3DDataSample
 from mmdet3d.utils import OptConfigType, OptMultiConfig, OptSampleList
 from .ops import Voxelization
+import cv2
 from .imageprocessing_unit import (dense_map_from_depth_batch_v2, 
                                    batch_colormap,two_images_side_by_side_gpu,
                                    display_depth_maps,
@@ -1369,77 +1370,139 @@ class BEVFusion(Base3DDetector):
 
         return sampled_feat_final
     
-    def convert_boxes_to_original_scale_FINAL_DEBUG(
-        self,
-        pred_results_list: List[torch.Tensor],
-        data_samples_list: List
-    ) -> List[torch.Tensor]:
-        num_cameras = 6 
-        converted_results = []
+    # def convert_boxes_to_original_scale(
+    #     self,
+    #     pred_results_list: List[torch.Tensor],
+    #     data_samples_list: List
+    # ) -> List[torch.Tensor]:
+    #     """
+    #     증강된 이미지 좌표계의 BBox를 원본으로 역변환합니다. (최종 버전)
+    #     너비/높이 변수 할당 오류를 수정하여 모든 변환을 최종적으로 해결합니다.
+    #     """
+    #     num_cameras = 6 
+    #     converted_results = []
 
-        for i, (pred_tensor, data_sample) in enumerate(zip(pred_results_list, data_samples_list)):
+    #     for i, (pred_tensor, data_sample) in enumerate(zip(pred_results_list, data_samples_list)):
             
-            if pred_tensor.shape[0] == 0:
-                converted_results.append(pred_tensor)
-                continue
+    #         if pred_tensor.shape[0] == 0:
+    #             converted_results.append(pred_tensor)
+    #             continue
                 
-            aug_bboxes = pred_tensor[:, :4].clone()
+    #         aug_bboxes = pred_tensor[:, :4].clone()
 
-            if not hasattr(data_sample, 'img_aug_params'):
-                converted_results.append(pred_tensor)
-                continue
+    #         # # --- ✨ 1. 초기 증강 BBox 코너 좌표 (동차) ✨ ---
+    #         # x1, y1, x2, y2 = aug_bboxes.T
+    #         # corners = torch.stack([x1, y1, x2, y1, x2, y2, x1, y2], dim=-1).view(-1, 4, 2)
+    #         # corners_hom = torch.cat([corners, torch.ones(corners.shape[0], 4, 1, device=corners.device)], dim=-1)
 
-            params_list = data_sample.img_aug_params
-            cam_index = i % num_cameras
-            params_dict = params_list[cam_index]
+    #         # if i == 0: # 첫 번째 카메라 이미지에 대해서만 로그 출력
+    #         #     print(f"\n--- Camera Index: {i} ---")
+    #         #     print(f"[LOG] Initial Augmented BBox (first box): {aug_bboxes[0].detach().cpu().numpy()}")
+    #         #     print(f"[LOG] Initial Corner Hom (first box, first corner): {corners_hom[0, 0].detach().cpu().numpy()}")
 
-            resize, crop, flip, rotate = params_dict['resize'], params_dict['crop'], params_dict['flip'], params_dict['rotate']
-            fW, fH = params_dict['final_dim']
+    #         if not hasattr(data_sample, 'img_aug_params'):
+    #             converted_results.append(pred_tensor)
+    #             continue
+
+    #         params_list = data_sample.img_aug_params
+    #         cam_index = i % num_cameras
+    #         params_dict = params_list[cam_index]
+
+    #         resize, crop, flip, rotate = params_dict['resize'], params_dict['crop'], params_dict['flip'], params_dict['rotate']
+    #         fH, fW = params_dict['final_dim'] # [Height, Width] 순서로 할당
+
+    #         # ✨✨✨ 2. 사용된 증강 파라미터 확인 ✨✨✨
+    #         if i == 0:
+    #             print(f"[DEBUG] Aug Params: resize={resize:.4f}, crop={crop}, flip={flip}, rotate={rotate:.4f}, fH={fH}, fW={fW}")
             
-            # ==========================================================
-            # ===== 버그를 수정한 올바른 corners 생성 코드입니다. =====
-            # ==========================================================
-            x1, y1, x2, y2 = aug_bboxes.T
-            corners = torch.stack([x1, y1, x2, y1, x2, y2, x1, y2], dim=-1).view(-1, 4, 2)
+    #         # --- 역변환 행렬 구성 ---
+    #         M_resize_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+    #         M_resize_inv[0, 0] = 1 / resize
+    #         M_resize_inv[1, 1] = 1 / resize
 
-            # ==================== DEBUG PRINT CODE ====================
-            if flip and pred_tensor.shape[0] > 0:
-                print("\n--- STARTING FINAL DEBUG FOR FLIPPED IMAGE ---")
-                print(f"Params: {params_dict}")
-                print(f"Initial Corners (Corrected):\n{corners[0].cpu().numpy().round(2)}")
-            # ==========================================================
+    #         M_crop_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+    #         M_crop_inv[0, 2] = crop[0]
+    #         M_crop_inv[1, 2] = crop[1]
 
-            # Sequential Inverse Transformation
-            if rotate != 0:
-                angle = math.radians(rotate)
-                cos, sin = math.cos(angle), math.sin(angle)
-                cx, cy = (fW - 1) / 2, (fH - 1) / 2
-                R_inv = torch.tensor([[cos, sin], [-sin, cos]], device=corners.device, dtype=torch.float32)
-                corners = (corners - torch.tensor([cx, cy], device=corners.device)) @ R_inv.T + torch.tensor([cx, cy], device=corners.device)
-                if flip and pred_tensor.shape[0] > 0: print(f"After Inverse Rotate:\n{corners[0].cpu().numpy().round(2)}")
+    #         M_flip_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+    #         # if flip:
+    #         #     M_flip_inv[0, 0] = -1
+    #         #     M_flip_inv[0, 2] = fW - 1
+    #         if flip:
+    #             # ✨ 시도: img_transform과 유사하게 crop 후 너비(fW)를 기준 축으로 사용
+    #             flip_axis_x = crop[2] - crop[0] # = fW
+    #             M_flip_inv[0, 0] = -1
+    #             M_flip_inv[0, 2] = flip_axis_x - 1 # fW - 1 대신 사용 시도
 
-            if flip:
-                corners[..., 0] = (fW - 1) - corners[..., 0]
-                if pred_tensor.shape[0] > 0: print(f"After Inverse Flip:\n{corners[0].cpu().numpy().round(2)}")
+    #         M_rotate_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+    #         if rotate != 0:
+    #             angle = math.radians(rotate)
+    #             cos, sin = math.cos(angle), math.sin(angle)
+    #             cx, cy = (fW - 1) / 2, (fH - 1) / 2
+    #             T1 = torch.tensor([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+    #             # 올바른 방향인 시계 방향(Clockwise) 역회전 행렬
+    #             R_inv = torch.tensor([[cos, sin, 0], [-sin, cos, 0], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+    #             T2 = torch.tensor([[1, 0, cx], [0, 1, cy], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+    #             M_rotate_inv = T2 @ R_inv @ T1
 
-            corners[..., 0] += crop[0]
-            corners[..., 1] += crop[1]
-            if flip and pred_tensor.shape[0] > 0: print(f"After Inverse Crop:\n{corners[0].cpu().numpy().round(2)}")
+    #             # # ✨ 시도: img_transform과 유사하게 crop 후 크기(fW, fH)를 중심 계산에 사용
+    #             # center_x = (crop[2] - crop[0]) / 2.0 # = fW / 2
+    #             # center_y = (crop[3] - crop[1]) / 2.0 # = fH / 2
 
-            corners /= resize
-            if flip and pred_tensor.shape[0] > 0:
-                print(f"After Inverse Resize (Final Coords):\n{corners[0].cpu().numpy().round(2)}")
-                print("--- ENDING FINAL DEBUG ---")
+    #             # T1 = torch.tensor([[1, 0, -center_x], [0, 1, -center_y], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+    #             # R_inv = torch.tensor([[cos, sin, 0], [-sin, cos, 0], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+    #             # T2 = torch.tensor([[1, 0, center_x], [0, 1, center_y], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
+    #             # M_rotate_inv = T2 @ R_inv @ T1
 
-            min_coords = torch.min(corners, dim=1).values
-            max_coords = torch.max(corners, dim=1).values
-            original_bboxes = torch.cat([min_coords, max_coords], dim=1)
+    #         # --- ✨ 2. 단계별 역변환 적용 및 로그 출력 ✨ ---
+    #         corners_current = corners_hom.clone() # 원본 복사
+
+    #         # 단계 1: InvRotate
+    #         corners_after_rotate = (M_rotate_inv.to(corners_current.dtype) @ corners_current.transpose(1, 2)).transpose(1, 2)
+    #         if i == 0: print(f"[LOG] Corner After InvRotate: {corners_after_rotate[0, 0].detach().cpu().numpy()}")
+    #         corners_current = corners_after_rotate
+
+    #         # 단계 2: InvFlip
+    #         corners_after_flip = (M_flip_inv.to(corners_current.dtype) @ corners_current.transpose(1, 2)).transpose(1, 2)
+    #         if i == 0: print(f"[LOG] Corner After InvFlip:   {corners_after_flip[0, 0].detach().cpu().numpy()}")
+    #         corners_current = corners_after_flip
+
+    #         # 단계 3: InvCrop
+    #         corners_after_crop = (M_crop_inv.to(corners_current.dtype) @ corners_current.transpose(1, 2)).transpose(1, 2)
+    #         if i == 0: print(f"[LOG] Corner After InvCrop:   {corners_after_crop[0, 0].detach().cpu().numpy()}")
+    #         corners_current = corners_after_crop
+
+    #         # 단계 4: InvResize
+    #         corners_after_resize = (M_resize_inv.to(corners_current.dtype) @ corners_current.transpose(1, 2)).transpose(1, 2)
+    #         if i == 0: print(f"[LOG] Corner After InvResize: {corners_after_resize[0, 0].detach().cpu().numpy()}")
+    #         transformed_corners_hom = corners_after_resize # 최종 결과
+                
+    #         # 최종 역변환 행렬 계산
+    #         M_total_inv = M_rotate_inv @ M_flip_inv @ M_crop_inv @ M_resize_inv
+
+    #         # Bounding Box 변환 적용
+    #         x1, y1, x2, y2 = aug_bboxes.T
+    #         corners = torch.stack([x1, y1, x2, y1, x2, y2, x1, y2], dim=-1).view(-1, 4, 2)
+    #         corners_hom = torch.cat([corners, torch.ones(corners.shape[0], 4, 1, device=corners.device)], dim=-1)
             
-            new_pred_tensor = pred_tensor.clone()
-            new_pred_tensor[:, :4] = original_bboxes
-            converted_results.append(new_pred_tensor)
+    #         M_total_inv = M_total_inv.to(corners_hom.dtype)
+    #         transformed_corners_hom = (M_total_inv @ corners_hom.transpose(1, 2)).transpose(1, 2)
+            
+    #         transformed_corners = transformed_corners_hom[..., :2] / transformed_corners_hom[..., 2, None]
+            
+    #         min_coords = torch.min(transformed_corners, dim=1).values
+    #         max_coords = torch.max(transformed_corners, dim=1).values
+    #         original_bboxes = torch.cat([min_coords, max_coords], dim=1)
 
-        return converted_results
+    #         if i == 0:
+    #             print(f"[LOG] Final Transformed Corner 2D: {transformed_corners[0, 0].detach().cpu().numpy()}")
+    #             print(f"[LOG] Final Original BBox (first box): {original_bboxes[0].detach().cpu().numpy()}")
+            
+    #         new_pred_tensor = pred_tensor.clone()
+    #         new_pred_tensor[:, :4] = original_bboxes
+    #         converted_results.append(new_pred_tensor)
+
+    #     return converted_results
     
     def convert_boxes_to_original_scale(
         self,
@@ -1460,52 +1523,59 @@ class BEVFusion(Base3DDetector):
                 continue
                 
             aug_bboxes = pred_tensor[:, :4].clone()
-
+        
             if not hasattr(data_sample, 'img_aug_params'):
-                converted_results.append(pred_tensor)
-                continue
+                        converted_results.append(pred_tensor)
+                        continue
 
             params_list = data_sample.img_aug_params
             cam_index = i % num_cameras
             params_dict = params_list[cam_index]
 
             resize, crop, flip, rotate = params_dict['resize'], params_dict['crop'], params_dict['flip'], params_dict['rotate']
+            fH, fW = params_dict['final_dim'] # 증강 후 최종 크기 (H, W)
             
-            # ====================================================================
-            # ===== 여기가 모든 문제의 원인이었던 변수 할당 오류 수정 부분입니다 =====
-            # ====================================================================
-            fH, fW = params_dict['final_dim'] # [Height, Width] 순서로 할당
-            
-            # --- 역변환 행렬 구성 ---
-            M_resize_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
-            M_resize_inv[0, 0] = 1 / resize
-            M_resize_inv[1, 1] = 1 / resize
+            # --- ✨ OpenCV를 사용한 아핀 변환 행렬 계산 ✨ ---
+            # 1. Resize 변환 행렬 (순방향)
+            M_resize = np.float32([[resize, 0, 0], [0, resize, 0]])
 
-            M_crop_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
-            M_crop_inv[0, 2] = crop[0]
-            M_crop_inv[1, 2] = crop[1]
+            # 2. Crop 변환 행렬 (순방향) - 이동(Translation)
+            #    Crop은 (x_offset, y_offset, x_offset+width, y_offset+height)
+            M_crop = np.float32([[1, 0, -crop[0]], [0, 1, -crop[1]]]) # 오프셋만큼 빼기
 
-            M_flip_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
+            # 3. Flip 변환 행렬 (순방향)
+            M_flip = np.float32([[1, 0, 0], [0, 1, 0]])
             if flip:
-                M_flip_inv[0, 0] = -1
-                M_flip_inv[0, 2] = fW - 1
+                M_flip = np.float32([[-1, 0, fW - 1], [0, 1, 0]]) # crop 후 너비(fW) 기준
 
-            M_rotate_inv = torch.eye(3, device=pred_tensor.device, dtype=torch.float32)
-            if rotate != 0:
-                angle = math.radians(rotate)
-                cos, sin = math.cos(angle), math.sin(angle)
-                cx, cy = (fW - 1) / 2, (fH - 1) / 2
-                
-                T1 = torch.tensor([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
-                # 올바른 방향인 시계 방향(Clockwise) 역회전 행렬
-                R_inv = torch.tensor([[cos, sin, 0], [-sin, cos, 0], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
-                T2 = torch.tensor([[1, 0, cx], [0, 1, cy], [0, 0, 1]], device=pred_tensor.device, dtype=torch.float32)
-                M_rotate_inv = T2 @ R_inv @ T1
+            # 4. Rotate 변환 행렬 (순방향)
+            center_x_aug, center_y_aug = fW / 2.0, fH / 2.0 # 증강 후 이미지 중심
+            M_rotate = cv2.getRotationMatrix2D((center_x_aug, center_y_aug), rotate, 1.0) # OpenCV는 반시계 방향이 +
 
-            # 최종 역변환 행렬 계산
-            M_total_inv = M_resize_inv @ M_crop_inv @ M_flip_inv @ M_rotate_inv
+            # 5. 모든 순방향 변환 행렬 결합 (OpenCV 스타일, 2x3 행렬)
+            #    순서: Resize -> Crop -> Flip -> Rotate
+            #    OpenCV는 3x3 동차 행렬 곱과 약간 다르게 결합해야 함
+            
+            # 3x3 행렬로 변환하여 곱셈 (더 직관적)
+            def to_3x3(M):
+                return np.vstack([M, [0, 0, 1]])
 
-            # Bounding Box 변환 적용
+            M_resize_3x3 = to_3x3(M_resize)
+            M_crop_3x3 = to_3x3(M_crop)
+            M_flip_3x3 = to_3x3(M_flip)
+            M_rotate_3x3 = to_3x3(M_rotate)
+            
+            # 순방향 전체 변환 행렬 (오른쪽부터 적용됨)
+            M_forward_total_3x3 = M_rotate_3x3 @ M_flip_3x3 @ M_crop_3x3 @ M_resize_3x3
+
+            # 6. 최종 역변환 행렬 계산
+            M_total_inv_np = np.linalg.inv(M_forward_total_3x3)
+            M_total_inv = torch.from_numpy(M_total_inv_np).to(dtype=torch.float32, device=pred_tensor.device)
+
+            # if i == 0:
+            #     print(f"[LOG] M_total_inv (OpenCV based):\n{M_total_inv.detach().cpu().numpy()}")
+
+            # --- Bounding Box 변환 적용 (이하 로직 동일) ---
             x1, y1, x2, y2 = aug_bboxes.T
             corners = torch.stack([x1, y1, x2, y1, x2, y2, x1, y2], dim=-1).view(-1, 4, 2)
             corners_hom = torch.cat([corners, torch.ones(corners.shape[0], 4, 1, device=corners.device)], dim=-1)
@@ -1518,13 +1588,17 @@ class BEVFusion(Base3DDetector):
             min_coords = torch.min(transformed_corners, dim=1).values
             max_coords = torch.max(transformed_corners, dim=1).values
             original_bboxes = torch.cat([min_coords, max_coords], dim=1)
-            
+
+            # if i == 0:
+            #     # ... (기존 로그 출력) ...
+            #     print(f"[LOG] Final Original BBox (first box, OpenCV): {original_bboxes[0].detach().cpu().numpy()}")
+
             new_pred_tensor = pred_tensor.clone()
             new_pred_tensor[:, :4] = original_bboxes
             converted_results.append(new_pred_tensor)
 
         return converted_results
-    
+
     def extract_multiscale_img_feats(self, batch_inputs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         입력 딕셔너리에서 이미지를 추출하고, 
@@ -1751,7 +1825,7 @@ class BEVFusion(Base3DDetector):
         # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
         # # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
         # self.vis_step_counter += 1
-        # for cid in range(12):
+        # for cid in range(6):
         #     # idx = id_to_idx[cid.item()]
         #     # draw_correspondences(
         #     #     trimed_corrs = gt_corrs[cid][:10,...],  # 첫 번째 배치 선택
