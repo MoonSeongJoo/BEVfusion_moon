@@ -1710,7 +1710,7 @@ class BEVFusion(Base3DDetector):
         else:
             losses_2d = dict()
         
-         # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
+        # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
         total_losses = dict()
         for k, v in losses_2d.items():
             total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
