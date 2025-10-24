@@ -352,8 +352,8 @@ train_dataloader = dict(
         dataset=dict(
             type='NuScenesDataset',
             data_root=data_root,
-            # ann_file='nuscenes_infos_train_new_with_2d.pkl', # 경로 명시
-            ann_file='debug_infos_train_with_2d.pkl',
+            ann_file='nuscenes_infos_train_new_with_2d.pkl', # 경로 명시
+            # ann_file='debug_infos_train_with_2d.pkl',
             pipeline=train_pipeline,
             modality=input_modality,
             test_mode=False,
@@ -365,8 +365,8 @@ val_dataloader = dict(
     dataset=dict(
         type='NuScenesDataset',
         data_root=data_root,
-        # ann_file='nuscenes_infos_val_new_with_2d.pkl', # 경로 명시
-        ann_file='debug_infos_val_with_2d.pkl',
+        ann_file='nuscenes_infos_val_new_with_2d.pkl', # 경로 명시
+        # ann_file='debug_infos_val_with_2d.pkl',
         pipeline=val_pipeline,
         modality=input_modality,
         test_mode=False,
@@ -382,8 +382,8 @@ test_dataloader = val_dataloader
 val_evaluator = dict(
     type='NuScenesMetric',
     data_root=data_root,
-    # ann_file=data_root + 'nuscenes_infos_val_new_with_2d.pkl',
-    ann_file=data_root + 'debug_infos_val_with_2d.pkl',
+    ann_file=data_root + 'nuscenes_infos_val_new_with_2d.pkl',
+    # ann_file=data_root + 'debug_infos_val_with_2d.pkl',
     metric='bbox',
     version='v1.0-trainval',
     collect_dir='test_results_tmp',)  # <-- 이 라인을 추가하세요.)
@@ -477,11 +477,17 @@ optim_wrapper = dict(
         custom_keys={
             # 이미지 백본은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
+            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
+            # 'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
+            # 'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
             # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             # 'corr': dict(lr_mult=0.1, decay_mult=1.0),
-            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
-            'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
-            'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
+            # # pts_backbone
+            'pts_voxel_layer' : dict(lr_mult=0.1, decay_mult=1.0),
+            'pts_voxel_encoder' :dict(lr_mult=0.1, decay_mult=1.0),
+            'pts_middle_encoder' : dict(lr_mult=0.1, decay_mult=1.0),
+            'pts_backbone' : dict(lr_mult=0.1, decay_mult=1.0),
+            'pts_neck' : dict(lr_mult=0.1, decay_mult=1.0),
         }),
     clip_grad=dict(max_norm=35, norm_type=2))
 
@@ -503,7 +509,7 @@ default_hooks = dict(
     #     max_keep_ckpts=3,),    # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
     checkpoint=dict(
         type='CheckpointHook',
-        interval=500,           # 500 이터레이션마다 체크포인트 저장 조건 확인
+        interval=3000,           # 500 이터레이션마다 체크포인트 저장 조건 확인
         by_epoch=False,
         save_best='train/loss',   # 'val/loss'를 기준으로 가장 좋은 모델을 저장
         rule='less',            # loss는 낮을수록 좋으므로 'less'로 설정
@@ -519,7 +525,7 @@ default_hooks = dict(
 del _base_.custom_hooks
 
 load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-# load_from =  "data/work_dirs/bevfusion/20251021_bevfusion_resume/iter_61000.pth"
+# load_from =  "data/work_dirs/bevfusion/20251021_bevfusion_resume/iter_129500.pth"
 # load_from = None
 resume_from = None
 

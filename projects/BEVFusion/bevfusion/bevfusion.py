@@ -24,13 +24,13 @@ from .imageprocessing_unit import (dense_map_from_depth_batch_v2,
                                    batch_colormap,two_images_side_by_side_gpu,
                                    display_depth_maps,
                                    save_batch_predictions_to_file,
-                                   axis_angle_to_rotation_matrix,
                                    visualize_bev_proposals,
                                    )
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
 import math
+from .calib_head import axis_angle_to_rotation_matrix,geodesic_distance_loss
 
 # class CalibrationCorrectionHead(nn.Module):
 #     """
@@ -72,6 +72,32 @@ import math
 #         pred_delta_6dof = self.mlp(x)
         
 #         return pred_delta_6dof
+
+def chamfer_distance(pred_points, gt_points):
+    """
+    두 포인트 클라우드 간의 Chamfer Distance를 계산합니다.
+    Args:
+        pred_points (Tensor): [B, N, 3] 예측 포인트 클라우드.
+        gt_points (Tensor): [B, M, 3] Ground Truth 포인트 클라우드.
+    Returns:
+        Tensor: 배치별 Chamfer Distance 값 [B].
+    """
+    pred_points = pred_points.float()
+    gt_points = gt_points.float()
+
+    # pred -> gt 거리 계산
+    diff_pred_gt = pred_points.unsqueeze(2) - gt_points.unsqueeze(1) # [B, N, M, 3]
+    dist_pred_gt = torch.sum(diff_pred_gt**2, dim=3) # [B, N, M]
+    min_dist_pred_gt, _ = torch.min(dist_pred_gt, dim=2) # [B, N]
+
+    # gt -> pred 거리 계산
+    diff_gt_pred = gt_points.unsqueeze(2) - pred_points.unsqueeze(1) # [B, M, N, 3]
+    dist_gt_pred = torch.sum(diff_gt_pred**2, dim=3) # [B, M, N]
+    min_dist_gt_pred, _ = torch.min(dist_gt_pred, dim=2) # [B, M]
+
+    # 두 거리의 평균 합
+    loss = torch.mean(min_dist_pred_gt, dim=1) + torch.mean(min_dist_gt_pred, dim=1)
+    return loss / 2.0 # 평균 반환
 
 @MODELS.register_module()
 class BEVFusion(Base3DDetector):
@@ -170,11 +196,11 @@ class BEVFusion(Base3DDetector):
             # # 동결할 모듈 목록 (2D 탐지 관련 모듈 제외)
             modules_to_freeze = {
                 # LiDAR Path
-                'pts_voxel_layer': self.pts_voxel_layer,
-                'pts_voxel_encoder': self.pts_voxel_encoder,
-                'pts_middle_encoder': self.pts_middle_encoder,
-                'pts_backbone': self.pts_backbone,
-                'pts_neck': self.pts_neck,
+                # 'pts_voxel_layer': self.pts_voxel_layer,
+                # 'pts_voxel_encoder': self.pts_voxel_encoder,
+                # 'pts_middle_encoder': self.pts_middle_encoder,
+                # 'pts_backbone': self.pts_backbone,
+                # 'pts_neck': self.pts_neck,
                 
                 # # 3D Detection Head
                 # 'bbox_head': self.bbox_head,
@@ -1805,8 +1831,17 @@ class BEVFusion(Base3DDetector):
             gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
             gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
 
-            losses['loss_calib_rot'] = F.l1_loss(pred_rot_filtered, gt_rot_filtered, reduction='mean') * 10.0
-            losses['loss_calib_trans'] = F.l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 2.0
+            # losses['loss_calib_rot'] = F.l1_loss(pred_rot_filtered, gt_rot_filtered, reduction='mean') * 10.0
+            # losses['loss_calib_trans'] = F.l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 2.0
+
+             # Loss 계산 (배치 전체에 대해 mean)
+            R_pred_calib = axis_angle_to_rotation_matrix(pred_rot_filtered)
+            R_gt_calib = axis_angle_to_rotation_matrix(gt_rot_filtered)
+            loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
+            loss_calib_trans_pred = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean')
+
+            losses['loss_calib_rot'] = loss_calib_rot_pred * 5.0
+            losses['loss_calib_trans'] = loss_calib_trans_pred * 1.0
 
             # 3. (이제 가능) '재구성된 전체 텐서'에서 rot, trans를 분리
             #    이 변수들이 corrected_calib_dict 함수로 전달됨
@@ -1929,6 +1964,41 @@ class BEVFusion(Base3DDetector):
         # self.training_step += 1
         # ################### end #####################################
 
+        # ✨✨✨ START: Chamfer Distance Loss 추가 ✨✨✨
+        # 1. 실제 LiDAR 포인트 클라우드 가져오기
+        #    batch_inputs_dict['points']는 리스트 형태일 수 있음 -> 패딩 및 텐서화 필요
+        #    또는 데이터 로더에서 미리 처리된 텐서를 사용
+        #    여기서는 batch_inputs_dict['points'][0] 이 [NumPoints, 3+] 형태라고 가정
+        #    (실제 구현 시 데이터 형태 확인 및 전처리 필요)
+        
+        gt_lidar_points = batch_inputs_dict['points'][0][:, :3] # 배치 0의 xyz만 사용 (가정)
+        gt_lidar_points = gt_lidar_points.unsqueeze(0).to(target_device) # [1, NumPoints, 3]
+        
+        # 2. det_xyz 형태 변환 [B*N_cam, Q, 3] -> [B, N_cam*Q, 3] (B=1 가정)
+        num_queries_per_cam = det_xyz.shape[1]
+        det_xyz_batch = det_xyz.reshape(B, N * num_queries_per_cam, 3) # [1, N_cam*Q, 3]
+
+        # 3. (선택적) 포인트 샘플링 (계산량 감소 목적)
+        #    예: 각 클라우드에서 2048개 포인트 무작위 샘플링
+        if gt_lidar_points.shape[1] > 2048:
+            indices = torch.randperm(gt_lidar_points.shape[1], device=target_device)[:2048]
+            gt_lidar_points_sampled = gt_lidar_points[:, indices, :]
+        else:
+            gt_lidar_points_sampled = gt_lidar_points
+            
+        if det_xyz_batch.shape[1] > 2048:
+            indices = torch.randperm(det_xyz_batch.shape[1], device=target_device)[:2048]
+            det_xyz_batch_sampled = det_xyz_batch[:, indices, :]
+        else:
+            det_xyz_batch_sampled = det_xyz_batch
+
+        # 4. Chamfer Distance 계산
+        loss_chamfer = chamfer_distance(det_xyz_batch_sampled, gt_lidar_points_sampled).mean()
+
+        # 5. losses 딕셔너리에 추가 (가중치 조절 필요)
+        losses['loss_chamfer_xyz'] = loss_chamfer * 0.05 # 예시 가중치
+        # ✨✨✨ END: Chamfer Distance Loss 추가 ✨✨✨
+
         det_xyz_ref = det_xyz.clone()
         det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
                 self.pc_range[3] - self.pc_range[0])
@@ -1947,7 +2017,14 @@ class BEVFusion(Base3DDetector):
                                 precomputed_img_feats=img_feats)
 
         if self.with_bbox_head:
-            bbox_loss = self.bbox_head.loss(feats, det_xyz_proc, det_feat_proc, batch_data_samples)
+            bbox_loss = self.bbox_head.loss(
+                            feats, 
+                            det_xyz_proc, 
+                            det_feat_proc, 
+                            batch_data_samples,
+                            gt_delta_rot=gt_delta_rot,       # <-- 추가
+                            gt_delta_trans=gt_delta_trans   # <-- 추가
+                        )
 
         losses.update(bbox_loss)
 

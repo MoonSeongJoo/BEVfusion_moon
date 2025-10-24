@@ -19,12 +19,11 @@ from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
 from .imageprocessing_unit import visualize_full_pipeline
-
+from .calib_head import axis_angle_to_rotation_matrix,geodesic_distance_loss,correct_camera_proposals
 
 def clip_sigmoid(x, eps=1e-4):
     y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
     return y
-
 
 @MODELS.register_module()
 class ConvFuser(nn.Sequential):
@@ -178,6 +177,42 @@ class TransFusionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_channel, hidden_channel),
         )
+        calibration_input_dim = hidden_channel
+        calibration_hidden_dim = 256 # Intermediate dimension, can be tuned
+
+        self.calibration_predictor = nn.Sequential(
+            nn.Linear(calibration_input_dim, calibration_hidden_dim),
+            nn.ReLU(), # Or nn.LeakyReLU(0.01) for potentially better stability
+            nn.Linear(calibration_hidden_dim, 6) # Output: 3 for rotation, 3 for translation
+        )
+
+        # --- ✨ 추가: 2단계 정제 퓨전을 위한 레이어들 ✨ ---
+        self.refined_attention = nn.MultiheadAttention(
+            embed_dim=hidden_channel,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.refined_ffn = nn.Sequential(
+            nn.Linear(hidden_channel, hidden_channel * 2),
+            nn.ReLU(), # 또는 LeakyReLU
+            nn.Linear(hidden_channel * 2, hidden_channel),
+        )
+        self.refined_norm1 = nn.LayerNorm(hidden_channel)
+        self.refined_norm2 = nn.LayerNorm(hidden_channel)
+
+        # --- ✨ 추가: 2단계 퓨전 결과를 평가하기 위한 보조 헤드 ✨ ---
+        # 기존 prediction_heads의 마지막 레이어와 유사한 구조 사용
+        aux_heads = copy.deepcopy(common_heads)
+        aux_heads.update(dict(heatmap=(self.num_classes, num_heatmap_convs)))
+        self.refined_fusion_aux_head = SeparateHead(
+            hidden_channel,
+            aux_heads,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            bias=bias,
+        )
+        # ---------------------------------------------------
 
         self.init_weights()
         self._init_assigner_sampler()
@@ -308,107 +343,138 @@ class TransFusionHead(nn.Module):
         )
         ###### 시각화 하기 위한 변수 따기 ##########
         lidar_only_query_feat = query_feat.clone()
-        
-        # <<< [최종 수정] 2단계 퓨전 아키텍처 구현 >>>
+
+        # --- 2단계 퓨전 변수 초기화 ---
+        coarse_fused_query_feat = lidar_only_query_feat # 카메라 없으면 이게 최종 입력
+        refined_query_feat = lidar_only_query_feat      # 카메라 없으면 이게 최종 입력
+        pred_delta_rot = torch.zeros(batch_size, 3, device=fusion_feat.device) # 기본값 0
+        pred_delta_trans = torch.zeros(batch_size, 3, device=fusion_feat.device) # 기본값 0
+ 
+        # --- 2. 카메라 정보 퓨전 (있을 경우) ---
         if det_xyz is not None and det_feats is not None:
-            # --- 1단계: 비대칭 Cross-Attention (카메라 정보 흡수) ---
-
-            # 1. 입력 텐서 준비 (모두 [B, N, C] 형태로 통일)
-            # Query: BEV 기반 쿼리
-            bev_query_feat = query_feat.permute(0, 2, 1)
+            # --- 2a. 1단계: 거친 퓨전 ---
+            bev_query_feat_stage1 = query_feat.permute(0, 2, 1) # [B, Nq, C]
             bev_query_pos_embed = self.bev_query_pos_embedding(query_pos)
+            cam_proposal_feat = det_feats # [B, Nc, C]
+            cam_proposal_pos_embed = self.camera_proposal_pos_embedding(det_xyz) # det_xyz는 [0,1] 정규화 상태 가정
 
-            # Key/Value: 카메라 기반 제안
-            cam_proposal_feat = det_feats
-            cam_proposal_pos_embed = self.camera_proposal_pos_embedding(det_xyz)
-
-            # 2. MultiheadAttention 호출
-            # 128개의 BEV 쿼리가 1200개의 카메라 제안을 참고하여 업데이트됨
-            fused_feat = self.fusion_cross_attention(
-                query=bev_query_feat + bev_query_pos_embed,
+            fused_feat_stage1 = self.fusion_cross_attention(
+                query=bev_query_feat_stage1 + bev_query_pos_embed,
                 key=cam_proposal_feat + cam_proposal_pos_embed,
                 value=cam_proposal_feat
             )[0]
+            bev_query_feat_stage1 = self.fusion_norm1(bev_query_feat_stage1 + fused_feat_stage1)
+            bev_query_feat_stage1 = self.fusion_norm2(bev_query_feat_stage1 + self.fusion_ffn(bev_query_feat_stage1))
+            coarse_fused_query_feat = bev_query_feat_stage1.permute(0, 2, 1).contiguous() # [B, C, Nq]
 
-            # 3. 잔차 연결(Residual Connection) 및 FFN (표준 Transformer 블록 구조)
-            bev_query_feat = self.fusion_norm1(bev_query_feat + fused_feat)
-            bev_query_feat = self.fusion_norm2(bev_query_feat + self.fusion_ffn(bev_query_feat))
+            # --- 2b. 캘리브레이션 오차 예측 ---
+            pooled_coarse_feat = coarse_fused_query_feat.mean(dim=-1) # [B, C]
+            pred_delta_6dof = self.calibration_predictor(pooled_coarse_feat) # [B, 6]
+            pred_delta_rot = pred_delta_6dof[..., :3]
+            pred_delta_trans = pred_delta_6dof[..., 3:]
 
-            # 4. 다음 단계를 위해 텐서 모양 복원 [B, 128, C] -> [B, C, 128]
-            query_feat = bev_query_feat.permute(0, 2, 1).contiguous()
-            # ✨ 2. "중간 보고" 캡처 (After Camera Fusion)
-            fused_query_feat = query_feat.clone()
+            # --- 2c. 카메라 제안 보정 ---
+            pc_range_tensor = torch.tensor(self.train_cfg['point_cloud_range'], device=det_xyz.device)
+            # 보정 시에는 그래디언트 흐름 차단 가능 (오차 예측 학습에만 집중)
+            det_xyz_corrected_norm = correct_camera_proposals(
+                det_xyz, pred_delta_rot.detach(), pred_delta_trans.detach(), pc_range_tensor
+            )
+            cam_proposal_pos_embed_corrected = self.camera_proposal_pos_embedding(det_xyz_corrected_norm)
+
+            # --- 2d. 2단계: 정제된 퓨전 ---
+            refined_bev_query_feat = coarse_fused_query_feat.permute(0, 2, 1) # 1단계 결과 재사용
+            refined_fused_feat = self.refined_attention(
+                query=refined_bev_query_feat + bev_query_pos_embed,
+                key=cam_proposal_feat + cam_proposal_pos_embed_corrected, # 보정된 위치 사용
+                value=cam_proposal_feat
+            )[0]
+            refined_bev_query_feat = self.refined_norm1(refined_bev_query_feat + refined_fused_feat)
+            refined_bev_query_feat = self.refined_norm2(refined_bev_query_feat + self.refined_ffn(refined_bev_query_feat))
+            refined_query_feat = refined_bev_query_feat.permute(0, 2, 1).contiguous() # [B, C, Nq]
         
-        #################################
-        # transformer decoder layer (Fusion feature as K,V)
-        #################################
-        ret_dicts = []
-        for i in range(self.num_decoder_layers):
-            # Transformer Decoder Layer
-            # :param query: B C Pq    :param query_pos: B Pq 3/6
-            query_feat = self.decoder[i](
-                query_feat,
-                key=fusion_feat_flatten,
-                query_pos=query_pos,
-                key_pos=bev_pos)
-            
-            # ✨ 2. 시각화 코드를 호출합니다.
-            if self.training_step % 50 == 0 :
-                with torch.no_grad():
-                    # 배치의 첫 번째 샘플만 시각화
-                    gt_instances_3d = batch_gt_instances_3d[0]
-                    # ✨ FIX: train_cfg에서 좌표 변환에 필요한 정보를 가져옵니다.
-                    pc_range = self.train_cfg['point_cloud_range']
-                    voxel_size = self.train_cfg['voxel_size']
-                    
-                    visualize_full_pipeline(
-                                    cam_proposals_xyz=det_xyz[0],
-                                    cam_proposals_feat=det_feats[0],
-                                    query_pos=query_pos[0],
-                                    lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
-                                    fused_feat=fused_query_feat[0].permute(1, 0),
-                                    final_feat=query_feat[0].permute(1, 0),
-                                    gt_bboxes_3d=gt_instances_3d.bboxes_3d,
-                                    pc_range=pc_range,
-                                    voxel_size=voxel_size,
-                                    step=self.training_step,
-                                    save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
-                                )
-                    print ("end")
-            
-            self.training_step += 1
+        # --- 시각화용: 중간 퓨전 결과 저장 ---
+        # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
+        fused_query_feat_for_vis = refined_query_feat 
 
-            # Prediction
-            res_layer = self.prediction_heads[i](query_feat)
-            res_layer['center'] = res_layer['center'] + query_pos.permute(
-                0, 2, 1)
+        # --- 3. Transformer Decoder 정제 ---
+        decoder_input_feat = refined_query_feat # 퓨전 결과가 디코더 입력
+        
+        ret_dicts = []
+        current_query_pos = query_pos # 초기 위치로 시작
+        for i in range(self.num_decoder_layers):
+            decoder_output_feat = self.decoder[i](
+                decoder_input_feat,
+                key=fusion_feat_flatten,
+                query_pos=current_query_pos,
+                key_pos=bev_pos
+            )
+            
+            res_layer = self.prediction_heads[i](decoder_output_feat)
+            predicted_center = res_layer['center'] + current_query_pos.permute(0, 2, 1)
+            res_layer['center'] = predicted_center
             ret_dicts.append(res_layer)
 
-            # for next level positional embedding
-            query_pos = res_layer['center'].detach().clone().permute(0, 2, 1)
+            # 다음 레이어를 위해 특징과 위치 업데이트
+            decoder_input_feat = decoder_output_feat 
+            current_query_pos = predicted_center.detach().clone().permute(0, 2, 1)
 
+        # --- 시각화용: 최종 디코더 출력 특징 저장 ---
+        final_query_feat_for_vis = decoder_output_feat
+
+        # --- 4. 시각화 호출 ---
+        if self.training_step % 3000 == 0 :
+            with torch.no_grad():
+                gt_instances_3d = batch_gt_instances_3d[0] # forward_single은 배치 0만 처리 가정
+                pc_range = self.train_cfg['point_cloud_range']
+                voxel_size = self.train_cfg['voxel_size']
+                
+                # det_xyz, det_feats가 None일 경우 빈 텐서 전달 (오류 방지)
+                vis_cam_xyz = det_xyz[0] if det_xyz is not None else torch.empty(0, 3, device=decoder_output_feat.device)
+                vis_cam_feat = det_feats[0] if det_feats is not None else torch.empty(0, lidar_only_query_feat.shape[1], device=decoder_output_feat.device)
+                
+                visualize_full_pipeline(
+                    cam_proposals_xyz=vis_cam_xyz,
+                    cam_proposals_feat=vis_cam_feat,
+                    query_pos=query_pos[0], # 항상 초기 위치 전달
+                    lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
+                    fused_feat=fused_query_feat_for_vis[0].permute(1, 0),
+                    final_feat=final_query_feat_for_vis[0].permute(1, 0),
+                    gt_bboxes_3d=gt_instances_3d.bboxes_3d,
+                    pc_range=pc_range,
+                    voxel_size=voxel_size,
+                    step=self.training_step,
+                    save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
+                )
+        self.training_step += 1
+
+        # --- 5. 결과 처리 및 반환 ---
         ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
-            index=top_proposals_index[:,
-                                      None, :].expand(-1, self.num_classes,
-                                                      -1),
-            dim=-1,
-        )  # [bs, num_classes, num_proposals]
+            index=top_proposals_index[:, None, :].expand(-1, self.num_classes, -1),
+            dim=-1
+        )
         ret_dicts[0]['dense_heatmap'] = dense_heatmap
 
         if self.auxiliary is False:
-            # only return the results of last decoder layer
-            return [ret_dicts[-1]]
+             # 마지막 레이어 결과만 반환 시, pred_delta_* 추가 필요
+             last_res = ret_dicts[-1]
+             last_res['pred_delta_rot'] = pred_delta_rot
+             last_res['pred_delta_trans'] = pred_delta_trans
+             return [last_res]
 
-        # return all the layer's results for auxiliary superivison
+        # 모든 레이어 결과 반환 시, pred_delta_* 추가 필요
         new_res = {}
         for key in ret_dicts[0].keys():
-            if key not in [
-                    'dense_heatmap', 'dense_heatmap_old', 'query_heatmap_score'
-            ]:
-                new_res[key] = torch.cat(
-                    [ret_dict[key] for ret_dict in ret_dicts], dim=-1)
+            if key not in ['dense_heatmap', 'query_heatmap_score']:
+                new_res[key] = torch.cat([ret_dict[key] for ret_dict in ret_dicts], dim=-1)
             else:
                 new_res[key] = ret_dicts[0][key]
+        
+        # ✨ 추가: 2단계 퓨전 결과(디코더 입력 전)를 loss 계산용으로 전달
+        new_res['refined_query_feat'] = refined_query_feat
+        
+        new_res['pred_delta_rot'] = pred_delta_rot
+        new_res['pred_delta_trans'] = pred_delta_trans
+        
         return [new_res]
 
     # def forward(self, feats, metas):
@@ -426,6 +492,7 @@ class TransFusionHead(nn.Module):
     #     res = multi_apply(self.forward_single, feats, [metas])
     #     assert len(res) == 1, 'only support one level features.'
     #     return res
+    
     def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None):
         if isinstance(feats, torch.Tensor):
             feats = [feats]
@@ -848,7 +915,7 @@ class TransFusionHead(nn.Module):
             heatmap[None],
         )
 
-    def loss(self, batch_feats, det_xyz,det_feats, batch_data_samples):
+    def loss(self, batch_feats, det_xyz,det_feats, batch_data_samples,gt_delta_rot=None, gt_delta_trans=None):
         """Loss function for CenterHead.
 
         Args:
@@ -864,12 +931,22 @@ class TransFusionHead(nn.Module):
             batch_input_metas.append(data_sample.metainfo)
             batch_gt_instances_3d.append(data_sample.gt_instances_3d)
         preds_dicts = self(batch_feats,det_xyz, det_feats,batch_input_metas,batch_gt_instances_3d)
-        loss = self.loss_by_feat(preds_dicts, batch_gt_instances_3d)
+        loss = self.loss_by_feat(
+                    preds_dicts, 
+                    batch_gt_instances_3d, 
+                    batch_input_metas, # metas는 여전히 다른 용도로 필요할 수 있음
+                    gt_delta_rot=gt_delta_rot,       # <-- 전달
+                    gt_delta_trans=gt_delta_trans   # <-- 전달
+                )
 
         return loss
 
     def loss_by_feat(self, preds_dicts: Tuple[List[dict]],
-                     batch_gt_instances_3d: List[InstanceData], *args,
+                     batch_gt_instances_3d: List[InstanceData],
+                     batch_input_metas: List[dict],
+                     gt_delta_rot: torch.Tensor,    # <-- 추가
+                     gt_delta_trans: torch.Tensor,
+                     *args,
                      **kwargs):
         (
             labels,
@@ -888,6 +965,23 @@ class TransFusionHead(nn.Module):
         preds_dict = preds_dicts[0][0]
         loss_dict = dict()
 
+        # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
+        # forward_single에서 반환된 예측값 사용
+        pred_delta_rot = preds_dict['pred_delta_rot']
+        pred_delta_trans = preds_dict['pred_delta_trans']
+        gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
+        gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
+        
+        # Loss 계산 (배치 전체에 대해 mean)
+        R_pred_calib = axis_angle_to_rotation_matrix(pred_delta_rot)
+        R_gt_calib = axis_angle_to_rotation_matrix(gt_delta_rot_mean)
+        loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
+        loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
+
+        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 5.0 # 가중치
+        loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
+        # ----------------------------------------------------
+
         # compute heatmap loss
         loss_heatmap = self.loss_heatmap(
             clip_sigmoid(preds_dict['dense_heatmap']).float(),
@@ -895,6 +989,54 @@ class TransFusionHead(nn.Module):
             avg_factor=max(heatmap.eq(1).float().sum().item(), 1),
         )
         loss_dict['loss_heatmap'] = loss_heatmap
+
+        # --- ✨ 추가: 2단계 정제 퓨전(Refined Fusion)에 대한 보조 Loss 계산 ✨ ---
+        # forward_single에서 전달받은 2단계 퓨전 특징
+        refined_query_feat = preds_dict['refined_query_feat']
+        
+        # 보조 예측 헤드로 예측 수행
+        aux_preds = self.refined_fusion_aux_head(refined_query_feat)
+        
+        # 보조 Loss 계산 (디코더 루프의 마지막 레이어(layer_-1)와 동일한 방식 사용)
+        aux_prefix = 'layer_refined_fusion'
+        num_layer_proposals = self.num_proposals # 보조 헤드는 디코더처럼 누적되지 않음
+        
+        aux_labels = labels[..., -num_layer_proposals:].reshape(-1)
+        aux_label_weights = label_weights[..., -num_layer_proposals:].reshape(-1)
+        aux_cls_score = aux_preds['heatmap'].permute(0, 2, 1).reshape(-1, self.num_classes)
+        
+        loss_aux_cls = self.loss_cls(
+            aux_cls_score.float(),
+            aux_labels,
+            aux_label_weights,
+            avg_factor=max(num_pos, 1),
+        )
+
+        aux_center = aux_preds['center']
+        aux_height = aux_preds['height']
+        aux_rot = aux_preds['rot']
+        aux_dim = aux_preds['dim']
+        aux_preds_tensor = torch.cat([aux_center, aux_height, aux_dim, aux_rot], dim=1).permute(0, 2, 1)
+        
+        if 'vel' in aux_preds:
+            aux_vel = aux_preds['vel']
+            aux_preds_tensor = torch.cat([aux_center, aux_height, aux_dim, aux_rot, aux_vel], dim=1).permute(0, 2, 1)
+
+        code_weights = self.train_cfg.get('code_weights', None)
+        aux_bbox_weights = bbox_weights[:, -num_layer_proposals:, :]
+        aux_reg_weights = aux_bbox_weights * aux_bbox_weights.new_tensor(code_weights)
+        aux_bbox_targets = bbox_targets[:, -num_layer_proposals:, :]
+        
+        loss_aux_bbox = self.loss_bbox(
+            aux_preds_tensor,
+            aux_bbox_targets,
+            aux_reg_weights,
+            avg_factor=max(num_pos, 1)
+        )
+
+        loss_dict[f'{aux_prefix}_loss_cls'] = loss_aux_cls * 0.5   # 가중치 (예: 0.5)
+        loss_dict[f'{aux_prefix}_loss_bbox'] = loss_aux_bbox * 0.5 # 가중치 (예: 0.5)
+        # ----------------------------------------------------
 
         # compute loss for each layer
         for idx_layer in range(
