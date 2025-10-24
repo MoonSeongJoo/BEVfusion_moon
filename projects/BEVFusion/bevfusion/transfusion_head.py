@@ -352,7 +352,7 @@ class TransFusionHead(nn.Module):
                 query_pos=query_pos,
                 key_pos=bev_pos)
             
-            ## ✨ 2. 시각화 코드를 호출합니다.
+            # # ✨ 2. 시각화 코드를 호출합니다.
             # if self.training_step % 50 == 0 :
             #     with torch.no_grad():
             #         # 배치의 첫 번째 샘플만 시각화
@@ -376,7 +376,7 @@ class TransFusionHead(nn.Module):
             #                     )
             #         print ("end")
             
-            self.training_step += 1
+            # self.training_step += 1
 
             # Prediction
             res_layer = self.prediction_heads[i](query_feat)
