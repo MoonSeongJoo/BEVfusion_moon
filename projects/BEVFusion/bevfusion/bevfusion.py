@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
 import math
-from .calib_head import axis_angle_to_rotation_matrix,geodesic_distance_loss
+from .calib_head import axis_angle_to_matrix,geodesic_distance_loss
 
 # class CalibrationCorrectionHead(nn.Module):
 #     """
@@ -1656,7 +1656,7 @@ class BEVFusion(Base3DDetector):
         보정된 calibration 파라미터 딕셔너리를 생성합니다.
         """
         # --- 1. 예측된 오차를 사용하여 corrected_camera2lidar 생성 ---
-        pred_delta_rot_mat = axis_angle_to_rotation_matrix(pred_delta_rot)
+        pred_delta_rot_mat = axis_angle_to_matrix(pred_delta_rot)
         broken_rots = broken_camera2lidar[..., :3, :3]
         broken_trans = broken_camera2lidar[..., :3, 3]
 
@@ -1835,8 +1835,8 @@ class BEVFusion(Base3DDetector):
             # losses['loss_calib_trans'] = F.l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 2.0
 
              # Loss 계산 (배치 전체에 대해 mean)
-            R_pred_calib = axis_angle_to_rotation_matrix(pred_rot_filtered)
-            R_gt_calib = axis_angle_to_rotation_matrix(gt_rot_filtered)
+            R_pred_calib = axis_angle_to_matrix(pred_rot_filtered)
+            R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
             loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
             loss_calib_trans_pred = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean')
 
@@ -2208,9 +2208,22 @@ class BEVFusion(Base3DDetector):
         esitmated_uvz = torch.cat([raw_pred_center_pts, esitmated_z['depth']], dim=-1)
 
         det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
+
+        # --- ✨ START: Logic copied from loss function ---
+        # loss 함수와 동일하게 좌표를 pc_range로 정규화 및 클램핑합니다.
+        det_xyz_ref = det_xyz.clone()
+        det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
+                self.pc_range[3] - self.pc_range[0])
+        det_xyz_ref[..., 1:2] = (det_xyz_ref[..., 1:2] - self.pc_range[1]) / (
+                self.pc_range[4] - self.pc_range[1])
+        det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
+                self.pc_range[5] - self.pc_range[2])
+        det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
+        # --- ✨ END: Logic copied from loss function ---
+        
         det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
         det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(
-            det_xyz, det_feat_sampled, B=B, N_cam=N)
+            det_xyz_ref_clamped, det_feat_sampled, B=B, N_cam=N)
 
         # --- 7. & 8. Final 3D Detection and Formatting (Same as before) ---
         feats = self.extract_feat(

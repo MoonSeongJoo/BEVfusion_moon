@@ -3,110 +3,87 @@ import torch.nn as nn
 from torch.nn import functional as F
 from mmdet3d.registry import MODELS
 
-def axis_angle_to_rotation_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
+def axis_angle_to_matrix(axis_angle: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
     """
-    하나 이상의 축-각 벡터를 3x3 회전 행렬로 변환합니다.
-
+    하나 이상의 축-각 벡터를 3x3 회전 행렬로 변환합니다. (ver 3.0, 최종 안정화)
+    
+    0-벡터(zero-angle) 입력에 대해 nan 그래디언트가 발생하지 않도록
+    각도(theta)가 epsilon보다 작은 경우와 큰 경우를 torch.where로 완벽히 분리하여
+    불안정한 그래디언트 계산 경로 자체를 차단합니다.
+    
     Args:
-        axis_angle (torch.Tensor): 변환할 축-각 벡터. 
-                                  Shape: (..., 3), 여기서 ...는 배치 차원을 의미.
-
+        axis_angle (torch.Tensor): 변환할 축-각 벡터. Shape: (..., 3)
+        epsilon (float): 0으로 간주할 매우 작은 각도(의 제곱) 기준값.
+                        dtype에 따라 (예: float16) 1e-6 정도로 높여야 할 수 있습니다.
     Returns:
-        torch.Tensor: 변환된 회전 행렬. Shape: (..., 3, 3).
+        torch.Tensor: 변환된 회전 행렬. Shape: (..., 3, 3)
     """
-    # 1. 각도(theta)와 단위 회전축(axis) 분리
-    # 벡터의 크기(norm)가 회전 각도(radian)
-    angle = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
-    
-    # 수치적 안정성을 위해 작은 epsilon 추가
-    # 각도가 0에 가까우면 axis는 어떤 방향이든 상관없음
-    axis = F.normalize(axis_angle, dim=-1)
-
-    # 2. 로드리게스 공식을 위한 준비
-    # 단위 회전축 벡터로 skew-symmetric cross-product 행렬 K 생성
-    K = torch.zeros(*axis.shape[:-1], 3, 3, device=axis.device, dtype=axis.dtype)
-    K[..., 0, 1] = -axis[..., 2]
-    K[..., 0, 2] =  axis[..., 1]
-    K[..., 1, 0] =  axis[..., 2]
-    K[..., 1, 2] = -axis[..., 0]
-    K[..., 2, 0] = -axis[..., 1]
-    K[..., 2, 1] =  axis[..., 0]
-
-    # 단위 행렬 I 생성
-    I = torch.eye(3, device=axis.device, dtype=axis.dtype).expand_as(K)
-    
-    # cos(theta)와 sin(theta) 계산
-    # (..., 1) -> (..., 1, 1) 형태로 브로드캐스팅 준비
-    cos_angle = torch.cos(angle).unsqueeze(-1)
-    sin_angle = torch.sin(angle).unsqueeze(-1)
-
-    # 3. 로드리게스 회전 공식 적용
-    # R = I + sin(θ)K + (1 - cos(θ))K^2
-    rotation_matrix = I + sin_angle * K + (1 - cos_angle) * torch.matmul(K, K)
-    
-    return rotation_matrix
-
-def axis_angle_to_matrix(axis_angle):
-    """
-    하나 이상의 축-각 회전 벡터 배치를 3x3 회전 행렬 배치로 변환합니다.
-    (Rodrigues' formula) - [B, ..., 3] 입력 처리 가능 (안정성 강화 버전)
-    Args:
-        axis_angle (Tensor): [..., 3] 모양의 회전 벡터.
-    Returns:
-        Tensor: [..., 3, 3] 모양의 회전 행렬.
-    """
-    original_shape = axis_angle.shape[:-1] # 마지막 3 제외한 원래 모양 저장
-    axis_angle = axis_angle.reshape(-1, 3) # 계산 편의를 위해 [N, 3] 형태로 변경
-    num_vectors = axis_angle.shape[0]
     device = axis_angle.device
     dtype = axis_angle.dtype
 
-    angle = torch.norm(axis_angle, p=2, dim=-1, keepdim=True) # [N, 1]
+    # ✨ FIX: 입력 자체의 NaN/Inf 방어
+    # 상위 네트워크에서 Inf/NaN이 터져서 넘어올 경우를 대비한 방어 코드
+    axis_angle = torch.nan_to_num(axis_angle, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 1. 각도(theta)의 제곱(theta^2) 계산
+    # (B, 1) 또는 (..., 1)
+    angle_sq = torch.sum(axis_angle**2, dim=-1, keepdim=True)
+
+    # 2. 정규화되지 *않은* 축-각 벡터 v로 Skew-symmetric 행렬 K_v 생성
+    # (B, 3, 3) 또는 (..., 3, 3)
+    K = torch.zeros(*axis_angle.shape[:-1], 3, 3, device=device, dtype=dtype)
+    K[..., 0, 1] = -axis_angle[..., 2]
+    K[..., 0, 2] =  axis_angle[..., 1]
+    K[..., 1, 0] =  axis_angle[..., 2]
+    K[..., 1, 2] = -axis_angle[..., 0]
+    K[..., 2, 0] = -axis_angle[..., 1]
+    K[..., 2, 1] =  axis_angle[..., 0]
+
+    # 단위 행렬 I 생성
+    I = torch.eye(3, device=device, dtype=dtype).expand_as(K)
     
-    # 단위 행렬 미리 생성 (기본값)
-    eye = torch.eye(3, device=device, dtype=dtype)
-    R = eye.unsqueeze(0).repeat(num_vectors, 1, 1) # [N, 3, 3], 초기값은 단위 행렬
+    # K_v의 제곱 계산
+    K_sq = torch.matmul(K, K)
 
-    # 각도가 0보다 큰 경우에만 계산 수행 (마스크 생성)
-    mask = (angle > 1e-6).squeeze(-1) # [N], True이면 각도가 큼
-
-    if mask.any():
-        # 마스크가 True인 벡터들만 선택
-        axis_angle_nz = axis_angle[mask] # [num_nz, 3]
-        angle_nz = angle[mask]           # [num_nz, 1]
-        
-        # Normalize axis only for non-zero angles
-        axis_nz = F.normalize(axis_angle_nz, p=2, dim=-1) # [num_nz, 3]
-
-        cos_nz = torch.cos(angle_nz) # [num_nz, 1]
-        sin_nz = torch.sin(angle_nz) # [num_nz, 1]
-
-        # Skew-symmetric 행렬 생성 [num_nz, 3, 3]
-        num_nz = axis_nz.shape[0]
-        skew_symmetric_nz = torch.zeros(num_nz, 3, 3, device=device, dtype=dtype)
-        skew_symmetric_nz[:, 0, 1] = -axis_nz[:, 2]
-        skew_symmetric_nz[:, 0, 2] = axis_nz[:, 1]
-        skew_symmetric_nz[:, 1, 0] = axis_nz[:, 2]
-        skew_symmetric_nz[:, 1, 2] = -axis_nz[:, 0]
-        skew_symmetric_nz[:, 2, 0] = -axis_nz[:, 1]
-        skew_symmetric_nz[:, 2, 1] = axis_nz[:, 0]
-
-        # Rodrigues' formula 계산 (브로드캐스팅을 위해 차원 명시적 추가)
-        eye_nz = eye.unsqueeze(0).repeat(num_nz, 1, 1) # [num_nz, 3, 3]
-        
-        # ✨ FIX: sin_nz, (1 - cos_nz)의 차원을 [num_nz, 1, 1]로 명확히 확장 ✨
-        term2 = sin_nz.unsqueeze(-1) * skew_symmetric_nz 
-        term3_matmul = torch.matmul(skew_symmetric_nz, skew_symmetric_nz)
-        term3 = (1 - cos_nz).unsqueeze(-1) * term3_matmul
-        
-        R_nz = eye_nz + term2 + term3 # [num_nz, 3, 3]
-        
-        # 계산된 결과를 원래 R 텐서의 해당 위치에 업데이트
-        R[mask] = R_nz
-        
-    # 원래 모양으로 복원 (예: [B, N_cam, 3, 3])
-    R = R.view(*original_shape, 3, 3)
-    return R
+    # 3. 로드리게스 공식을 위한 계수 A, B 계산
+    
+    # (B, 1) 또는 (..., 1)
+    small_angle_mask = (angle_sq < epsilon)
+    
+    # --- Case 1: 각도가 매우 작은 경우 (Taylor Expansion) ---
+    # A ≈ 1 - θ²/6,  B ≈ 1/2 - θ²/24
+    # 이 경로는 0으로 나누는 연산이 아예 없으므로 항상 안전합니다.
+    A_small = 1.0 - angle_sq / 6.0
+    B_small = 0.5 - angle_sq / 24.0
+    
+    # --- Case 2: 각도가 0에 가깝지 않은 경우 (일반 계산) ---
+    # ✨ FIX: small_angle_mask가 True인 곳은 0이 아닌 1.0으로 대체하여
+    # 0으로 나누는 연산 자체를 방지합니다.
+    # (어차피 이 값들은 small_angle_mask에 의해 버려짐)
+    angle_sq_safe = torch.where(small_angle_mask, 
+                              torch.ones_like(angle_sq), 
+                              angle_sq)
+    
+    angle_safe = torch.sqrt(angle_sq_safe)
+    
+    sin_angle = torch.sin(angle_safe)
+    cos_angle = torch.cos(angle_safe)
+    
+    A_large = sin_angle / angle_safe
+    B_large = (1.0 - cos_angle) / angle_sq_safe
+    
+    # --- 두 케이스 병합 ---
+    # [..., 1, 1] 로 브로드캐스팅 준비
+    # small_angle_mask가 True인 곳은 A_small/B_small (안전한 경로)
+    # False인 곳은 A_large/B_large (0이 아님이 보장된 경로)
+    A = torch.where(small_angle_mask, A_small, A_large).unsqueeze(-1)
+    B = torch.where(small_angle_mask, B_small, B_large).unsqueeze(-1)
+    
+    # 4. 로드리게스 회전 공식 적용
+    # R = I + A * K_v + B * K_v²
+    rotation_matrix = I + A * K + B * K_sq
+    
+    return rotation_matrix
 
 def geodesic_distance_loss(R_pred, R_gt, epsilon=1e-7):
     """두 회전 행렬 간의 측지 거리(각도 차이) 계산"""

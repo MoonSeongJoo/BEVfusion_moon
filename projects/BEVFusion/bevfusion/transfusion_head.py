@@ -19,7 +19,7 @@ from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
 from .imageprocessing_unit import visualize_full_pipeline
-from .calib_head import axis_angle_to_rotation_matrix,geodesic_distance_loss,correct_camera_proposals
+from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals
 
 def clip_sigmoid(x, eps=1e-4):
     y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
@@ -421,31 +421,31 @@ class TransFusionHead(nn.Module):
         # --- 시각화용: 최종 디코더 출력 특징 저장 ---
         final_query_feat_for_vis = decoder_output_feat
 
-        # --- 4. 시각화 호출 ---
-        if self.training_step % 3000 == 0 :
-            with torch.no_grad():
-                gt_instances_3d = batch_gt_instances_3d[0] # forward_single은 배치 0만 처리 가정
-                pc_range = self.train_cfg['point_cloud_range']
-                voxel_size = self.train_cfg['voxel_size']
+        # # --- 4. 시각화 호출 ---
+        # if self.training_step % 3000 == 0 :
+        #     with torch.no_grad():
+        #         gt_instances_3d = batch_gt_instances_3d[0] # forward_single은 배치 0만 처리 가정
+        #         pc_range = self.train_cfg['point_cloud_range']
+        #         voxel_size = self.train_cfg['voxel_size']
                 
-                # det_xyz, det_feats가 None일 경우 빈 텐서 전달 (오류 방지)
-                vis_cam_xyz = det_xyz[0] if det_xyz is not None else torch.empty(0, 3, device=decoder_output_feat.device)
-                vis_cam_feat = det_feats[0] if det_feats is not None else torch.empty(0, lidar_only_query_feat.shape[1], device=decoder_output_feat.device)
+        #         # det_xyz, det_feats가 None일 경우 빈 텐서 전달 (오류 방지)
+        #         vis_cam_xyz = det_xyz[0] if det_xyz is not None else torch.empty(0, 3, device=decoder_output_feat.device)
+        #         vis_cam_feat = det_feats[0] if det_feats is not None else torch.empty(0, lidar_only_query_feat.shape[1], device=decoder_output_feat.device)
                 
-                visualize_full_pipeline(
-                    cam_proposals_xyz=vis_cam_xyz,
-                    cam_proposals_feat=vis_cam_feat,
-                    query_pos=query_pos[0], # 항상 초기 위치 전달
-                    lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
-                    fused_feat=fused_query_feat_for_vis[0].permute(1, 0),
-                    final_feat=final_query_feat_for_vis[0].permute(1, 0),
-                    gt_bboxes_3d=gt_instances_3d.bboxes_3d,
-                    pc_range=pc_range,
-                    voxel_size=voxel_size,
-                    step=self.training_step,
-                    save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
-                )
-        self.training_step += 1
+        #         visualize_full_pipeline(
+        #             cam_proposals_xyz=vis_cam_xyz,
+        #             cam_proposals_feat=vis_cam_feat,
+        #             query_pos=query_pos[0], # 항상 초기 위치 전달
+        #             lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
+        #             fused_feat=fused_query_feat_for_vis[0].permute(1, 0),
+        #             final_feat=final_query_feat_for_vis[0].permute(1, 0),
+        #             gt_bboxes_3d=gt_instances_3d.bboxes_3d,
+        #             pc_range=pc_range,
+        #             voxel_size=voxel_size,
+        #             step=self.training_step,
+        #             save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
+        #         )
+        # self.training_step += 1
 
         # --- 5. 결과 처리 및 반환 ---
         ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
@@ -973,8 +973,8 @@ class TransFusionHead(nn.Module):
         gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
         
         # Loss 계산 (배치 전체에 대해 mean)
-        R_pred_calib = axis_angle_to_rotation_matrix(pred_delta_rot)
-        R_gt_calib = axis_angle_to_rotation_matrix(gt_delta_rot_mean)
+        R_pred_calib = axis_angle_to_matrix(pred_delta_rot)
+        R_gt_calib = axis_angle_to_matrix(gt_delta_rot_mean)
         loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
         loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
 
