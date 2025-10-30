@@ -5469,12 +5469,18 @@ def visualize_full_pipeline(
     )
     fig.colorbar(scatter0, ax=ax0, label='Feature Norm (Strength)')
 
+    # --- ✨✨✨ START: FIX - 시각화 편향 보정 ✨✨✨ ---
+    # '좌하향' 편향(e.g., 피처가 -0.5 셀만큼 밀림)을 보정하기 위해
+    # 쿼리 위치(pos)에 0.5 그리드 셀만큼의 오프셋을 더해줍니다.
+    pos_corrected = pos
+    # --- ✨✨✨ END: FIX --- ✨✨✨
+
     # --- Plot 1: 초기 (LiDAR-Only Queries) ---
     ax1.set_title("1. Initial (LiDAR-Only)")
     ax1.set_facecolor('black')
     out_size_factor = 4 # Transfusion의 경우
-    metric_x = pos[:, 0] * voxel_size[0] * out_size_factor + pc_range[0]
-    metric_y = pos[:, 1] * voxel_size[1] * out_size_factor + pc_range[1]
+    metric_x = pos_corrected[:, 0] * voxel_size[0] * out_size_factor + pc_range[0]
+    metric_y = pos_corrected[:, 1] * voxel_size[1] * out_size_factor + pc_range[1]
     scatter1 = ax1.scatter(metric_x, metric_y, c=lidar_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
     fig.colorbar(scatter1, ax=ax1, label='Feature Norm (Strength)')
 
@@ -5516,3 +5522,76 @@ def visualize_full_pipeline(
     plt.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
     print(f"✅ Full pipeline visualization saved to {save_path}")
+
+# --- ✨ START: Calibration Visualization Helpers ✨ ---
+
+def project_points_to_image(points_lidar_frame, lidar_to_img_proj_matrix, H, W):
+    """
+    LiDAR 좌표계의 3D 포인트를 이미지 평면에 투영하고 필터링합니다.
+
+    Args:
+        points_lidar_frame (torch.Tensor): LiDAR 좌표계의 포인트 [N, 3+].
+        lidar_to_img_proj_matrix (torch.Tensor): 3x4 LiDAR-to-Image 투영 행렬 (K @ T_lidar2cam).
+        H (int): 이미지 높이.
+        W (int): 이미지 너비.
+
+    Returns:
+        torch.Tensor: 이미지 평면 상의 유효한 포인트 [M, 2] (u, v 좌표).
+                     None 반환 시 유효 포인트 없음.
+    """
+    if points_lidar_frame is None or lidar_to_img_proj_matrix is None:
+        return None
+        
+    points_xyz = points_lidar_frame[:, :3]
+    points_ones = torch.ones_like(points_xyz[:, :1])
+    points_lidar_hom = torch.cat([points_xyz, points_ones], dim=-1) # [N, 4]
+
+    # points_img_hom: [N, 3] = lidar_to_img_proj_matrix @ points_lidar_hom.T
+    points_img_hom = (lidar_to_img_proj_matrix @ points_lidar_hom.T).T
+
+    # Perspective division
+    depth = points_img_hom[:, 2:3]
+    points_uv = points_img_hom[:, :2] / (depth + 1e-8) # [N, 2]
+
+    # Filter points behind camera or outside image boundaries
+    mask_depth = (depth.squeeze() > 0)
+    mask_u = (points_uv[:, 0] >= 0) & (points_uv[:, 0] < W)
+    mask_v = (points_uv[:, 1] >= 0) & (points_uv[:, 1] < H)
+    valid_mask = mask_depth & mask_u & mask_v
+
+    if valid_mask.any():
+        return points_uv[valid_mask]
+    else:
+        return None
+
+def visualize_calibration_effect(img, pts_gt, pts_broken, pts_corr, step, save_path):
+    """
+    카메라 이미지 위에 GT, Broken, Corrected LiDAR 포인트를 시각화합니다.
+    """
+    plt.figure(figsize=(16, 9))
+    plt.imshow(img)
+
+    # 점 크기 및 투명도 설정
+    s = 1 # 점 크기
+    alpha = 0.6 # 투명도
+
+    if pts_broken is not None:
+        pts_broken_np = pts_broken.cpu().numpy()
+        plt.scatter(pts_broken_np[:, 0], pts_broken_np[:, 1], color='red', s=s, alpha=alpha, label='Broken Calibration')
+
+    if pts_corr is not None:
+        pts_corr_np = pts_corr.cpu().numpy()
+        plt.scatter(pts_corr_np[:, 0], pts_corr_np[:, 1], color='cyan', s=s, alpha=alpha, label='Corrected by Model')
+
+    if pts_gt is not None:
+        pts_gt_np = pts_gt.cpu().numpy()
+        plt.scatter(pts_gt_np[:, 0], pts_gt_np[:, 1], color='lime', s=s, alpha=alpha, label='Ground Truth Calibration')
+
+    plt.title(f"Calibration Check @ Step {step}")
+    plt.legend(markerscale=10) # 범례의 점 크기를 키움
+    plt.axis('off')
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+    print(f"✅ Calibration visualization saved to {save_path}")
+
+# --- ✨ END: Calibration Visualization Helpers ✨ ---

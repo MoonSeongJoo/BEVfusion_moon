@@ -1715,7 +1715,7 @@ class BEVFusion(Base3DDetector):
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
              batch_data_samples: List[Det3DDataSample],
              **kwargs) -> List[Det3DDataSample]:
-        
+    
         target_device = batch_inputs_dict['imgs'].device
         batch_input_metas = [item.metainfo for item in batch_data_samples]
         # batch_data_samples에서 직접 Calibration 관련 텐서를 가져옵니다.

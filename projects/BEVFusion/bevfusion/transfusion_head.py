@@ -18,7 +18,7 @@ from mmdet3d.models.dense_heads.centerpoint_head import SeparateHead
 from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
-from .imageprocessing_unit import visualize_full_pipeline
+from .imageprocessing_unit import visualize_full_pipeline,project_points_to_image,visualize_calibration_effect
 from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals
 
 def clip_sigmoid(x, eps=1e-4):
