@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
 import math
-from .calib_head import axis_angle_to_matrix,geodesic_distance_loss
+from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,quaternion_to_matrix
 
 # class CalibrationCorrectionHead(nn.Module):
 #     """
@@ -1646,8 +1646,8 @@ class BEVFusion(Base3DDetector):
     
     def _get_corrected_calib_from_prediction(
         self,
-        pred_delta_rot: torch.Tensor,
-        pred_delta_trans: torch.Tensor,
+        pred_delta_rot: torch.Tensor, # ✨ 입력이 (B, N, 4) 쿼터니언으로 변경됨
+        pred_delta_trans: torch.Tensor, # (B, N, 3)
         broken_camera2lidar: torch.Tensor,
         broken_camera_intrinsics: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
@@ -1656,7 +1656,7 @@ class BEVFusion(Base3DDetector):
         보정된 calibration 파라미터 딕셔너리를 생성합니다.
         """
         # --- 1. 예측된 오차를 사용하여 corrected_camera2lidar 생성 ---
-        pred_delta_rot_mat = axis_angle_to_matrix(pred_delta_rot)
+        pred_delta_rot_mat = quaternion_to_matrix(pred_delta_rot)
         broken_rots = broken_camera2lidar[..., :3, :3]
         broken_trans = broken_camera2lidar[..., :3, 3]
 
@@ -1797,7 +1797,7 @@ class BEVFusion(Base3DDetector):
 
         raw_corrs = torch.zeros(raw_corrs_shape, device=query_input.device)
         enc_out = torch.zeros(enc_out_shape, device=query_input.device)
-        pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
+        pred_delta_6dof = torch.zeros(B, N, 7, device=target_device)
         
         # --- ✨ FIX 2: 활성 카메라가 있을 때만 네트워크 학습 수행 ---
         if len(active_cam_indices) > 0:
@@ -1812,7 +1812,13 @@ class BEVFusion(Base3DDetector):
             # 필터링된 데이터로 네트워크 호출
             raw_corrs_filtered, cycle, corr_mask, enc_out_filtered  = self.corr(sbs_view, query_input_filtered)
             # <<< START: MODIFICATION - 선택적 Loss 계산 >>>
-            pred_delta_6dof_filtered = self.calib_head(enc_out_filtered) # 모양: [활성 카메라 수, 6]
+            # pred_delta_6dof_filtered = self.calib_head(enc_out_filtered) # 모양: [활성 카메라 수, 6]
+            # 1. calib_head에 3개의 인자(enc_out, query, corrs) 전달
+            pred_delta_7dof_filtered = self.calib_head(
+                                        enc_out_filtered,       # (B*N, C, H, W)
+                                        query_input_filtered,   # (B*N, 200, 2)
+                                        raw_corrs_filtered      # (B*N, 200, 2)
+                                        ) # 출력 shape: (B*N, 7)
 
             # (✨ FIX) 4D -> 3D 변환
             b_act, c_f, h_f, w_f = enc_out_filtered.shape
@@ -1821,12 +1827,12 @@ class BEVFusion(Base3DDetector):
             if B == 1:
                 raw_corrs[active_cam_indices] = raw_corrs_filtered
                 enc_out[active_cam_indices] = enc_out_filtered_reshaped
-                pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_filtered
+                pred_delta_6dof[0, active_cam_indices] = pred_delta_7dof_filtered
                 enc_out = enc_out.permute(0,2,1).reshape(-1,d_model,feat_h,feat_w)
             
             # 1.Loss 계산은 '필터링된' 값들을 사용해 정확하게 수행
-            pred_rot_filtered = pred_delta_6dof_filtered[..., :3]
-            pred_trans_filtered = pred_delta_6dof_filtered[..., 3:]
+            pred_rot_filtered = pred_delta_7dof_filtered[..., :4]
+            pred_trans_filtered = pred_delta_7dof_filtered[..., 4:]
 
             gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
             gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
@@ -1835,7 +1841,7 @@ class BEVFusion(Base3DDetector):
             # losses['loss_calib_trans'] = F.l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 2.0
 
              # Loss 계산 (배치 전체에 대해 mean)
-            R_pred_calib = axis_angle_to_matrix(pred_rot_filtered)
+            R_pred_calib = quaternion_to_matrix(pred_rot_filtered)
             R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
             loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
             loss_calib_trans_pred = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean')
@@ -1851,8 +1857,8 @@ class BEVFusion(Base3DDetector):
             losses['loss_calib_rot'] = torch.tensor(0.0, device=sbs_img.device, requires_grad=True)
             losses['loss_calib_trans'] = torch.tensor(0.0, device=sbs_img.device, requires_grad=True)
 
-        pred_delta_rot = pred_delta_6dof[..., :3]
-        pred_delta_trans = pred_delta_6dof[..., 3:]
+        pred_delta_rot = pred_delta_6dof[..., :4]
+        pred_delta_trans = pred_delta_6dof[..., 4:]
 
         # # ##### 검증용 display ######
         # from .imageprocessing_unit import draw_correspondences

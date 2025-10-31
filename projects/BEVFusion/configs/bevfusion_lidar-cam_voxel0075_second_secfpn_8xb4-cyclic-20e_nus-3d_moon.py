@@ -169,8 +169,8 @@ model = dict(
     calib_head=dict(
         type='CalibrationCorrectionHead',
         in_channels=312,
-        hidden_dim=256,
-        out_dim=6,
+        # hidden_dim=256,
+        # out_dim=6,
     ),
     fusion_layer=dict(
         type='ConvFuser', in_channels=[80, 256], out_channels=256)
@@ -525,7 +525,7 @@ default_hooks = dict(
 del _base_.custom_hooks
 
 # load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-load_from =  "data/work_dirs/bevfusion/20251023_bevfusion_totaly_new/iter_27000.pth"
+load_from =  "data/work_dirs/bevfusion/20251031_calibhead_refine_quetanion/iter_6000.pth"
 # load_from = None
 resume_from = None
 

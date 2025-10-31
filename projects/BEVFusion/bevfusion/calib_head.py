@@ -85,6 +85,46 @@ def axis_angle_to_matrix(axis_angle: torch.Tensor, epsilon: float = 1e-8) -> tor
     
     return rotation_matrix
 
+def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
+    """
+    (..., 4) 모양의 쿼터니언을 (..., 3, 3) 회전 행렬로 변환합니다.
+    (x, y, z, w) 순서가 아닌 (w, x, y, z) 순서를 가정합니다. 
+    만약 (x, y, z, w) 순서라면 아래의 w, x, y, z 할당을 수정해야 합니다.
+    """
+    # 입력 쿼터니언이 (B, 4) 또는 (B, N, 4) 등일 수 있음
+    # F.normalize를 통해 항상 단위 쿼터니언(unit quaternion)이 되도록 보장
+    quaternions = F.normalize(quaternions, p=2, dim=-1)
+    
+    # 쿼터니언 성분 분리 (w, x, y, z) 순서로 가정
+    # 만약 calib_head가 (x, y, z, w)를 반환한다면 순서를 바꿔야 함:
+    # x, y, z, w = quaternions[..., 0], quaternions[..., 1], quaternions[..., 2], quaternions[..., 3]
+    w, x, y, z = quaternions[..., 0], quaternions[..., 1], quaternions[..., 2], quaternions[..., 3]
+
+    # 공통 계산 항목
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+
+    # 회전 행렬 계산 (이 공식은 NaN을 유발하는 나눗셈이 없음)
+    R = torch.empty(*quaternions.shape[:-1], 3, 3, device=quaternions.device, dtype=quaternions.dtype)
+    R[..., 0, 0] = 1 - 2 * (yy + zz)
+    R[..., 0, 1] = 2 * (xy - wz)
+    R[..., 0, 2] = 2 * (xz + wy)
+    R[..., 1, 0] = 2 * (xy + wz)
+    R[..., 1, 1] = 1 - 2 * (xx + zz)
+    R[..., 1, 2] = 2 * (yz - wx)
+    R[..., 2, 0] = 2 * (xz - wy)
+    R[..., 2, 1] = 2 * (yz + wx)
+    R[..., 2, 2] = 1 - 2 * (xx + yy)
+    
+    return R
+
 def geodesic_distance_loss(R_pred, R_gt, epsilon=1e-7):
     """두 회전 행렬 간의 측지 거리(각도 차이) 계산"""
     R_rel = torch.matmul(R_pred, R_gt.transpose(-2, -1))
@@ -93,22 +133,64 @@ def geodesic_distance_loss(R_pred, R_gt, epsilon=1e-7):
     angle = torch.acos((trace - 1) / 2.0)
     return angle
 
-# --- 새로 추가된 헬퍼 함수 ---
-def create_transformation_matrix(rot_vec, trans_vec):
-    """3D 회전 벡터와 3D 이동 벡터로부터 4x4 동차 변환 행렬 생성"""
-    batch_size = rot_vec.shape[0]
-    rotation_matrix = axis_angle_to_matrix(rot_vec) # [B, 3, 3]
+# # --- 새로 추가된 헬퍼 함수 ---
+# def create_transformation_matrix(rot_vec, trans_vec):
+#     """3D 회전 벡터와 3D 이동 벡터로부터 4x4 동차 변환 행렬 생성"""
+#     batch_size = rot_vec.shape[0]
+#     rotation_matrix = axis_angle_to_matrix(rot_vec) # [B, 3, 3]
     
+#     # 4x4 행렬 생성 (기본은 단위 행렬 형태)
+#     transformation_matrix = torch.eye(4, device=rot_vec.device, dtype=rot_vec.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+    
+#     # 회전 부분 채우기
+#     transformation_matrix[:, :3, :3] = rotation_matrix
+    
+#     # 이동 부분 채우기
+#     transformation_matrix[:, :3, 3] = trans_vec
+    
+#     return transformation_matrix
+
+# --- ✨ START: 수정할 함수 ✨ ---
+def create_transformation_matrix(rot_input: torch.Tensor, trans_vec: torch.Tensor) -> torch.Tensor:
+    """
+    3D 회전 벡터(3D) 또는 쿼터니언(4D)과 3D 이동 벡터로부터 
+    4x4 동차 변환 행렬을 생성합니다.
+
+    Args:
+        rot_input (torch.Tensor): (..., 3) [축-각] 또는 (..., 4) [쿼터니언]
+        trans_vec (torch.Tensor): (..., 3) [이동 벡터]
+    
+    Returns:
+        torch.Tensor: (..., 4, 4) 변환 행렬
+    """
+    batch_shape = rot_input.shape[:-1]
+    
+    if rot_input.shape[-1] == 3:
+        # 입력이 3D (축-각)인 경우
+        rotation_matrix = axis_angle_to_matrix(rot_input) # (..., 3, 3)
+    elif rot_input.shape[-1] == 4:
+        # 입력이 4D (쿼터니언)인 경우
+        rotation_matrix = quaternion_to_matrix(rot_input) # (..., 3, 3)
+    else:
+        raise ValueError(
+            f"Unknown rotation format. Expected 3 (axis-angle) or 4 (quaternion) "
+            f"dims in the last axis, got {rot_input.shape[-1]}"
+        )
+
     # 4x4 행렬 생성 (기본은 단위 행렬 형태)
-    transformation_matrix = torch.eye(4, device=rot_vec.device, dtype=rot_vec.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+    # .expand() 대신 torch.eye.repeat()를 사용하여 배치 차원에 맞게 생성
+    transformation_matrix = torch.eye(
+        4, device=rot_input.device, dtype=rot_input.dtype
+    ).unsqueeze(0).repeat(*batch_shape, 1, 1) # (..., 4, 4)
     
     # 회전 부분 채우기
-    transformation_matrix[:, :3, :3] = rotation_matrix
+    transformation_matrix[..., :3, :3] = rotation_matrix
     
     # 이동 부분 채우기
-    transformation_matrix[:, :3, 3] = trans_vec
+    transformation_matrix[..., :3, 3] = trans_vec
     
     return transformation_matrix
+# --- ✨ END: 수정할 함수 ✨ ---
 
 # --- 카메라 제안 보정 함수 (핵심 로직) ---
 def correct_camera_proposals(det_xyz_norm, pred_delta_rot, pred_delta_trans, pc_range_tensor):
@@ -150,44 +232,185 @@ def correct_camera_proposals(det_xyz_norm, pred_delta_rot, pred_delta_trans, pc_
 
     return det_xyz_corrected_norm
 
+# @MODELS.register_module()
+# class CalibrationCorrectionHead(nn.Module):
+#     """
+#     특징 맵을 입력받아 6-DoF 보정 파라미터를 예측하는 헤드.
+
+#     Args:
+#         in_channels (int): 입력 특징 맵의 채널 수.
+#         hidden_dim (int): MLP의 중간층 차원.
+#         out_dim (int): 출력 차원. 기본값은 6 (rot 3 + trans 3).
+#     """
+#     def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
+#         super().__init__()
+        
+#         # 1. 공간 차원(H, W)을 없애고 채널 정보만 남기기 위한 풀링 레이어
+#         self.pool = nn.AdaptiveAvgPool2d(1)
+        
+#         # 2. 풀링된 특징 벡터를 최종 6-DoF 값으로 매핑하는 MLP
+#         self.mlp = nn.Sequential(
+#             nn.Linear(in_channels, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, out_dim)
+#         )
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             x (torch.Tensor): 입력 특징 맵 (B*N, C, H, W)
+        
+#         Returns:
+#             torch.Tensor: 예측된 6-DoF 파라미터 (B*N, 6)
+#         """
+#         # (B*N, C, H, W) -> (B*N, C, 1, 1)
+#         x = self.pool(x)
+        
+#         # (B*N, C, 1, 1) -> (B*N, C)
+#         x = torch.flatten(x, 1)
+        
+#         # (B*N, C) -> (B*N, 6)
+#         pred_delta_6dof = self.mlp(x)
+        
+#         return pred_delta_6dof
+    
+# --------------------------------------------------------------------
+# 1. DepthCalibTranformer의 'regressor' 로직을 위한 헬퍼 클래스
+#    (CalibrationCorrectionHead 클래스보다 *먼저* 정의되어야 합니다)
+# --------------------------------------------------------------------
+class _CalibHeadRegressor(nn.Module):
+    """
+    DepthCalibTranformer의 regressor 로직을 구현한 내부 헬퍼 클래스.
+    BEVFusion의 2D 입력(num_kp*6)과 쿼터니언(4D) 출력에 맞게 수정됨.
+    """
+    def __init__(self, in_channels=312, dropout=0.5, num_kp=200):
+        super(_CalibHeadRegressor, self).__init__()
+        self.num_kp = num_kp
+        self.mish = nn.Mish()
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # 1. Global Feature (enc_out) 처리용
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        
+        # 2. Local Feature (corrs_emb) 차원
+        # BEVFusion 입력 기준: (u,v), (u',v'), (u-u'), (v-v') = 6 dims per Kp
+        self.corrs_emb_dim = self.num_kp * 6
+        
+        # 3. MLP 입력 차원 = Global (in_channels) + Local (corrs_emb_dim)
+        self.mlp_input_dim = self.corrs_emb_dim + in_channels # 예: (200 * 6) + 312 = 1512
+
+        # 4. 회전(Rotation) 브랜치 (regressor와 동일 구조)
+        self.fc0_rot_aggr = nn.Linear(self.mlp_input_dim, 1024)
+        self.bn0_rot_aggr = nn.BatchNorm1d(1024)
+        self.fc0_rot = nn.Linear(1024, 512)
+        self.bn0_rot = nn.BatchNorm1d(512)
+        self.fc1_rot = nn.Linear(512, 256)
+        self.bn1_rot = nn.BatchNorm1d(256)
+        # --- ✨ 수정: NaN 방지를 위해 쿼터니언(4D) 출력 ---
+        self.fc2_rot = nn.Linear(256, 4) 
+
+        # 5. 이동(Translation) 브랜치 (regressor와 동일 구조)
+        self.fc0_tarsl_aggr = nn.Linear(self.mlp_input_dim, 1024)
+        self.bn0_tarsl_aggr = nn.BatchNorm1d(1024)
+        self.fc0_trasl = nn.Linear(1024, 512)
+        self.bn0_trasl = nn.BatchNorm1d(512)
+        self.fc1_trasl = nn.Linear(512, 256)
+        self.bn1_trasl = nn.BatchNorm1d(256)
+        self.fc2_trasl = nn.Linear(256, 3) # 3D translation
+
+    def forward(self, x_global, y_local_flat):
+        """
+        Args:
+            x_global (Tensor): (B*N, C) - Global AvgPool Feature
+            y_local_flat (Tensor): (B*N, num_kp*6) - Flattened Corrs Feature
+        """
+        # (B*N, C + num_kp*6)
+        feature_emb = torch.cat((x_global, y_local_flat), dim=-1)
+        
+        # --- 회전 브랜치 ---
+        aggr_rot_x = self.mish(self.bn0_rot_aggr(self.fc0_rot_aggr(feature_emb)))
+        aggr_rot_x = self.dropout2(aggr_rot_x)
+        rot = self.mish(self.bn0_rot(self.fc0_rot(aggr_rot_x)))
+        rot = self.mish(self.bn1_rot(self.fc1_rot(rot)))
+        rot = self.fc2_rot(rot) # (B*N, 4) 쿼터니언 출력
+
+        # --- 이동 브랜치 ---
+        aggr_transl_x = self.mish(self.bn0_tarsl_aggr(self.fc0_tarsl_aggr(feature_emb)))
+        aggr_transl_x = self.dropout2(aggr_transl_x)
+        transl = self.mish(self.bn0_trasl(self.fc0_trasl(aggr_transl_x)))
+        transl = self.mish(self.bn1_trasl(self.fc1_trasl(transl)))
+        transl = self.fc2_trasl(transl) # (B*N, 3)
+
+        return rot, transl
+
+# --------------------------------------------------------------------
+# 2. 새로운 CalibrationCorrectionHead (기존 스텁 덮어쓰기)
+# --------------------------------------------------------------------
 @MODELS.register_module()
 class CalibrationCorrectionHead(nn.Module):
     """
-    특징 맵을 입력받아 6-DoF 보정 파라미터를 예측하는 헤드.
+    특징 맵(enc_out)과 대응점(corrs)을 입력받아
+    'regressor' 로직을 사용해 6-DoF 보정 파라미터를 예측하는 헤드.
+    (쿼터니언 4D + 이동 3D = 7D 출력)
 
     Args:
-        in_channels (int): 입력 특징 맵의 채널 수.
-        hidden_dim (int): MLP의 중간층 차원.
-        out_dim (int): 출력 차원. 기본값은 6 (rot 3 + trans 3).
+        in_channels (int): enc_out의 채널 수. (기본값: 312)
+        num_kp (int): correspondence keypoint의 수. (기본값: 200)
+        dropout_p (float): 드롭아웃 확률. (기본값: 0.5)
     """
-    def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
+    def __init__(self, in_channels: int = 312, num_kp: int = 200, dropout_p: float = 0.5):
         super().__init__()
+        self.num_kp = num_kp
         
-        # 1. 공간 차원(H, W)을 없애고 채널 정보만 남기기 위한 풀링 레이어
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        
-        # 2. 풀링된 특징 벡터를 최종 6-DoF 값으로 매핑하는 MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim)
+        # regressor 로직을 포함하는 내부 모듈 생성
+        self.regressor = _CalibHeadRegressor(
+            in_channels=in_channels, 
+            dropout=dropout_p, 
+            num_kp=num_kp
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, 
+                enc_out: torch.Tensor, 
+                query_input: torch.Tensor, 
+                corrs_pred: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x (torch.Tensor): 입력 특징 맵 (B*N, C, H, W)
+            enc_out (torch.Tensor): (B*N, C, H, W) e.g., (B*N, 312, 12, 64)
+            query_input (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
+            corrs_pred (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
         
         Returns:
-            torch.Tensor: 예측된 6-DoF 파라미터 (B*N, 6)
+            torch.Tensor: 예측된 7-DoF 파라미터 (B*N, 7)
+                         [..., :4] = quaternion (w, x, y, z) 또는 (x, y, z, w)
+                         [..., 4:] = translation (x, y, z)
         """
-        # (B*N, C, H, W) -> (B*N, C, 1, 1)
-        x = self.pool(x)
         
-        # (B*N, C, 1, 1) -> (B*N, C)
-        x = torch.flatten(x, 1)
+        # 1. Global Feature (enc_out) 처리
+        # (B*N, C, H, W) -> (B*N, C, 1, 1) -> (B*N, C)
+        x_global = self.regressor.flatten(self.regressor.avgpool(enc_out))
         
-        # (B*N, C) -> (B*N, 6)
-        pred_delta_6dof = self.mlp(x)
+        # 2. Local Feature (corrs_emb) 처리
+        # (B*N, 200, 2) and (B*N, 200, 2)
         
-        return pred_delta_6dof
+        # (u,v)와 (u',v') 결합
+        concat_pred_corrs = torch.cat((query_input, corrs_pred), dim=-1) # (B*N, 200, 4)
+        
+        # (u-u')와 (v-v') 차이 벡터 계산
+        x_diff = concat_pred_corrs[..., 0] - concat_pred_corrs[..., 2] # u - u'
+        y_diff = concat_pred_corrs[..., 1] - concat_pred_corrs[..., 3] # v - v'
+        concat_pred_corrs_diff = torch.stack([x_diff, y_diff], dim=2)  # (B*N, 200, 2)
+        
+        # (u,v, u',v', u-u', v-v') 결합
+        corrs_emb = torch.cat((concat_pred_corrs, concat_pred_corrs_diff), dim=-1) # (B*N, 200, 6)
+        
+        # MLP 입력을 위해 (B*N, 200, 6) -> (B*N, 200 * 6)
+        y_local_flat = corrs_emb.view(corrs_emb.size(0), -1) # (B*N, 1200)
+        
+        # 3. Regressor 호출
+        pred_rot, pred_trans = self.regressor(x_global, y_local_flat)
+        
+        # 4. 결과 결합 (4D + 3D = 7D)
+        pred_delta_7dof = torch.cat([pred_rot, pred_trans], dim=1) # (B*N, 7)
+        
+        return pred_delta_7dof

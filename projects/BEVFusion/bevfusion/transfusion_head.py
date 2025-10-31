@@ -19,7 +19,7 @@ from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
 from .imageprocessing_unit import visualize_full_pipeline,project_points_to_image,visualize_calibration_effect
-from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals
+from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,quaternion_to_matrix
 
 def clip_sigmoid(x, eps=1e-4):
     y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
@@ -183,7 +183,7 @@ class TransFusionHead(nn.Module):
         self.calibration_predictor = nn.Sequential(
             nn.Linear(calibration_input_dim, calibration_hidden_dim),
             nn.ReLU(), # Or nn.LeakyReLU(0.01) for potentially better stability
-            nn.Linear(calibration_hidden_dim, 6) # Output: 3 for rotation, 3 for translation
+            nn.Linear(calibration_hidden_dim, 7) # Output: 3 for rotation, 3 for translation
         )
 
         # --- ✨ 추가: 2단계 정제 퓨전을 위한 레이어들 ✨ ---
@@ -369,9 +369,9 @@ class TransFusionHead(nn.Module):
 
             # --- 2b. 캘리브레이션 오차 예측 ---
             pooled_coarse_feat = coarse_fused_query_feat.mean(dim=-1) # [B, C]
-            pred_delta_6dof = self.calibration_predictor(pooled_coarse_feat) # [B, 6]
-            pred_delta_rot = pred_delta_6dof[..., :3]
-            pred_delta_trans = pred_delta_6dof[..., 3:]
+            pred_delta_7dof = self.calibration_predictor(pooled_coarse_feat) # [B, 6]
+            pred_delta_rot = pred_delta_7dof[..., :4]
+            pred_delta_trans = pred_delta_7dof[..., 4:]
 
             # --- 2c. 카메라 제안 보정 ---
             pc_range_tensor = torch.tensor(self.train_cfg['point_cloud_range'], device=det_xyz.device)
@@ -965,22 +965,22 @@ class TransFusionHead(nn.Module):
         preds_dict = preds_dicts[0][0]
         loss_dict = dict()
 
-        # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
-        # forward_single에서 반환된 예측값 사용
-        pred_delta_rot = preds_dict['pred_delta_rot']
-        pred_delta_trans = preds_dict['pred_delta_trans']
-        gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
-        gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
+        # # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
+        # # forward_single에서 반환된 예측값 사용
+        # pred_delta_rot = preds_dict['pred_delta_rot']
+        # pred_delta_trans = preds_dict['pred_delta_trans']
+        # gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
+        # gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
         
-        # Loss 계산 (배치 전체에 대해 mean)
-        R_pred_calib = axis_angle_to_matrix(pred_delta_rot)
-        R_gt_calib = axis_angle_to_matrix(gt_delta_rot_mean)
-        loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
-        loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
+        # # Loss 계산 (배치 전체에 대해 mean)
+        # R_pred_calib = quaternion_to_matrix(pred_delta_rot)
+        # R_gt_calib = axis_angle_to_matrix(gt_delta_rot_mean)
+        # loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
+        # loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
 
-        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 5.0 # 가중치
-        loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
-        # ----------------------------------------------------
+        # loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 5.0 # 가중치
+        # loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
+        # # ----------------------------------------------------
 
         # compute heatmap loss
         loss_heatmap = self.loss_heatmap(
