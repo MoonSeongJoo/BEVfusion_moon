@@ -62,7 +62,9 @@ model = dict(
         encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128,
                                                                       128)),
         encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, (1, 1, 0)), (0, 0)),
-        block_type='basicblock'),
+        block_type='basicblock',
+        init_cfg=dict(type='Pretrained', checkpoint='data/work_dirs/extracted_backbones/pts_middle_encoder_pretrained.pth'),
+        ),
     pts_backbone=dict(
         type='SECOND',
         in_channels=256,
@@ -70,7 +72,9 @@ model = dict(
         layer_nums=[5, 5],
         layer_strides=[1, 2],
         norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
-        conv_cfg=dict(type='Conv2d', bias=False)),
+        conv_cfg=dict(type='Conv2d', bias=False),
+        init_cfg=dict(type='Pretrained', checkpoint='data/work_dirs/extracted_backbones/pts_backbone_pretrained.pth'),
+        ),
     pts_neck=dict(
         type='SECONDFPN',
         in_channels=[128, 256],
@@ -78,7 +82,9 @@ model = dict(
         upsample_strides=[1, 2],
         norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
         upsample_cfg=dict(type='deconv', bias=False),
-        use_conv_for_no_stride=True),
+        use_conv_for_no_stride=True,
+        init_cfg=dict(type='Pretrained', checkpoint='data/work_dirs/extracted_backbones/pts_neck_pretrained.pth')
+        ),
     bbox_head=dict(
         type='TransFusionHead',
         num_proposals=200,

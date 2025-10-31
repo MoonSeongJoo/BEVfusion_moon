@@ -965,22 +965,22 @@ class TransFusionHead(nn.Module):
         preds_dict = preds_dicts[0][0]
         loss_dict = dict()
 
-        # # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
-        # # forward_single에서 반환된 예측값 사용
-        # pred_delta_rot = preds_dict['pred_delta_rot']
-        # pred_delta_trans = preds_dict['pred_delta_trans']
-        # gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
-        # gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
+        # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
+        # forward_single에서 반환된 예측값 사용
+        pred_delta_rot = preds_dict['pred_delta_rot']
+        pred_delta_trans = preds_dict['pred_delta_trans']
+        gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
+        gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
         
-        # # Loss 계산 (배치 전체에 대해 mean)
-        # R_pred_calib = quaternion_to_matrix(pred_delta_rot)
-        # R_gt_calib = axis_angle_to_matrix(gt_delta_rot_mean)
-        # loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
-        # loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
+        # Loss 계산 (배치 전체에 대해 mean)
+        R_pred_calib = quaternion_to_matrix(pred_delta_rot)
+        R_gt_calib = axis_angle_to_matrix(gt_delta_rot_mean)
+        loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
+        loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
 
-        # loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 5.0 # 가중치
-        # loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
-        # # ----------------------------------------------------
+        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 1.0 # 가중치
+        loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
+        # ----------------------------------------------------
 
         # compute heatmap loss
         loss_heatmap = self.loss_heatmap(

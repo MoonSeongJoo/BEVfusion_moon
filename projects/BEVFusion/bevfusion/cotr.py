@@ -53,22 +53,22 @@ class COTR(BaseModule):
         ##### CORR network #######
         self.corr = build(easydict.EasyDict(cotr_config))
 
-        # --- ✨ 2. 가중치 수동 로드 로직 추가 ---
-        if self.init_cfg and self.init_cfg['type'] == 'Pretrained':
-            checkpoint_path = self.init_cfg.get('checkpoint')
-            if checkpoint_path:
-                # self.corr 모듈에 직접 체크포인트를 로드합니다.
-                load_checkpoint(
-                    self.corr, 
-                    checkpoint_path, 
-                    map_location='cpu', 
-                    strict=False,
-                    # 키 이름의 맨 앞에 있는 'corr.' 문자열을 제거하는 정규식
-                    revise_keys=[('^corr\\.', '')] # <-- 이 라인을 추가!
-                )
-                print_log(f'Manually loading checkpoint for self.corr from: {checkpoint_path}', logger='current')
-            else:
-                print_log('No checkpoint path in init_cfg for COTR.', logger='current', level='WARNING')
+        # # --- ✨ 2. 가중치 수동 로드 로직 추가 ---
+        # if self.init_cfg and self.init_cfg['type'] == 'Pretrained':
+        #     checkpoint_path = self.init_cfg.get('checkpoint')
+        #     if checkpoint_path:
+        #         # self.corr 모듈에 직접 체크포인트를 로드합니다.
+        #         load_checkpoint(
+        #             self.corr, 
+        #             checkpoint_path, 
+        #             map_location='cpu', 
+        #             strict=False,
+        #             # 키 이름의 맨 앞에 있는 'corr.' 문자열을 제거하는 정규식
+        #             revise_keys=[('^corr\\.', '')] # <-- 이 라인을 추가!
+        #         )
+        #         print_log(f'Manually loading checkpoint for self.corr from: {checkpoint_path}', logger='current')
+        #     else:
+        #         print_log('No checkpoint path in init_cfg for COTR.', logger='current', level='WARNING')
         
     #     self.frozen = frozen
     #     if self.frozen:

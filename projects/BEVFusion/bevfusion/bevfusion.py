@@ -31,6 +31,9 @@ import matplotlib.patches as patches
 import os
 import math
 from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,quaternion_to_matrix
+from mmengine.runner import load_checkpoint
+from mmengine.logging import print_log
+import logging
 
 # class CalibrationCorrectionHead(nn.Module):
 #     """
@@ -295,9 +298,70 @@ class BEVFusion(Base3DDetector):
 
         return loss, log_vars  # type: ignore
 
+    # def init_weights(self) -> None:
+    #     if self.img_backbone is not None:
+    #         self.img_backbone.init_weights()
+    
     def init_weights(self) -> None:
+        """
+        'super().init_weights()'의 버그(LongTensor.mean() 에러)를 우회하기 위해
+        init_cfg를 수동으로 처리하는 커스텀 init_weights 함수.
+        """
+        print_log(
+            f'WARNING: Running custom init_weights() to bypass '
+            f'BaseModel.init_weights() bug.', 
+            logger='current', 
+            level=logging.WARNING , # <--- ✨ 'WARN' -> logging.WARNING
+        )
+
+        # 1. SwinTransformer (img_backbone)는 자체 init_weights()를 사용
+        #    (이 모듈은 http에서 직접 로드하므로 수동 처리가 필요 없음)
         if self.img_backbone is not None:
-            self.img_backbone.init_weights()
+            if hasattr(self.img_backbone, 'init_weights'):
+                self.img_backbone.init_weights()
+                # SwinTransformer는 'BaseModule'을 상속하지 않아서 _is_init이 없을 수 있음
+                # 하지만 init_cfg도 없으니 수동 루프에서 건너뛸 것임.
+
+        # 2. 'init_cfg'가 있는 모든 자식 모듈을 순회하며 수동으로 가중치 로드
+        for module_name, m in self.named_modules():
+            # BaseModel을 상속받은 모듈(e.g., img_neck, pts_neck 등)만 처리
+            if hasattr(m, 'init_cfg') and m.init_cfg is not None:
+                # 이미 초기화된 모듈은 건너뜀 (예: Swin)
+                if hasattr(m, '_is_init') and m._is_init:
+                    continue
+
+                init_cfg = m.init_cfg
+                if init_cfg.get('type') == 'Pretrained':
+                    checkpoint_path = init_cfg.get('checkpoint')
+                    if checkpoint_path is None or "http" in checkpoint_path:
+                        # (http 로드는 Swin이 이미 처리했으므로 무시)
+                        continue
+                        
+                    try:
+                        print_log(f'Manually loading pretrained weights for {module_name} '
+                                  f'from {checkpoint_path}', logger='current', level=logging.INFO)
+                        
+                        # ✨✨✨ 여기가 핵심 수정 ✨✨✨
+                        # load_checkpoint(모듈 객체, 파일 경로, ...)
+                        load_checkpoint(
+                                m, # <--- 'm' (모듈 객체)이 첫 번째 인자
+                                checkpoint_path,
+                                map_location='cpu',
+                                strict=False,
+                                # revise_keys는 config의 init_cfg에서 처리되거나
+                                # 추출한 .pth 파일에 접두사가 없으므로 불필요
+                            )
+                        # ✨✨✨ 수정 완료 ✨✨✨
+                        print_log(f'Successfully loaded weights for {module_name}.', logger='current')
+                        
+                        if hasattr(m, '_set_init_cfg'):
+                            m._set_init_cfg(init_cfg) # 초기화 기록
+                        if hasattr(m, '_is_init'):
+                            m._is_init = True # 초기화됨 플래그 설정
+                        
+                    except Exception as e:
+                        print_log(f'ERROR loading {checkpoint_path} for {module_name}: {e}', 
+                                    logger='current', level=logging.ERROR)
 
     @property
     def with_bbox_head(self):

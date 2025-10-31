@@ -12,6 +12,7 @@ from mmdet3d.models.layers import SparseBasicBlock, make_sparse_convmodule
 from mmdet3d.models.layers.spconv import IS_SPCONV2_AVAILABLE
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import BaseInstance3DBoxes
+from mmengine.model import BaseModel
 
 if IS_SPCONV2_AVAILABLE:
     from spconv.pytorch import SparseConvTensor, SparseSequential
@@ -22,7 +23,7 @@ TwoTupleIntType = Tuple[Tuple[int]]
 
 
 @MODELS.register_module()
-class SparseEncoder(nn.Module):
+class SparseEncoder(BaseModel):
     r"""Sparse encoder for SECOND and Part-A2.
 
     Args:

@@ -23,8 +23,11 @@ class GeneralizedLSSFPN(BaseModule):
             norm_cfg=dict(type='BN2d'),
             act_cfg=dict(type='ReLU'),
             upsample_cfg=dict(mode='bilinear', align_corners=True),
+            init_cfg=None,
     ) -> None:
-        super().__init__()
+        # super().__init__()
+        super(GeneralizedLSSFPN, self).__init__(init_cfg=init_cfg)
+
         assert isinstance(in_channels, list)
         self.in_channels = in_channels
         self.out_channels = out_channels

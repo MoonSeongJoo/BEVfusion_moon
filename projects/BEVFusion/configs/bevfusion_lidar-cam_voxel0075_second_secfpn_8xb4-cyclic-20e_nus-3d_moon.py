@@ -70,7 +70,9 @@ model = dict(
         num_outs=3,
         norm_cfg=dict(type='BN2d', requires_grad=True),
         act_cfg=dict(type='ReLU', inplace=True),
-        upsample_cfg=dict(mode='bilinear', align_corners=False)),
+        upsample_cfg=dict(mode='bilinear', align_corners=False),
+        init_cfg=dict(type='Pretrained', checkpoint='data/work_dirs/extracted_backbones/img_neck_pretrained.pth'),
+        ),
     # --- 2. 새로 추가할 2D Detection Head ---
     img_bbox_head=dict(
         type='mmdet.RetinaHead',
@@ -119,7 +121,7 @@ model = dict(
         init_cfg=dict(
             type='Pretrained',
             # 예시: COCO 데이터셋으로 학습된 MMDetection의 RetinaNet 모델 체크포인트
-            checkpoint='https://download.openmmlab.com/mmdetection/v2.0/retinanet/retinanet_r50_fpn_1x_coco/retinanet_r50_fpn_1x_coco_20200130-c2398f9e.pth')
+            checkpoint='data/work_dirs/extracted_backbones/img_bbox_head_pretrained.pth')
         ),
     view_transform=dict(
         type='DepthLSSTransform',
@@ -477,9 +479,8 @@ optim_wrapper = dict(
         custom_keys={
             # 이미지 백본은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
-            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
-            # 'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
-            # 'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
+            'img_neck'  :dict(lr_mult=0.1, decay_mult=1.0),
+            'img_bbox_head': dict(lr_mult=0.1, decay_mult=1.0),
             # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             # 'corr': dict(lr_mult=0.1, decay_mult=1.0),
             # # pts_backbone
@@ -488,6 +489,7 @@ optim_wrapper = dict(
             'pts_middle_encoder' : dict(lr_mult=0.1, decay_mult=1.0),
             'pts_backbone' : dict(lr_mult=0.1, decay_mult=1.0),
             'pts_neck' : dict(lr_mult=0.1, decay_mult=1.0),
+            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
         }),
     clip_grad=dict(max_norm=35, norm_type=2))
 
@@ -525,11 +527,11 @@ default_hooks = dict(
 del _base_.custom_hooks
 
 # load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-load_from =  "data/work_dirs/bevfusion/20251031_calibhead_refine_quetanion/iter_6000.pth"
-# load_from = None
+# load_from =  "data/work_dirs/bevfusion/20251031_calibhead_refine_quetanion/iter_6000.pth"
+load_from = None
 resume_from = None
 
-# log_level = 'WARNING' 
+# log_level = 'DEBUG' 
 # 1. vis_backends 리스트를 먼저 정의합니다.
 vis_backends = [
     dict(type='LocalVisBackend'),

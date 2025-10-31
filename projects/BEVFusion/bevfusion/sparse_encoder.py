@@ -53,8 +53,9 @@ class BEVFusionSparseEncoder(SparseEncoder):
                  encoder_paddings=((1, ), (1, 1, 1), (1, 1, 1), ((0, 1, 1), 1,
                                                                  1)),
                  block_type='conv_module',
-                 return_middle_feats=False):
-        super(SparseEncoder, self).__init__()
+                 return_middle_feats=False,
+                 init_cfg=None):
+        super(SparseEncoder, self).__init__(init_cfg=init_cfg)
         assert block_type in ['conv_module', 'basicblock']
         self.sparse_shape = sparse_shape
         self.in_channels = in_channels
