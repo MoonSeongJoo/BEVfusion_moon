@@ -213,7 +213,7 @@ class BEVFusion(Base3DDetector):
                 # 'fusion_layer': self.fusion_layer,
                 
                 # Custom Modules
-                'corr': self.corr,
+                # 'corr': self.corr,
                 # 'z_estimator': self.z_estimator,
             }
             # modules_to_freeze = {
@@ -2226,7 +2226,7 @@ class BEVFusion(Base3DDetector):
 
         raw_corrs = torch.zeros(raw_corrs_shape, device=query_input.device)
         enc_out = torch.zeros(enc_out_shape, device=query_input.device)
-        pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
+        pred_delta_6dof = torch.zeros(B, N, 7, device=target_device)
 
         # Handle the two cases: with or without active cameras
         if len(active_cam_indices) > 0:
@@ -2241,7 +2241,12 @@ class BEVFusion(Base3DDetector):
             raw_corrs_filtered, _, _, enc_out_filtered  = self.corr(sbs_view, query_input_filtered)
             
             # Predict calibration delta for active cameras
-            pred_delta_6dof_filtered = self.calib_head(enc_out_filtered)
+            # pred_delta_6dof_filtered = self.calib_head(enc_out_filtered)
+            pred_delta_7dof_filtered = self.calib_head(
+                            enc_out_filtered,       # (B*N, C, H, W)
+                            query_input_filtered,   # (B*N, 200, 2)
+                            raw_corrs_filtered      # (B*N, 200, 2)
+                            ) # 출력 shape: (B*N, 7)
 
             # (✨ FIX) 4D -> 3D 변환
             b_act, c_f, h_f, w_f = enc_out_filtered.shape
@@ -2251,12 +2256,12 @@ class BEVFusion(Base3DDetector):
                 raw_corrs[active_cam_indices] = raw_corrs_filtered
                 # ✨ FIX: 4D 텐서 원본을 4D 슬라이스에 할당합니다.
                 enc_out[active_cam_indices] = enc_out_filtered_reshaped
-                pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_filtered
+                pred_delta_6dof[0, active_cam_indices] = pred_delta_7dof_filtered
                 enc_out = enc_out.permute(0,2,1).reshape(-1,d_model,feat_h,feat_w)
 
         # Split the (now fully reconstructed) tensor for the calibration correction function
-        pred_delta_rot = pred_delta_6dof[..., :3]
-        pred_delta_trans = pred_delta_6dof[..., 3:]
+        pred_delta_rot = pred_delta_6dof[..., :4]
+        pred_delta_trans = pred_delta_6dof[..., 4:]
 
         # ===================== END: LOGIC ALIGNMENT WITH LOSS FUNCTION =====================
 

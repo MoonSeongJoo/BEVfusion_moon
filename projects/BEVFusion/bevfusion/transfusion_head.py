@@ -978,7 +978,7 @@ class TransFusionHead(nn.Module):
         loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
         loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
 
-        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 1.0 # 가중치
+        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 5.0 # 가중치
         loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
         # ----------------------------------------------------
 

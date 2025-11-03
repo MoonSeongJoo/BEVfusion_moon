@@ -27,7 +27,7 @@ data_root = '/workspace/mmdetection3d/data/nuscenes/'
 
 model = dict(
     type='BEVFusion',
-    enable_selective_freezing=True,
+    enable_selective_freezing=False,
     class_names=class_names,
     train_cfg=dict(
         complement_2d_gt=0.35, # <-- 커스텀 설정을 여기로 이동
@@ -482,14 +482,14 @@ optim_wrapper = dict(
             'img_neck'  :dict(lr_mult=0.1, decay_mult=1.0),
             'img_bbox_head': dict(lr_mult=0.1, decay_mult=1.0),
             # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
-            # 'corr': dict(lr_mult=0.1, decay_mult=1.0),
+            'corr': dict(lr_mult=0.01, decay_mult=1.0),
             # # pts_backbone
             'pts_voxel_layer' : dict(lr_mult=0.1, decay_mult=1.0),
             'pts_voxel_encoder' :dict(lr_mult=0.1, decay_mult=1.0),
             'pts_middle_encoder' : dict(lr_mult=0.1, decay_mult=1.0),
             'pts_backbone' : dict(lr_mult=0.1, decay_mult=1.0),
             'pts_neck' : dict(lr_mult=0.1, decay_mult=1.0),
-            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
+            'z_estimator': dict(lr_mult=0.1,decay_mult=1.0), 
         }),
     clip_grad=dict(max_norm=35, norm_type=2))
 
@@ -527,8 +527,8 @@ default_hooks = dict(
 del _base_.custom_hooks
 
 # load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-# load_from =  "data/work_dirs/bevfusion/20251031_calibhead_refine_quetanion/iter_6000.pth"
-load_from = None
+load_from =  "data/work_dirs/bevfusion/20251031_pretrined_init_new/iter_27000.pth"
+# load_from = None
 resume_from = None
 
 # log_level = 'DEBUG' 
