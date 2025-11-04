@@ -88,17 +88,21 @@ def axis_angle_to_matrix(axis_angle: torch.Tensor, epsilon: float = 1e-8) -> tor
 def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
     """
     (..., 4) 모양의 쿼터니언을 (..., 3, 3) 회전 행렬로 변환합니다.
-    (x, y, z, w) 순서가 아닌 (w, x, y, z) 순서를 가정합니다. 
-    만약 (x, y, z, w) 순서라면 아래의 w, x, y, z 할당을 수정해야 합니다.
-    """
-    # 입력 쿼터니언이 (B, 4) 또는 (B, N, 4) 등일 수 있음
-    # F.normalize를 통해 항상 단위 쿼터니언(unit quaternion)이 되도록 보장
-    quaternions = F.normalize(quaternions, p=2, dim=-1)
+    (F.normalize 안정화 버전)
     
-    # 쿼터니언 성분 분리 (w, x, y, z) 순서로 가정
-    # 만약 calib_head가 (x, y, z, w)를 반환한다면 순서를 바꿔야 함:
-    # x, y, z, w = quaternions[..., 0], quaternions[..., 1], quaternions[..., 2], quaternions[..., 3]
-    w, x, y, z = quaternions[..., 0], quaternions[..., 1], quaternions[..., 2], quaternions[..., 3]
+    쿼터니언 순서는 (w, x, y, z)로 가정합니다.
+    """
+    # ✨✨✨ START: 여기가 핵심 수정 ✨✨✨
+    # 0-벡터(Zero Vector)가 입력될 경우 NaN이 발생하는 것을 막기 위해
+    # 분모에 작은 값(epsilon)을 더해줍니다.
+    norm = torch.norm(quaternions, p=2, dim=-1, keepdim=True)
+    eps = 1e-8 # 0으로 나누기 방지
+    quaternions_normalized = quaternions / (norm + eps)
+    # ✨✨✨ END: 여기가 핵심 수정 ✨✨✨
+
+    # 정규화된 쿼터니언 사용
+    w, x, y, z = quaternions_normalized[..., 0], quaternions_normalized[..., 1], \
+                   quaternions_normalized[..., 2], quaternions_normalized[..., 3]
 
     # 공통 계산 항목
     xx = x * x
