@@ -1837,7 +1837,7 @@ class BEVFusion(Base3DDetector):
                 )
 
                 # 3. ZEstimator의 "예측"과 "샘플링 좌표"를 가져옴
-                z_estimated_active = esitmated_z_active['depth'] # [NumActive, Q, 1]
+                z_estimated_active = esitmated_z_active['z_estimated_real'] # [NumActive, Q, 1]
 
                 # 4. 🚨 "정답지" (TRUE) 준비: Dilation 코드 모두 삭제 (롤백)
                 depth_map_reshaped_TRUE = dense_depth_map_gt.view(B * N, 900, 1600)
