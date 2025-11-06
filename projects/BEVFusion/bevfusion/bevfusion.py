@@ -648,9 +648,13 @@ class BEVFusion(Base3DDetector):
             lidar_depth_mis = imgs.new_tensor(np.asarray(lidar_depth_mis))
             lidar_depth_gt = imgs.new_tensor(np.asarray(lidar_depth_gt))
 
-            dense_depth_map = dense_map_from_depth_batch_v2(lidar_depth_mis,grid=3,iterations=3)
-            dense_depth_img_mis = dense_depth_map.to(dtype=torch.uint8)
+            dense_depth_map_mis = dense_map_from_depth_batch_v2(lidar_depth_mis,grid=3,iterations=3)
+            dense_depth_img_mis = dense_depth_map_mis.to(dtype=torch.uint8)
             dense_depth_img_color_mis = batch_colormap(dense_depth_img_mis)
+
+            dense_depth_map = dense_map_from_depth_batch_v2(lidar_depth_gt,grid=3,iterations=3)
+            # dense_depth_img = dense_depth_map.to(dtype=torch.uint8)
+            # dense_depth_img_color = batch_colormap(dense_depth_img)
 
             # 픽셀 값을 0.0 ~ 1.0 범위로 정규화하여 imshow가 올바르게 표시하도록 함
             img_min, img_max = imgs.min(), imgs.max()
@@ -658,10 +662,10 @@ class BEVFusion(Base3DDetector):
 
             N, V, C, H, W = imgs.shape
             imgs_reshaped = imgs.view(N * V, C, H, W)
-            depth_reshaped = dense_depth_img_color_mis.view(N * V, C, H, W)
+            depth_reshaped_mis = dense_depth_img_color_mis.view(N * V, C, H, W)
 
             img_resized = F.interpolate(imgs_reshaped, size=[192, 640], mode="bilinear")
-            lidar_depth_mis_resized = F.interpolate(depth_reshaped, size=[192, 640], mode="bilinear")
+            lidar_depth_mis_resized = F.interpolate(depth_reshaped_mis, size=[192, 640], mode="bilinear")
 
             sbs_img = two_images_side_by_side_gpu(img_resized, lidar_depth_mis_resized)
             sbs_img = sbs_img.permute(0,3,1,2)
@@ -673,7 +677,7 @@ class BEVFusion(Base3DDetector):
                 display_depth_maps(imgs,dense_depth_img_color_mis,sbs_img)
                 print("input dispaly end")
         
-        return sbs_img, points ,dense_depth_map
+        return sbs_img, points ,dense_depth_map_mis,dense_depth_map
     
     def box_iou(self, bboxes1, bboxes2):
         """
@@ -1713,400 +1717,285 @@ class BEVFusion(Base3DDetector):
         return corrected_calib_dict
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
-             batch_data_samples: List[Det3DDataSample],
-             **kwargs) -> List[Det3DDataSample]:
-    
-        target_device = batch_inputs_dict['imgs'].device
-        batch_input_metas = [item.metainfo for item in batch_data_samples]
-        # batch_data_samples에서 직접 Calibration 관련 텐서를 가져옵니다.
-        broken_camera2lidar = torch.stack([s.broken_camera2lidar for s in batch_data_samples]).to(target_device)
-        broken_camera_intrinsics = torch.stack([s.broken_camera_intrinsics for s in batch_data_samples]).to(target_device)
-        original_camera2lidar = torch.stack([s.camera2lidar for s in batch_data_samples]).to(target_device)
-        gt_delta_rot = torch.stack([s.gt_delta_rot for s in batch_data_samples]).to(target_device)
-        gt_delta_trans = torch.stack([s.gt_delta_trans for s in batch_data_samples]).to(target_device)
-
-        img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
-
-        reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
-            img_feats, batch_data_samples)
+                batch_data_samples: List[Det3DDataSample],
+                **kwargs) -> List[Det3DDataSample]:
         
-        losses = dict()
-        if self.with_bbox_head:
-            losses_2d = self.img_bbox_head.loss(reshaped_img_feats, reshaped_data_samples)
-        else:
-            losses_2d = dict()
-        
-        # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
-        total_losses = dict()
-        for k, v in losses_2d.items():
-            total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
-        
-        # losses 딕셔너리를 total_losses로 초기화하여 2D loss를 먼저 담습니다.
-        losses = total_losses
+            target_device = batch_inputs_dict['imgs'].device
+            batch_input_metas = [item.metainfo for item in batch_data_samples]
+            # batch_data_samples에서 직접 Calibration 관련 텐서를 가져옵니다.
+            broken_camera2lidar = torch.stack([s.broken_camera2lidar for s in batch_data_samples]).to(target_device)
+            broken_camera_intrinsics = torch.stack([s.broken_camera_intrinsics for s in batch_data_samples]).to(target_device)
+            original_camera2lidar = torch.stack([s.camera2lidar for s in batch_data_samples]).to(target_device)
+            gt_delta_rot = torch.stack([s.gt_delta_rot for s in batch_data_samples]).to(target_device)
+            gt_delta_trans = torch.stack([s.gt_delta_trans for s in batch_data_samples]).to(target_device)
 
-        # ✨ 2. 헬퍼 함수를 호출하여 2D 탐지 결과 생성, 처리, 시각화를 한 번에 수행
-        #    시각화가 필요할 때 visualize=True로 설정
-        detections_2d = self._generate_and_process_2d_dets(
-            reshaped_img_feats, 
-            reshaped_data_samples, 
-            batch_inputs_dict, 
-            visualize=False # 디버깅 시 True, 평소에는 False
-        )
+            img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
 
-        detections_2d_orig_coords = self.convert_boxes_to_original_scale(
-            pred_results_list=detections_2d,
-            data_samples_list=reshaped_data_samples
-        )
-
-        rois , proposla_list = self._generate_rois_from_detections(detections_2d_orig_coords)
-        rois_center = self.get_center_points(rois)
-        
-        # --- ✨ FIX 1: 활성 카메라 인덱스 추출 ---
-        # rois_center가 비어있지 않은 경우에만 활성 카메라 인덱스를 찾습니다.
-        if rois_center.numel() > 0:
-            active_cam_indices = torch.unique(rois_center[:, 0]).long()
-        else:
-            active_cam_indices = torch.tensor([], dtype=torch.long, device=rois_center.device)
-        
-        trimed_center_pts =self.batch_rois_center_by_cam_id(rois_center,batch_size=200)
-        # query_input = trimed_center_pts[..., 2:].clone()
-        # query_input[..., 0] /= 1600
-        # query_input[..., 1] /= 900
-        # query_input[:,:,0] = query_input[:,:,0]/2    # recaling points for sbs image resizing
-        # query_input[:,:,1] = query_input[:,:,1]
-
-        # --- ✨ FIX 1: query_input 정규화 로직 수정 ---
-        # in-place 연산 대신 새로운 텐서를 생성합니다.
-        query_coords = trimed_center_pts[..., 2:]
-        q_x = (query_coords[..., 0] / 1600) / 2
-        q_y = query_coords[..., 1] / 900
-        # z좌표가 있다면 유지, 없다면 x,y만 사용 (코드에 맞게 조절)
-        if query_coords.shape[-1] > 2:
-            q_z = query_coords[..., 2]
-            query_input = torch.stack([q_x, q_y, q_z], dim=-1)
-        else:
-            query_input = torch.stack([q_x, q_y], dim=-1)
-
-        sbs_img, pertubed_points,dense_depth_map = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
-        B,N,C,H,W = sbs_img.shape
-        d_model = 312
-        feat_h, feat_w = 12, 64 # 우리가 확인한 실제 피처맵 크기
-
-        raw_corrs_shape = (B * N, query_input.shape[1], query_input.shape[2])
-        enc_out_shape = (B * N, feat_h * feat_w, d_model) # [B*N, 768, 312]
-
-        raw_corrs = torch.zeros(raw_corrs_shape, device=query_input.device)
-        enc_out = torch.zeros(enc_out_shape, device=query_input.device)
-        pred_delta_6dof = torch.zeros(B, N, 7, device=target_device)
-        
-        # --- ✨ FIX 2: 활성 카메라가 있을 때만 네트워크 학습 수행 ---
-        if len(active_cam_indices) > 0:
-            # 활성 카메라 인덱스를 사용해 이미지와 쿼리 필터링
-            sbs_img_filtered = sbs_img[:, active_cam_indices]  # (B, num_active_cams, C, H, W)
-            query_input_filtered = query_input[active_cam_indices] # (num_active_cams, 200, 2)
+            reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
+                img_feats, batch_data_samples)
             
-            # B=1이라고 가정하고, 필터링된 이미지의 view를 조정
-            num_active_cams = sbs_img_filtered.shape[1]
-            sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
+            losses = dict()
+            if self.with_bbox_head:
+                losses_2d = self.img_bbox_head.loss(reshaped_img_feats, reshaped_data_samples)
+            else:
+                losses_2d = dict()
             
-            # 필터링된 데이터로 네트워크 호출
-            raw_corrs_filtered, cycle, corr_mask, enc_out_filtered  = self.corr(sbs_view, query_input_filtered)
-            # <<< START: MODIFICATION - 선택적 Loss 계산 >>>
-            # pred_delta_6dof_filtered = self.calib_head(enc_out_filtered) # 모양: [활성 카메라 수, 6]
-            # 1. calib_head에 3개의 인자(enc_out, query, corrs) 전달
-            pred_delta_7dof_filtered = self.calib_head(
-                                        enc_out_filtered,       # (B*N, C, H, W)
-                                        query_input_filtered,   # (B*N, 200, 2)
-                                        raw_corrs_filtered      # (B*N, 200, 2)
-                                        ) # 출력 shape: (B*N, 7)
-
-            # (✨ FIX) 4D -> 3D 변환
-            b_act, c_f, h_f, w_f = enc_out_filtered.shape
-            enc_out_filtered_reshaped = enc_out_filtered.flatten(2).permute(0, 2, 1)
-
-            if B == 1:
-                raw_corrs[active_cam_indices] = raw_corrs_filtered
-                enc_out[active_cam_indices] = enc_out_filtered_reshaped
-                pred_delta_6dof[0, active_cam_indices] = pred_delta_7dof_filtered
-                enc_out = enc_out.permute(0,2,1).reshape(-1,d_model,feat_h,feat_w)
+            # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
+            total_losses = dict()
+            for k, v in losses_2d.items():
+                total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
             
-            # 1.Loss 계산은 '필터링된' 값들을 사용해 정확하게 수행
-            pred_rot_filtered = pred_delta_7dof_filtered[..., :4]
-            pred_trans_filtered = pred_delta_7dof_filtered[..., 4:]
+            # losses 딕셔너리를 total_losses로 초기화하여 2D loss를 먼저 담습니다.
+            losses = total_losses
 
-            gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
-            gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
-
-            # losses['loss_calib_rot'] = F.l1_loss(pred_rot_filtered, gt_rot_filtered, reduction='mean') * 10.0
-            # losses['loss_calib_trans'] = F.l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 2.0
-
-             # Loss 계산 (배치 전체에 대해 mean)
-            R_pred_calib = quaternion_to_matrix(pred_rot_filtered)
-            R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
-            loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
-            loss_calib_trans_pred = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean')
-
-            losses['loss_calib_rot'] = loss_calib_rot_pred * 5.0
-            losses['loss_calib_trans'] = loss_calib_trans_pred * 1.0
-
-            # 3. (이제 가능) '재구성된 전체 텐서'에서 rot, trans를 분리
-            #    이 변수들이 corrected_calib_dict 함수로 전달됨
-
-        else:
-            # Loss도 0으로 설정
-            losses['loss_calib_rot'] = torch.tensor(0.0, device=sbs_img.device, requires_grad=True)
-            losses['loss_calib_trans'] = torch.tensor(0.0, device=sbs_img.device, requires_grad=True)
-
-        pred_delta_rot = pred_delta_6dof[..., :4]
-        pred_delta_trans = pred_delta_6dof[..., 4:]
-
-        # # ##### 검증용 display ######
-        # from .imageprocessing_unit import draw_correspondences
-        # # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
-        # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
-        # # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
-        # self.vis_step_counter += 1
-        # for cid in range(6):
-        #     # idx = id_to_idx[cid.item()]
-        #     # draw_correspondences(
-        #     #     trimed_corrs = gt_corrs[cid][:10,...],  # 첫 번째 배치 선택
-        #     #     sbs_img=sbs_img[cid],
-        #     #     save_path='correspondence_visualization_gt.jpg'
-        #     # )
-        #     bboxes_for_this_view = detections_2d_orig_coords[cid]
-        #     draw_correspondences(
-        #         trimed_corrs = pred_corrs[cid][:3,...],  # 첫 번째 배치 선택
-        #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
-        #         save_path='correspondence_visualization_pred.jpg',
-        #         bboxes_to_draw = bboxes_for_this_view, # 원본 좌표계 BBox 전달
-        #         score_thr = 0.4
-        #     )
-        #     # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
-        #     save_batch_predictions_to_file(
-        #             batch_inputs_dict=batch_inputs_dict,
-        #             reshaped_data_samples=reshaped_data_samples,
-        #             augmented_preds_list=detections_2d,
-        #             original_preds_list=detections_2d_orig_coords,
-        #             current_step=self.vis_step_counter,
-        #             save_dir='work_dirs/my_exp/vis_results',
-        #             view_index=cid, # 루프 변수 cid를 view_index로 사용
-        #             score_thr=0.4
-        #         )
-        #     print ("end")
-
-        # raw_pred_center_pts = raw_corrs.clone()
-        # raw_pred_center_pts[..., 0] = (raw_pred_center_pts[..., 0] - 0.5) * 2
-        # raw_pred_center_pts[..., 0] *= 1600
-        # raw_pred_center_pts[..., 1] *= 900
-
-        # --- ✨ FIX 2: raw_pred_center_pts 후처리 로직 수정 ---
-        # in-place 연산 대신 새로운 텐서를 생성합니다.
-        raw_corrs_clone = raw_corrs.clone()
-        r_x = (raw_corrs_clone[..., 0] - 0.5) * 2 * 1600
-        r_y = raw_corrs_clone[..., 1] * 900
-        raw_pred_center_pts = torch.stack([r_x, r_y], dim=-1)
-
-        esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map,enc_out)
-        esitmated_uvz =torch.cat([raw_pred_center_pts, esitmated_z['depth']],dim=-1)
-
-        # ✨✨✨ START: Z-Estimator를 위한 희소 감독(Sparse Supervision) Loss ✨✨✨
-        # 1. z_estimator의 예측값과 LiDAR 투영 깊이 값을 가져옵니다.
-        z_estimated = esitmated_z['z_estimated_real'] # 모델의 예측
-        z_lidar_sparse_gt = esitmated_z['z_lidar_real'] # 신뢰할 수 있는 희소한 정답
-
-        # 2. 신뢰할 수 있는 지점(LiDAR 포인트가 실제로 있는 곳)에 대한 마스크를 생성합니다.
-        valid_mask = (z_lidar_sparse_gt > 0).squeeze(-1)
-
-        # 3. 신뢰할 수 있는 지점들에서만 L1 Loss를 계산합니다.
-        if valid_mask.any():
-            # 이 Loss는 모델에게 "적어도 LiDAR 포인트가 있는 곳에서는 값을 맞춰라!"고 가르칩니다.
-            loss_z_estimation = F.l1_loss(
-                z_estimated.squeeze(-1)[valid_mask], 
-                z_lidar_sparse_gt.squeeze(-1)[valid_mask], 
-                reduction='mean'
+            detections_2d = self._generate_and_process_2d_dets(
+                reshaped_img_feats, 
+                reshaped_data_samples, 
+                batch_inputs_dict, 
+                visualize=False
             )
-        else:
-            # 이번 배치에 유효한 LiDAR 포인트가 하나도 없으면 loss는 0
-            loss_z_estimation = torch.tensor(0.0, device=target_device)
 
-        # 4. 계산된 loss를 전체 losses 딕셔너리에 추가합니다.
-        losses['loss_z_estimation'] = loss_z_estimation * 0.1 # loss 가중치는 조절 가능
+            detections_2d_orig_coords = self.convert_boxes_to_original_scale(
+                pred_results_list=detections_2d,
+                data_samples_list=reshaped_data_samples
+            )
 
-        # ✨✨✨ END: Z-Estimator Loss 추가 ✨✨✨
-
-        corrected_calib_dict = self._get_corrected_calib_from_prediction(
-                        pred_delta_rot,
-                        pred_delta_trans,
-                        broken_camera2lidar,
-                        broken_camera_intrinsics
-                    )
-
-        # ✨ '보정된' lidar2imag를 사용하여 3D 좌표 변환 수행
-        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
-       
-        # ###### BEV display logic 추가 #############################
-        # if self.training_step % 50 == 0 :
-        #         with torch.no_grad(): # 그래디언트 계산 비활성화
-        #             # ✨ FIX: det_xyz를 먼저 계산해야 시각화에 사용할 수 있습니다.
-        #             # 이 계산은 아래 corrected_calib_dict가 생성된 후에 나옵니다.
-        #             # 따라서 시각화를 위해 여기서 임시로 'broken' calib을 사용해 계산합니다.
-        #             det_xyz_for_vis = det_xyz.clone() 
-        #             # 배치의 첫 번째 샘플만 시각화
-        #             # first_sample_det_xyz = det_xyz_for_vis.view(B, N, -1, 3)[0].view(-1, 3)
-        #             first_sample_det_xyz = det_xyz_for_vis.reshape(B, N, -1, 3)[0].reshape(-1, 3)
-                    
-        #             # ✨ FIX: batch_data_samples에서 직접 Ground Truth를 가져옵니다.
-        #             first_sample_gt_instances = batch_data_samples[0].gt_instances_3d
-                    
-        #             save_filename = f"work_dirs/bev_proposal_step_after_{self.training_step}.png"
-                    
-        #             visualize_bev_proposals(
-        #                 det_xyz=first_sample_det_xyz,
-        #                 gt_bboxes_3d=first_sample_gt_instances.bboxes_3d,
-        #                 step=self.training_step,
-        #                 save_path=save_filename
-        #             )
-        #             print ("end")
-        # self.training_step += 1
-        # ################### end #####################################
-
-        # ✨✨✨ START: Chamfer Distance Loss 추가 ✨✨✨
-        # 1. 실제 LiDAR 포인트 클라우드 가져오기
-        #    batch_inputs_dict['points']는 리스트 형태일 수 있음 -> 패딩 및 텐서화 필요
-        #    또는 데이터 로더에서 미리 처리된 텐서를 사용
-        #    여기서는 batch_inputs_dict['points'][0] 이 [NumPoints, 3+] 형태라고 가정
-        #    (실제 구현 시 데이터 형태 확인 및 전처리 필요)
-        
-        gt_lidar_points = batch_inputs_dict['points'][0][:, :3] # 배치 0의 xyz만 사용 (가정)
-        gt_lidar_points = gt_lidar_points.unsqueeze(0).to(target_device) # [1, NumPoints, 3]
-        
-        # 2. det_xyz 형태 변환 [B*N_cam, Q, 3] -> [B, N_cam*Q, 3] (B=1 가정)
-        num_queries_per_cam = det_xyz.shape[1]
-        det_xyz_batch = det_xyz.reshape(B, N * num_queries_per_cam, 3) # [1, N_cam*Q, 3]
-
-        # 3. (선택적) 포인트 샘플링 (계산량 감소 목적)
-        #    예: 각 클라우드에서 2048개 포인트 무작위 샘플링
-        if gt_lidar_points.shape[1] > 2048:
-            indices = torch.randperm(gt_lidar_points.shape[1], device=target_device)[:2048]
-            gt_lidar_points_sampled = gt_lidar_points[:, indices, :]
-        else:
-            gt_lidar_points_sampled = gt_lidar_points
+            rois , proposla_list = self._generate_rois_from_detections(detections_2d_orig_coords)
+            rois_center = self.get_center_points(rois)
             
-        if det_xyz_batch.shape[1] > 2048:
-            indices = torch.randperm(det_xyz_batch.shape[1], device=target_device)[:2048]
-            det_xyz_batch_sampled = det_xyz_batch[:, indices, :]
-        else:
-            det_xyz_batch_sampled = det_xyz_batch
+            if rois_center.numel() > 0:
+                active_cam_indices = torch.unique(rois_center[:, 0]).long()
+            else:
+                active_cam_indices = torch.tensor([], dtype=torch.long, device=rois_center.device)
+            
+            trimed_center_pts =self.batch_rois_center_by_cam_id(rois_center,batch_size=200)
 
-        # 4. Chamfer Distance 계산
-        loss_chamfer = chamfer_distance(det_xyz_batch_sampled, gt_lidar_points_sampled).mean()
+            query_coords = trimed_center_pts[..., 2:]
+            q_x = (query_coords[..., 0] / 1600) / 2
+            q_y = query_coords[..., 1] / 900
+            if query_coords.shape[-1] > 2:
+                q_z = query_coords[..., 2]
+                query_input = torch.stack([q_x, q_y, q_z], dim=-1)
+            else:
+                query_input = torch.stack([q_x, q_y], dim=-1)
 
-        # 5. losses 딕셔너리에 추가 (가중치 조절 필요)
-        losses['loss_chamfer_xyz'] = loss_chamfer * 0.05 # 예시 가중치
-        # ✨✨✨ END: Chamfer Distance Loss 추가 ✨✨✨
+            sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
+            B,N,C,H,W = sbs_img.shape
+            d_model = 312
+            feat_h, feat_w = 12, 64
 
-        det_xyz_ref = det_xyz.clone()
-        det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
-                self.pc_range[3] - self.pc_range[0])
-        det_xyz_ref[..., 1:2] = (det_xyz_ref[..., 1:2] - self.pc_range[1]) / (
-                self.pc_range[4] - self.pc_range[1])
-        det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
-                self.pc_range[5] - self.pc_range[2])
-        det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
-        
-        det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
-        det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz_ref_clamped,det_feat_sampled,B=B,N_cam=N)
+            # --- ✨ FIX 1: 모든 텐서를 미리 0으로 초기화 (else 블록과 공유) ---
+            raw_corrs_shape = (B * N, query_input.shape[1], query_input.shape[2])
+            enc_out_shape = (B * N, feat_h * feat_w, d_model)
+            esitmated_uvz_shape = (B * N, query_input.shape[1], 3) # (u,v,z)
 
-        feats = self.extract_feat(batch_inputs_dict=batch_inputs_dict,
-                                batch_input_metas=batch_input_metas,
-                                corrected_calib=corrected_calib_dict,
-                                precomputed_img_feats=img_feats)
+            raw_corrs = torch.zeros(raw_corrs_shape, device=query_input.device)
+            enc_out = torch.zeros(enc_out_shape, device=query_input.device)
+            esitmated_uvz = torch.zeros(esitmated_uvz_shape, device=query_input.device)
+            
+            losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device)
+            
+            pred_delta_7dof = torch.zeros(B, N, 7, device=target_device)
+            losses['loss_calib_rot'] = torch.tensor(0.0, device=target_device, requires_grad=True)
+            losses['loss_calib_trans'] = torch.tensor(0.0, device=target_device, requires_grad=True)
+            
+            # --- ✨ FIX 2: "안전장치" if 블록 유지 ---
+            if len(active_cam_indices) > 0:
+                sbs_img_filtered = sbs_img[:, active_cam_indices]
+                query_input_filtered = query_input[active_cam_indices]
+                
+                num_active_cams = sbs_img_filtered.shape[1]
+                sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
+                
+                raw_corrs_active, cycle, corr_mask, enc_out_active_4d = self.corr(sbs_view, query_input_filtered)
+                pred_delta_7dof_active = self.calib_head(
+                    enc_out_active_4d, 
+                    query_input_filtered, 
+                    raw_corrs_active
+                )
 
-        if self.with_bbox_head:
-            bbox_loss = self.bbox_head.loss(
-                            feats, 
-                            det_xyz_proc, 
-                            det_feat_proc, 
-                            batch_data_samples,
-                            gt_delta_rot=gt_delta_rot,       # <-- 추가
-                            gt_delta_trans=gt_delta_trans   # <-- 추가
+                b_act, c_f, h_f, w_f = enc_out_active_4d.shape
+                enc_out_active_3d = enc_out_active_4d.flatten(2).permute(0, 2, 1)
+            
+                # raw_corrs_active (Corr 정규화) -> uv_pixels_from_corr (Corr 픽셀)
+                # "predict" 함수의 (L1498-1500) 로직을 여기에 그대로 복사해야 합니다.
+                # (아래는 L1498을 기반으로 한 *추정*입니다. L1498 코드를 정확히 복사하세요)
+                r_x = (raw_corrs_active[..., 0] - 0.5) * 2 * 1600 
+                r_y = raw_corrs_active[..., 1] * 900
+                uv_pixels_from_corr = torch.stack([r_x, r_y], dim=-1) # (NumActive, Q, 2)
+                
+                # 🚨 1. "문제지" (BROKEN) 준비
+                depth_map_reshaped_BROKEN = dense_depth_map.view(B * N, 900, 1600)
+                depth_map_active_BROKEN = depth_map_reshaped_BROKEN[active_cam_indices]
+
+                # 2. ZEstimator 호출: "문제지"를 입력으로 줌
+                esitmated_z_active = self.z_estimator(
+                    uv_sbs_normalized=raw_corrs_active,      # (특징 좌표)
+                    uv_orig_pixels=uv_pixels_from_corr,   # ✨ (GT 샘플링용 좌표)
+                    depth_map=depth_map_active_BROKEN,
+                    enc_out=enc_out_active_4d
+                )
+
+                # 3. ZEstimator의 "예측"과 "샘플링 좌표"를 가져옴
+                z_estimated_active = esitmated_z_active['depth'] # [NumActive, Q, 1]
+
+                # 4. 🚨 "정답지" (TRUE) 준비: Dilation 코드 모두 삭제 (롤백)
+                depth_map_reshaped_TRUE = dense_depth_map_gt.view(B * N, 900, 1600)
+                depth_map_active_TRUE = depth_map_reshaped_TRUE[active_cam_indices] # [NumActive, H, W]
+
+                num_active, Q, _ = uv_pixels_from_corr.shape # ✨ [수정]
+                H_gt, W_gt = 900, 1600
+                
+                uv_orig_flat_active = uv_pixels_from_corr.view(-1, 2) # ✨ [수정]
+                cam_ids_active_flat = torch.arange(num_active, device=target_device).unsqueeze(1).expand(num_active, Q).reshape(-1) 
+                
+                u_coords_flat = uv_orig_flat_active[:, 0].round().long().clamp(0, W_gt - 1)
+                v_coords_flat = uv_orig_flat_active[:, 1].round().long().clamp(0, H_gt - 1)
+
+                # "진짜" GT 깊이 값 [NumActive * Q]
+                z_lidar_sparse_gt_TRUE_flat = depth_map_active_TRUE[cam_ids_active_flat, v_coords_flat, u_coords_flat]
+                
+                # [NumActive, Q] 형태로 복원
+                z_lidar_sparse_gt_TRUE_active = z_lidar_sparse_gt_TRUE_flat.view(num_active, Q)
+                
+                # 6. Z-Estimator 손실 계산 (예측 vs "진짜" 정답)
+                valid_mask_active = (z_lidar_sparse_gt_TRUE_active > 0) # "진짜" 정답이 있는 곳만
+
+                if valid_mask_active.any():
+                    loss_z_estimation = F.smooth_l1_loss(  # <-- L1을 Smooth L1로 변경
+                                        z_estimated_active.squeeze(-1)[valid_mask_active], # 예측
+                                        z_lidar_sparse_gt_TRUE_active[valid_mask_active],  # "진짜" 정답
+                                        reduction='mean',
+                                        beta=1.0  # beta=1.0이 표준입니다 (오차 1.0 기준 L1/L2 전환)
+                                    )
+                    losses['loss_z_estimation'] = loss_z_estimation * 0.1
+                
+                if B == 1:
+                    raw_corrs[active_cam_indices] = raw_corrs_active
+                    enc_out[active_cam_indices] = enc_out_active_3d
+                    pred_delta_7dof[0, active_cam_indices] = pred_delta_7dof_active
+                    
+                    esitmated_uvz_active = torch.cat(
+                        [uv_pixels_from_corr, esitmated_z_active['depth']], dim=-1
+                    ) # ✨
+                    esitmated_uvz[active_cam_indices] = esitmated_uvz_active
+
+                pred_rot_filtered = pred_delta_7dof_active[..., :4]
+                pred_trans_filtered = pred_delta_7dof_active[..., 4:]
+
+                gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
+                gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
+
+                R_pred_calib = quaternion_to_matrix(pred_rot_filtered)
+                R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
+                losses['loss_calib_rot'] = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean() * 5.0
+                losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 1.0
+            # --- if/else 블록 끝 ---
+            
+            enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
+            
+            pred_delta_rot = pred_delta_7dof[..., :4]
+            pred_delta_trans = pred_delta_7dof[..., 4:]
+
+            # # ##### 검증용 display ######
+            # from .imageprocessing_unit import draw_correspondences
+            # # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
+            # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
+            # # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
+            # self.vis_step_counter += 1
+            # for cid in range(6):
+            #     # idx = id_to_idx[cid.item()]
+            #     # draw_correspondences(
+            #     #     trimed_corrs = gt_corrs[cid][:10,...],  # 첫 번째 배치 선택
+            #     #     sbs_img=sbs_img[cid],
+            #     #     save_path='correspondence_visualization_gt.jpg'
+            #     # )
+            #     bboxes_for_this_view = detections_2d_orig_coords[cid]
+            #     draw_correspondences(
+            #         trimed_corrs = pred_corrs[cid][:3,...],  # 첫 번째 배치 선택
+            #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
+            #         save_path='correspondence_visualization_pred.jpg',
+            #         bboxes_to_draw = bboxes_for_this_view, # 원본 좌표계 BBox 전달
+            #         score_thr = 0.4
+            #     )
+            #     # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
+            #     save_batch_predictions_to_file(
+            #             batch_inputs_dict=batch_inputs_dict,
+            #             reshaped_data_samples=reshaped_data_samples,
+            #             augmented_preds_list=detections_2d,
+            #             original_preds_list=detections_2d_orig_coords,
+            #             current_step=self.vis_step_counter,
+            #             save_dir='work_dirs/my_exp/vis_results',
+            #             view_index=cid, # 루프 변수 cid를 view_index로 사용
+            #             score_thr=0.4
+            #         )
+            #     print ("end")
+
+            corrected_calib_dict = self._get_corrected_calib_from_prediction(
+                            pred_delta_rot,
+                            pred_delta_trans,
+                            broken_camera2lidar,
+                            broken_camera_intrinsics
                         )
 
-        losses.update(bbox_loss)
-
-        # # --- ✨ VERIFICATION 2: 최종 시각적 검증 (GT / Broken / Corrected 비교) ---
-        # # 100 스텝마다 첫 번째 샘플의 첫 번째 카메라만 시각화하여 확인
-        # if hasattr(self, 'training_step') and self.training_step % 50 == 0:
-        #     with torch.no_grad():
-        #         import matplotlib.pyplot as plt
-        #         import cv2
-        #         import numpy as np
-
-        #         cam_idx = 0
-                
-        #         # --- 1. 시각화에 필요한 데이터 준비 ---
-        #         img_tensor_chw = batch_inputs_dict['img_original'][0][cam_idx].cpu().numpy()
-        #         img_for_vis = img_tensor_chw.transpose(1, 2, 0)
-        #         if img_for_vis.dtype in [np.float32, np.float64] and img_for_vis.max() > 1.0:
-        #             img_for_vis = img_for_vis / 255.0
-                    
-        #         points_for_vis = batch_inputs_dict['points_original'][0].tensor
-        #         h, w = img_for_vis.shape[:2]
-        #         K = broken_camera_intrinsics[0, cam_idx, :3, :3]
-                
-        #         # --- 2. 세 가지 상태의 투영 행렬(Projection Matrix) 계산 ---
-        #         # (P = K @ T_lidar2camera)
-                
-        #         # a) Ground Truth (정답)
-        #         T_l2c_orig = torch.inverse(original_camera2lidar[0, cam_idx])[:3, :]
-        #         P_orig = K @ T_l2c_orig
-                
-        #         # b) Broken (문제)
-        #         T_l2c_broken = torch.inverse(broken_camera2lidar[0, cam_idx])[:3, :]
-        #         P_broken = K @ T_l2c_broken
-                
-        #         # c) Corrected (모델의 해결책)
-        #         T_l2c_corr = torch.inverse(corrected_calib_dict['cam2lidar'][0, cam_idx])[:3, :]
-        #         P_corr = K @ T_l2c_corr
-
-        #         # --- 3. 포인트 투영을 위한 헬퍼 함수 ---
-        #         def project_points(points_tensor, P_matrix, height, width):
-        #             points_h = torch.cat([points_tensor[:, :3], torch.ones_like(points_tensor[:, :1])], dim=-1).to(P_matrix.device)
-        #             points_proj_raw = (P_matrix @ points_h.T).T
-                    
-        #             # Perspective Division (In-place 연산 방지)
-        #             uv = points_proj_raw[:, :2] / (points_proj_raw[:, 2:3] + 1e-8)
-        #             z = points_proj_raw[:, 2:3]
-        #             points_proj = torch.cat([uv, z], dim=-1)
-
-        #             mask = (points_proj[:, 0] >= 0) & (points_proj[:, 0] < width) & \
-        #                 (points_proj[:, 1] >= 0) & (points_proj[:, 1] < height) & (points_proj[:, 2] > 0)
-        #             return points_proj[mask].cpu().numpy()
-
-        #         # --- 4. 각 상태에 대해 포인트 투영 실행 ---
-        #         pts_gt = project_points(points_for_vis, P_orig, h, w)
-        #         pts_broken = project_points(points_for_vis, P_broken, h, w)
-        #         pts_corr = project_points(points_for_vis, P_corr, h, w)
-                
-        #         # --- 5. 최종 시각화 ---
-        #         plt.figure(figsize=(16, 9))
-        #         plt.imshow(img_for_vis)
-                
-        #         # 세 종류의 포인트를 각기 다른 색상으로 플로팅
-        #         plt.scatter(pts_broken[:, 0], pts_broken[:, 1], color='red', s=1, alpha=0.6, label='Broken (Problem)')
-        #         plt.scatter(pts_gt[:, 0], pts_gt[:, 1], color='lime', s=1, alpha=0.6, label='Ground Truth (Answer)')
-        #         plt.scatter(pts_corr[:, 0], pts_corr[:, 1], c='cyan', s=1, alpha=0.6, label='Corrected by Model (Solution)')
-                
-        #         plt.title(f"Visual Verification @ Step {self.training_step}")
-        #         plt.legend()
-        #         plt.axis('off')
-        #         plt.savefig(f"verification_step_{self.training_step}.jpg", bbox_inches='tight', pad_inches=0)
-        #         plt.close()
-        #         print(f"✅ Visual verification image saved to verification_step_{self.training_step}.jpg")
-        #         print("verification display end")
+            # ✨ '보정된' lidar2imag를 사용하여 3D 좌표 변환 수행
+            # ✨ (esitmated_uvz는 이제 if/else 로직에 의해 올바르게 채워졌습니다)
+            det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
         
-        # self.training_step += 1
-        return losses
+            # ... (이하 Chamfer Loss, BBox Head 등 나머지 코드는 동일) ...
+
+            gt_lidar_points = batch_inputs_dict['points'][0][:, :3]
+            gt_lidar_points = gt_lidar_points.unsqueeze(0).to(target_device)
+            
+            num_queries_per_cam = det_xyz.shape[1]
+            det_xyz_batch = det_xyz.reshape(B, N * num_queries_per_cam, 3)
+
+            if gt_lidar_points.shape[1] > 2048:
+                indices = torch.randperm(gt_lidar_points.shape[1], device=target_device)[:2048]
+                gt_lidar_points_sampled = gt_lidar_points[:, indices, :]
+            else:
+                gt_lidar_points_sampled = gt_lidar_points
+                
+            if det_xyz_batch.shape[1] > 2048:
+                indices = torch.randperm(det_xyz_batch.shape[1], device=target_device)[:2048]
+                det_xyz_batch_sampled = det_xyz_batch[:, indices, :]
+            else:
+                det_xyz_batch_sampled = det_xyz_batch
+
+            loss_chamfer = chamfer_distance(det_xyz_batch_sampled, gt_lidar_points_sampled).mean()
+
+            losses['loss_chamfer_xyz'] = loss_chamfer * 0.05
+
+            det_xyz_ref = det_xyz.clone()
+            det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
+                    self.pc_range[3] - self.pc_range[0])
+            det_xyz_ref[..., 1:2] = (det_xyz_ref[..., 1:2] - self.pc_range[1]) / (
+                    self.pc_range[4] - self.pc_range[1])
+            det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
+                    self.pc_range[5] - self.pc_range[2])
+            det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
+            
+            det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
+            det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz_ref_clamped,det_feat_sampled,B=B,N_cam=N)
+
+            feats = self.extract_feat(batch_inputs_dict=batch_inputs_dict,
+                                    batch_input_metas=batch_input_metas,
+                                    corrected_calib=corrected_calib_dict,
+                                    precomputed_img_feats=img_feats)
+
+            if self.with_bbox_head:
+                bbox_loss = self.bbox_head.loss(
+                                feats, 
+                                det_xyz_proc, 
+                                det_feat_proc, 
+                                batch_data_samples,
+                                gt_delta_rot=gt_delta_rot,
+                                gt_delta_trans=gt_delta_trans
+                            )
+
+            losses.update(bbox_loss)
+
+            return losses
 
     def predict(self, batch_inputs_dict: Dict[str, Tensor],
                 batch_data_samples: List[Det3DDataSample],
