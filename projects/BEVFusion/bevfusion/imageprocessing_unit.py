@@ -4283,32 +4283,32 @@ def draw_correspondences(
         for l, r in zip(left_pts, right_pts):
             ax.plot([l[0], r[0]], [l[1], r[1]], color='yellow', linestyle='--', linewidth=1.5, alpha=0.4)
 
-    # 4. Bounding Box 그리기 (수정된 로직)
-    if bboxes_to_draw is not None and bboxes_to_draw.shape[0] > 0:
-        bboxes = bboxes_to_draw.clone()
+    # # 4. Bounding Box 그리기 (수정된 로직)
+    # if bboxes_to_draw is not None and bboxes_to_draw.shape[0] > 0:
+    #     bboxes = bboxes_to_draw.clone()
 
-        # ====================================================================
-        # ===== 여기가 BBox 좌표 스케일링 및 이동 로직입니다. =====
-        # ====================================================================
-        # X 좌표 스케일링
-        bboxes[:, [0, 2]] *= scale_x
-        # Y 좌표 스케일링
-        bboxes[:, [1, 3]] *= scale_y
+    #     # ====================================================================
+    #     # ===== 여기가 BBox 좌표 스케일링 및 이동 로직입니다. =====
+    #     # ====================================================================
+    #     # X 좌표 스케일링
+    #     bboxes[:, [0, 2]] *= scale_x
+    #     # Y 좌표 스케일링
+    #     bboxes[:, [1, 3]] *= scale_y
         
-        for bbox_data in bboxes:
-            coords, score, label = bbox_data[:4], bbox_data[4], int(bbox_data[5].item())
-            if score < score_thr:
-                continue
+    #     for bbox_data in bboxes:
+    #         coords, score, label = bbox_data[:4], bbox_data[4], int(bbox_data[5].item())
+    #         if score < score_thr:
+    #             continue
             
-            x1, y1, x2, y2 = coords.cpu().numpy()
-            width, height = x2 - x1, y2 - y1
+    #         x1, y1, x2, y2 = coords.cpu().numpy()
+    #         width, height = x2 - x1, y2 - y1
             
-            rect = patches.Rectangle((x1, y1), width, height, linewidth=2, edgecolor='blue', facecolor='none')
-            ax.add_patch(rect)
+    #         rect = patches.Rectangle((x1, y1), width, height, linewidth=2, edgecolor='blue', facecolor='none')
+    #         ax.add_patch(rect)
             
-            # 텍스트 위치도 스케일링된 좌표에 맞춰 조정
-            ax.text(x1, y1 - 5, f'L:{label} | {score:.2f}', 
-                    color='blue', fontsize=10, bbox=dict(facecolor='white', alpha=0.5))
+    #         # 텍스트 위치도 스케일링된 좌표에 맞춰 조정
+    #         ax.text(x1, y1 - 5, f'L:{label} | {score:.2f}', 
+    #                 color='blue', fontsize=10, bbox=dict(facecolor='white', alpha=0.5))
 
     # 5. 최종 이미지 저장
     ax.set_aspect('equal') # 비율 유지

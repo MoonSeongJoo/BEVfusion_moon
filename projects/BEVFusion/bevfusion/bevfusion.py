@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
 import math
-from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,quaternion_to_matrix
+from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,quaternion_to_matrix ,identity_matrix_loss
 
 # class CalibrationCorrectionHead(nn.Module):
 #     """
@@ -1660,7 +1660,7 @@ class BEVFusion(Base3DDetector):
         보정된 calibration 파라미터 딕셔너리를 생성합니다.
         """
         # --- 1. 예측된 오차를 사용하여 corrected_camera2lidar 생성 ---
-        pred_delta_rot_mat = quaternion_to_matrix(pred_delta_rot)
+        pred_delta_rot_mat = axis_angle_to_matrix(pred_delta_rot)
         broken_rots = broken_camera2lidar[..., :3, :3]
         broken_trans = broken_camera2lidar[..., :3, 3]
 
@@ -1795,7 +1795,7 @@ class BEVFusion(Base3DDetector):
             
             losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device)
             
-            pred_delta_7dof = torch.zeros(B, N, 7, device=target_device)
+            pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
             losses['loss_calib_rot'] = torch.tensor(0.0, device=target_device, requires_grad=True)
             losses['loss_calib_trans'] = torch.tensor(0.0, device=target_device, requires_grad=True)
             
@@ -1808,11 +1808,6 @@ class BEVFusion(Base3DDetector):
                 sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
                 
                 raw_corrs_active, cycle, corr_mask, enc_out_active_4d = self.corr(sbs_view, query_input_filtered)
-                pred_delta_7dof_active = self.calib_head(
-                    enc_out_active_4d, 
-                    query_input_filtered, 
-                    raw_corrs_active
-                )
 
                 b_act, c_f, h_f, w_f = enc_out_active_4d.shape
                 enc_out_active_3d = enc_out_active_4d.flatten(2).permute(0, 2, 1)
@@ -1836,7 +1831,7 @@ class BEVFusion(Base3DDetector):
                     enc_out=enc_out_active_4d
                 )
 
-                # 3. ZEstimator의 "예측"과 "샘플링 좌표"를 가져옴
+                # 3. ZEstimator의 "예측"만 가져옴 - 학습시는 예측값만 사용 
                 z_estimated_active = esitmated_z_active['z_estimated_real'] # [NumActive, Q, 1]
 
                 # 4. 🚨 "정답지" (TRUE) 준비: Dilation 코드 모두 삭제 (롤백)
@@ -1868,34 +1863,47 @@ class BEVFusion(Base3DDetector):
                                         reduction='mean',
                                         beta=1.0  # beta=1.0이 표준입니다 (오차 1.0 기준 L1/L2 전환)
                                     )
-                    losses['loss_z_estimation'] = loss_z_estimation * 0.1
+                    losses['loss_z_estimation'] = loss_z_estimation * 1
+                
+                # --- ✨ 1. [신규] Z-Estimator의 예측(z')을 Corr 예측(u', v')과 결합 ---
+                # raw_corrs_active: (NumActive, Q, 2)
+                # z_estimated_active: (NumActive, Q, 1)
+                # -> (u', v', z') 3D 대응점 생성
+                corrs_3d_active = torch.cat([raw_corrs_active, z_estimated_active], dim=-1) # (NumActive, Q, 3)
+
+                pred_delta_6dof_active = self.calib_head(
+                    enc_out_active_4d, 
+                    query_input_filtered, 
+                    corrs_3d_active, # ✨ Corr 예측 (u', v', z') - 3D
+                )
                 
                 if B == 1:
                     raw_corrs[active_cam_indices] = raw_corrs_active
                     enc_out[active_cam_indices] = enc_out_active_3d
-                    pred_delta_7dof[0, active_cam_indices] = pred_delta_7dof_active
+                    pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_active
                     
                     esitmated_uvz_active = torch.cat(
                         [uv_pixels_from_corr, esitmated_z_active['depth']], dim=-1
                     ) # ✨
                     esitmated_uvz[active_cam_indices] = esitmated_uvz_active
 
-                pred_rot_filtered = pred_delta_7dof_active[..., :4]
-                pred_trans_filtered = pred_delta_7dof_active[..., 4:]
+                pred_rot_filtered = pred_delta_6dof_active[..., :3]
+                pred_trans_filtered = pred_delta_6dof_active[..., 3:]
 
                 gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
                 gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
 
-                R_pred_calib = quaternion_to_matrix(pred_rot_filtered)
+                R_pred_calib = axis_angle_to_matrix(pred_rot_filtered)
                 R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
-                losses['loss_calib_rot'] = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean() * 5.0
+                # losses['loss_calib_rot'] = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean() * 5.0
+                losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 500.0
                 losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 1.0
             # --- if/else 블록 끝 ---
             
             enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
             
-            pred_delta_rot = pred_delta_7dof[..., :4]
-            pred_delta_trans = pred_delta_7dof[..., 4:]
+            pred_delta_rot = pred_delta_6dof[..., :3]
+            pred_delta_trans = pred_delta_6dof[..., 3:]
 
             # # ##### 검증용 display ######
             # from .imageprocessing_unit import draw_correspondences
@@ -1964,7 +1972,7 @@ class BEVFusion(Base3DDetector):
 
             loss_chamfer = chamfer_distance(det_xyz_batch_sampled, gt_lidar_points_sampled).mean()
 
-            losses['loss_chamfer_xyz'] = loss_chamfer * 0.05
+            losses['loss_chamfer_xyz'] = loss_chamfer * 0.005
 
             det_xyz_ref = det_xyz.clone()
             det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
@@ -2040,18 +2048,22 @@ class BEVFusion(Base3DDetector):
         else:
             query_input = torch.stack([q_x, q_y], dim=-1)
 
-        sbs_img, _, dense_depth_map = self.extract_sbs_img(
-            batch_inputs_dict, batch_input_metas, visualize=False)
+        # sbs_img, _, dense_depth_map = self.extract_sbs_img(
+        #     batch_inputs_dict, batch_input_metas, visualize=False)
+        sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(
+            batch_inputs_dict, batch_input_metas,visualize=False)
         B, N, C, H, W = sbs_img.shape
         d_model = 312
         feat_h, feat_w = 12, 64 # 우리가 확인한 실제 피처맵 크기
 
         raw_corrs_shape = (B * N, query_input.shape[1], query_input.shape[2])
         enc_out_shape = (B * N, feat_h * feat_w, d_model) # [B*N, 768, 312]
+        esitmated_uvz_shape = (B * N, query_input.shape[1], 3) # (u,v,z)
 
         raw_corrs = torch.zeros(raw_corrs_shape, device=query_input.device)
         enc_out = torch.zeros(enc_out_shape, device=query_input.device)
-        pred_delta_6dof = torch.zeros(B, N, 7, device=target_device)
+        esitmated_uvz = torch.zeros(esitmated_uvz_shape, device=query_input.device)
+        pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
 
         # Handle the two cases: with or without active cameras
         if len(active_cam_indices) > 0:
@@ -2063,49 +2075,69 @@ class BEVFusion(Base3DDetector):
             sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
             
             # Call the correlation network with filtered data
-            raw_corrs_filtered, _, _, enc_out_filtered  = self.corr(sbs_view, query_input_filtered)
+            raw_corrs_filtered, _, _, enc_out_filtered_4d  = self.corr(sbs_view, query_input_filtered)
             
-            # Predict calibration delta for active cameras
-            # pred_delta_6dof_filtered = self.calib_head(enc_out_filtered)
-            pred_delta_7dof_filtered = self.calib_head(
-                            enc_out_filtered,       # (B*N, C, H, W)
-                            query_input_filtered,   # (B*N, 200, 2)
-                            raw_corrs_filtered      # (B*N, 200, 2)
-                            ) # 출력 shape: (B*N, 7)
+            # 1. Convert normalized corrs to pixel coordinates
+            r_x = (raw_corrs_filtered[..., 0] - 0.5) * 2 * 1600 
+            r_y = raw_corrs_filtered[..., 1] * 900
+            uv_pixels_from_corr_filtered = torch.stack([r_x, r_y], dim=-1) # (NumActive, Q, 2)
 
-            # (✨ FIX) 4D -> 3D 변환
-            b_act, c_f, h_f, w_f = enc_out_filtered.shape
-            enc_out_filtered_reshaped = enc_out_filtered.flatten(2).permute(0, 2, 1)
+            # 2. Get the "BROKEN" depth map for Z-Estimation
+            depth_map_reshaped_BROKEN = dense_depth_map.view(B * N, 900, 1600)
+            depth_map_active_BROKEN = depth_map_reshaped_BROKEN[active_cam_indices]
+
+            # 3. Call ZEstimator
+            esitmated_z_filtered = self.z_estimator(
+                uv_sbs_normalized=raw_corrs_filtered,       # (특징 좌표)
+                uv_orig_pixels=uv_pixels_from_corr_filtered,    # (GT 샘플링용 픽셀 좌표)
+                depth_map=depth_map_active_BROKEN,
+                enc_out=enc_out_filtered_4d # 4D enc_out
+            )
+
+            # 4. Get the predicted Z value
+            z_estimated_filtered = esitmated_z_filtered['z_estimated_real'] # [NumActive, Q, 1]
+
+            # 5. Create 3D correspondences (u', v', z')
+            corrs_3d_filtered = torch.cat([raw_corrs_filtered, z_estimated_filtered], dim=-1) # (NumActive, Q, 3)
+
+            # 6. Call calib_head with 3D correspondences
+            pred_delta_6dof_filtered = self.calib_head(
+                enc_out_filtered_4d,    # 4D tensor
+                query_input_filtered,   # (NumActive, Q, 2 or 3)
+                corrs_3d_filtered       # (NumActive, Q, 3)
+            ) # 출력 shape: (NumActive, 6)
+
+            # Convert 4D enc_out to 3D for storage
+            b_act, c_f, h_f, w_f = enc_out_filtered_4d.shape
+            enc_out_filtered_3d = enc_out_filtered_4d.flatten(2).permute(0, 2, 1)
 
             if B == 1:
                 raw_corrs[active_cam_indices] = raw_corrs_filtered
-                # ✨ FIX: 4D 텐서 원본을 4D 슬라이스에 할당합니다.
-                enc_out[active_cam_indices] = enc_out_filtered_reshaped
-                pred_delta_6dof[0, active_cam_indices] = pred_delta_7dof_filtered
-                enc_out = enc_out.permute(0,2,1).reshape(-1,d_model,feat_h,feat_w)
+                enc_out[active_cam_indices] = enc_out_filtered_3d # Store 3D version
+                pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_filtered # Store 6DoF
+                
+                # ✨ Store (u, v, z) in pixel coordinates + depth
+                esitmated_uvz_filtered = torch.cat(
+                    [uv_pixels_from_corr_filtered, esitmated_z_filtered['depth']], dim=-1
+                )
+                esitmated_uvz[active_cam_indices] = esitmated_uvz_filtered
 
-        # Split the (now fully reconstructed) tensor for the calibration correction function
-        pred_delta_rot = pred_delta_6dof[..., :4]
-        pred_delta_trans = pred_delta_6dof[..., 4:]
+        # --- ✨ FIX: Reshape enc_out to 4D *after* the if-block (like in loss) ---
+        enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
+            
+        # --- ✨ FIX: Split 6DoF (3 rot + 3 trans) ---
+        pred_delta_rot = pred_delta_6dof[..., :3]
+        pred_delta_trans = pred_delta_6dof[..., 3:]
 
         # ===================== END: LOGIC ALIGNMENT WITH LOSS FUNCTION =====================
 
         # --- 5. Correct Calibration Matrices (Now safe to run) ---
         corrected_calib_dict = self._get_corrected_calib_from_prediction(
-            pred_delta_rot,
-            pred_delta_trans,
+            pred_delta_rot,   # (B, N, 3)
+            pred_delta_trans, # (B, N, 3)
             broken_camera2lidar,
             broken_camera_intrinsics
         )
-        
-        # --- 6. Generate 3D Coordinates and Features (Now safe to run) ---
-        raw_corrs_clone = raw_corrs.clone()
-        r_x = (raw_corrs_clone[..., 0] - 0.5) * 2 * 1600
-        r_y = raw_corrs_clone[..., 1] * 900
-        raw_pred_center_pts = torch.stack([r_x, r_y], dim=-1)
-
-        esitmated_z = self.z_estimator(raw_pred_center_pts, dense_depth_map, enc_out)
-        esitmated_uvz = torch.cat([raw_pred_center_pts, esitmated_z['depth']], dim=-1)
 
         det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
 

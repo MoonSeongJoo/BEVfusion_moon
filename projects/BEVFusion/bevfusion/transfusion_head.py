@@ -19,7 +19,7 @@ from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
 from .imageprocessing_unit import visualize_full_pipeline,project_points_to_image,visualize_calibration_effect
-from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,quaternion_to_matrix
+from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,quaternion_to_matrix,identity_matrix_loss
 
 def clip_sigmoid(x, eps=1e-4):
     y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
@@ -973,9 +973,10 @@ class TransFusionHead(nn.Module):
         gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
         
         # Loss 계산 (배치 전체에 대해 mean)
-        R_pred_calib = quaternion_to_matrix(pred_delta_rot)
+        R_pred_calib = axis_angle_to_matrix(pred_delta_rot)
         R_gt_calib = axis_angle_to_matrix(gt_delta_rot_mean)
-        loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
+        # loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
+        loss_calib_rot_pred= identity_matrix_loss(R_pred_calib, R_gt_calib)
         loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
 
         loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 5.0 # 가중치
