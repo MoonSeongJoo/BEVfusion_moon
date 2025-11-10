@@ -373,6 +373,13 @@ class TransFusionHead(nn.Module):
             pred_delta_rot = pred_delta_7dof[..., :4]
             pred_delta_trans = pred_delta_7dof[..., 4:]
 
+            # # =================================================================
+            # # ✨✨✨ ABLATION STUDY (2/2): 2차 캘리브레이션 끄기 ✨✨✨
+            # # print("\n!!! ABLATION: Disabling 2nd-stage calibration in TransFusionHead !!!\n")
+            # pred_delta_rot = torch.zeros_like(pred_delta_7dof[..., :4])
+            # pred_delta_trans = torch.zeros_like(pred_delta_7dof[..., 4:])
+            # # =================================================================
+
             # --- 2c. 카메라 제안 보정 ---
             pc_range_tensor = torch.tensor(self.train_cfg['point_cloud_range'], device=det_xyz.device)
             # 보정 시에는 그래디언트 흐름 차단 가능 (오차 예측 학습에만 집중)
