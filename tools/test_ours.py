@@ -162,8 +162,14 @@ def main():
             # 2. 출력 경로를 강제로 설정합니다.
             hook.test_out_dir = './visualization_forced'
             print(f"DEBUG: hook.test_out_dir forced to -> {hook.test_out_dir}")
+
+            # 3. ▼▼▼▼▼ [중요] 작업 유형을 강제로 설정합니다. ▼▼▼▼▼
+            # 이 값이 없으면 hook이 무엇을 그려야 할지 모릅니다.
+            hook.vis_task = 'multi-modality_det'  # BEVFusion이므로 'multi-modality_det'
+            print(f"DEBUG: hook.vis_task forced to -> {hook.vis_task}")
+            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
             
-            # 3. 점수 커트라인을 강제로 설정합니다.
+            # 4. 점수 커트라인을 강제로 설정합니다.
             if hasattr(hook, 'score_thr'):
                 hook.score_thr = 0.01
                 print(f"DEBUG: hook.score_thr forced to -> {hook.score_thr}")

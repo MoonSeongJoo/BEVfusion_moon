@@ -525,7 +525,7 @@ default_hooks = dict(
 del _base_.custom_hooks
 
 # load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-load_from =  "data/work_dirs/bevfusion/20251107_zestimator_refine_v3/iter_72000.pth"
+load_from =  "data/work_dirs/bevfusion/20251107_zestimator_refine_v3/iter_129000.pth"
 # load_from = None
 resume_from = None
 
