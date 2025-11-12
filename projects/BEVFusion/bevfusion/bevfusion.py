@@ -2003,6 +2003,103 @@ class BEVFusion(Base3DDetector):
 
             losses.update(bbox_loss)
 
+            # --- ✨ VERIFICATION 2: 최종 시각적 검증 (GT / Broken / Corrected 비교) ---
+            # 100 스텝마다 첫 번째 샘플의 첫 번째 카메라만 시각화하여 확인
+            if hasattr(self, 'training_step') and self.training_step % 50 == 0:
+                with torch.no_grad():
+                    import matplotlib.pyplot as plt
+                    import cv2
+                    import numpy as np
+
+                    cam_idx = 0
+                    
+                    # --- 1. 시각화에 필요한 데이터 준비 ---
+                    img_tensor_chw = batch_inputs_dict['img_original'][0][cam_idx].cpu().numpy()
+                    img_for_vis = img_tensor_chw.transpose(1, 2, 0)
+                    if img_for_vis.dtype in [np.float32, np.float64] and img_for_vis.max() > 1.0:
+                        img_for_vis = img_for_vis / 255.0
+                        
+                    points_for_vis = batch_inputs_dict['points_original'][0].tensor
+                    h, w = img_for_vis.shape[:2]
+                    K = broken_camera_intrinsics[0, cam_idx, :3, :3]
+                    
+                    # --- 2. 세 가지 상태의 투영 행렬(Projection Matrix) 계산 ---
+                    # (P = K @ T_lidar2camera)
+                    
+                    # a) Ground Truth (정답)
+                    T_l2c_orig = torch.inverse(original_camera2lidar[0, cam_idx])[:3, :]
+                    P_orig = K @ T_l2c_orig
+                    
+                    # b) Broken (문제)
+                    T_l2c_broken = torch.inverse(broken_camera2lidar[0, cam_idx])[:3, :]
+                    P_broken = K @ T_l2c_broken
+                    
+                    # c) Corrected (모델의 해결책)
+                    T_l2c_corr = torch.inverse(corrected_calib_dict['cam2lidar'][0, cam_idx])[:3, :]
+                    P_corr = K @ T_l2c_corr
+
+                    # --- 3. 포인트 투영을 위한 헬퍼 함수 ---
+                    def project_points(points_tensor, P_matrix, height, width):
+                        points_h = torch.cat([points_tensor[:, :3], torch.ones_like(points_tensor[:, :1])], dim=-1).to(P_matrix.device)
+                        points_proj_raw = (P_matrix @ points_h.T).T
+                        
+                        # Perspective Division (In-place 연산 방지)
+                        uv = points_proj_raw[:, :2] / (points_proj_raw[:, 2:3] + 1e-8)
+                        z = points_proj_raw[:, 2:3]
+                        points_proj = torch.cat([uv, z], dim=-1)
+
+                        mask = (points_proj[:, 0] >= 0) & (points_proj[:, 0] < width) & \
+                            (points_proj[:, 1] >= 0) & (points_proj[:, 1] < height) & (points_proj[:, 2] > 0)
+                        return points_proj[mask].cpu().numpy()
+                    
+                    # --- 3.5. 시각화 개선을 위한 포인트 필터링 및 샘플링 ---
+        
+                    # A) Z-축(높이) 기준으로 필터링 (지면 포인트 제거)
+                    #    (LiDAR 좌표계에서 Z축이 '위' 방향이라고 가정)
+                    z_threshold = 0.3  # 예: 지면에서 30cm 이상 높이에 있는 포인트만 선택
+                    height_mask = points_for_vis[:, 2] > z_threshold
+                    filtered_points = points_for_vis[height_mask]
+
+                    # B) 포인트 개수 줄이기 (Random Sampling)
+                    max_points = 5000  # 시각화할 최대 포인트 수
+                    if len(filtered_points) > max_points:
+                        indices = np.random.choice(len(filtered_points), max_points, replace=False)
+                        filtered_points = filtered_points[indices]
+                    
+                    # 필터링 후 포인트가 너무 적을 경우 원본에서 샘플링
+                    if len(filtered_points) < 100: 
+                        if len(points_for_vis) > max_points:
+                            indices = np.random.choice(len(points_for_vis), max_points, replace=False)
+                            points_to_plot = points_for_vis[indices]
+                        else:
+                            points_to_plot = points_for_vis
+                    else:
+                        points_to_plot = filtered_points
+
+                    # --- 4. 각 상태에 대해 포인트 투영 실행 ---
+                    pts_gt = project_points(points_to_plot, P_orig, h, w)
+                    pts_broken = project_points(points_to_plot, P_broken, h, w)
+                    pts_corr = project_points(points_to_plot, P_corr, h, w)
+                    
+                    # --- 5. 최종 시각화 ---
+                    plt.figure(figsize=(16, 9))
+                    plt.imshow(img_for_vis)
+                    
+                    # 세 종류의 포인트를 각기 다른 색상으로 플로팅
+                    plt.scatter(pts_broken[:, 0], pts_broken[:, 1], color='red', s=1, alpha=0.6, label='Broken (Problem)')
+                    plt.scatter(pts_gt[:, 0], pts_gt[:, 1], color='lime', s=1, alpha=0.6, label='Ground Truth (Answer)')
+                    plt.scatter(pts_corr[:, 0], pts_corr[:, 1], c='cyan', s=1, alpha=0.6, label='Corrected by Model (Solution)')
+                    
+                    plt.title(f"Visual Verification @ Step {self.training_step}")
+                    plt.legend()
+                    plt.axis('off')
+                    plt.savefig(f"verification_step_{self.training_step}.jpg", bbox_inches='tight', pad_inches=0)
+                    plt.close()
+                    print(f"✅ Visual verification image saved to verification_step_{self.training_step}.jpg")
+                    print("verification display end")
+            
+            self.training_step += 1
+
             return losses
 
     def predict(self, batch_inputs_dict: Dict[str, Tensor],
