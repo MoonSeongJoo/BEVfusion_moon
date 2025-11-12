@@ -945,6 +945,17 @@ class TransFusionHead(nn.Module):
                     gt_delta_rot=gt_delta_rot,       # <-- 전달
                     gt_delta_trans=gt_delta_trans   # <-- 전달
                 )
+        
+        # --- ✨ 3. 시각화를 위해 예측값 추가 ---
+        # forward_single이 배치 0만 처리한다고 가정하지 않고,
+        # 전체 배치를 처리한 preds_list[0] (new_res 딕셔너리)를 사용합니다.
+        # 이 딕셔너리는 [B, ...] 차원의 텐서를 포함합니다.
+        
+        # new_res 딕셔너리 (preds_list[0])에서 예측값을 가져와 'losses'에 추가
+        new_res = preds_dicts[0][0] 
+        loss['pred_delta_rot'] = new_res['pred_delta_rot']
+        loss['pred_delta_trans'] = new_res['pred_delta_trans']
+        # ------------------------------------
 
         return loss
 
