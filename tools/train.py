@@ -166,5 +166,5 @@ def main():
     runner.train()
 
 if __name__ == '__main__':
-    torch.set_printoptions(precision=4, sci_mode=False)
+    torch.set_printoptions(precision=5, sci_mode=False)
     main()

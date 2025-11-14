@@ -915,7 +915,7 @@ class TransFusionHead(nn.Module):
             heatmap[None],
         )
 
-    def loss(self, batch_feats, det_xyz,det_feats, batch_data_samples,gt_delta_rot=None, gt_delta_trans=None):
+    def loss(self, batch_feats, det_xyz,det_feats, batch_data_samples,pred_delta_rot=None, pred_delta_trans=None, gt_delta_rot=None, gt_delta_trans=None):
         """Loss function for CenterHead.
 
         Args:
@@ -935,6 +935,8 @@ class TransFusionHead(nn.Module):
                     preds_dicts, 
                     batch_gt_instances_3d, 
                     batch_input_metas, # metas는 여전히 다른 용도로 필요할 수 있음
+                    pred_delta_rot=pred_delta_rot,
+                    pred_delta_trans=pred_delta_trans,
                     gt_delta_rot=gt_delta_rot,       # <-- 전달
                     gt_delta_trans=gt_delta_trans   # <-- 전달
                 )
@@ -955,6 +957,8 @@ class TransFusionHead(nn.Module):
     def loss_by_feat(self, preds_dicts: Tuple[List[dict]],
                      batch_gt_instances_3d: List[InstanceData],
                      batch_input_metas: List[dict],
+                     pred_delta_rot: torch.Tensor,    # <-- 추가
+                     pred_delta_trans: torch.Tensor,
                      gt_delta_rot: torch.Tensor,    # <-- 추가
                      gt_delta_trans: torch.Tensor,
                      *args,
@@ -978,19 +982,34 @@ class TransFusionHead(nn.Module):
 
         # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
         # forward_single에서 반환된 예측값 사용
-        pred_delta_rot = preds_dict['pred_delta_rot']
-        pred_delta_trans = preds_dict['pred_delta_trans']
+        pred_delta_rot_2nd = preds_dict['pred_delta_rot']
+        pred_delta_trans_2nd = preds_dict['pred_delta_trans']
+
+        # 1단계 예측값 (detach()로 그래디언트 차단)
+        pred_delta_rot_1st_per_cam = pred_delta_rot.detach()
+        pred_delta_trans_1st_per_cam = pred_delta_trans.detach()
+
+        # [수정] 1단계 예측값도 6개 카메라에 대해 평균을 냅니다.
+        pred_delta_rot_1st_mean = pred_delta_rot_1st_per_cam.mean(dim=1) # Shape [1, 3]
+        pred_delta_trans_1st_mean = pred_delta_trans_1st_per_cam.mean(dim=1) # Shape [1, 3]
+
+        # 전체 GT
         gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
         gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
         
         # Loss 계산 (배치 전체에 대해 mean)
-        R_pred_calib = axis_angle_to_matrix(pred_delta_rot)
-        R_gt_calib = axis_angle_to_matrix(gt_delta_rot_mean)
-        # loss_calib_rot_pred = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean()
-        loss_calib_rot_pred= identity_matrix_loss(R_pred_calib, R_gt_calib)
-        loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans, gt_delta_trans_mean, reduction='mean')
+        R_pred_1st = axis_angle_to_matrix(pred_delta_rot_1st_mean)
+        R_gt_total = axis_angle_to_matrix(gt_delta_rot_mean)
+        R_gt_residual = R_gt_total @ R_pred_1st.transpose(1, 2)
+        # T_gt_residual = T_gt_total - T_pred_1st
+        T_gt_residual = gt_delta_trans_mean - pred_delta_trans_1st_mean
 
-        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 5.0 # 가중치
+        R_pred_2nd = axis_angle_to_matrix(pred_delta_rot_2nd)
+
+        loss_calib_rot_pred= identity_matrix_loss(R_pred_2nd, R_gt_residual)
+        loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans_2nd, T_gt_residual, reduction='mean')
+
+        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 100.0 # 가중치
         loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
         # ----------------------------------------------------
 
