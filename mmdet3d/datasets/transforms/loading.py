@@ -1446,7 +1446,7 @@ class PointToMultiViewDepth(object):
 
             points2img = add_calibration(lidar2img,points_lidar)
             miscalibrated_points2img ,perturbed_points, extrinsic_perturb, lidar2img_original ,lidar2img_mis = add_mis_calibration_adv(
-                                                                                    lidar2img,lidar2cam,cam2img, points_lidar, max_r=0.0,max_t=0.0)
+                                                                                    lidar2img,lidar2cam,cam2img, points_lidar, max_r=2.0,max_t=0.5)
             
             # --- ✨ CORRECTED LOGIC V2: 올바른 행렬 곱셈 적용 ---
             # 1. 'broken_camera2lidar' 계산
