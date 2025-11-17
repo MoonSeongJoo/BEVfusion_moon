@@ -1009,7 +1009,7 @@ class TransFusionHead(nn.Module):
         loss_calib_rot_pred= identity_matrix_loss(R_pred_2nd, R_gt_residual)
         loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans_2nd, T_gt_residual, reduction='mean')
 
-        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 100.0 # 가중치
+        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 2.0 # 가중치
         loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 1.0 # 가중치
         # ----------------------------------------------------
 

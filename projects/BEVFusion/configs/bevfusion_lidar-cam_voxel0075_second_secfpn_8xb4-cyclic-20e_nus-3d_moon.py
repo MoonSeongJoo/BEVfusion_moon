@@ -57,11 +57,15 @@ model = dict(
         out_indices=[1, 2, 3],
         with_cp=False,
         convert_weights=True,
+        # init_cfg=dict(
+        #     type='Pretrained',
+        #     checkpoint=  # noqa: E251
+        #     'https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth'  # noqa: E501
+        # )
         init_cfg=dict(
             type='Pretrained',
-            checkpoint=  # noqa: E251
-            'https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth'  # noqa: E501
-        )),
+            checkpoint='data/work_dirs/extracted_backbones1/img_backbone_pretrained.pth'),
+        ),
     img_neck=dict(
         type='GeneralizedLSSFPN',
         in_channels=[192, 384, 768],
@@ -70,7 +74,9 @@ model = dict(
         num_outs=3,
         norm_cfg=dict(type='BN2d', requires_grad=True),
         act_cfg=dict(type='ReLU', inplace=True),
-        upsample_cfg=dict(mode='bilinear', align_corners=False)),
+        upsample_cfg=dict(mode='bilinear', align_corners=False),
+        init_cfg=dict(type='Pretrained', checkpoint='data/work_dirs/extracted_backbones1/img_neck_pretrained.pth'),
+        ),
     # --- 2. 새로 추가할 2D Detection Head ---
     img_bbox_head=dict(
         type='mmdet.RetinaHead',
@@ -119,7 +125,7 @@ model = dict(
         init_cfg=dict(
             type='Pretrained',
             # 예시: COCO 데이터셋으로 학습된 MMDetection의 RetinaNet 모델 체크포인트
-            checkpoint='https://download.openmmlab.com/mmdetection/v2.0/retinanet/retinanet_r50_fpn_1x_coco/retinanet_r50_fpn_1x_coco_20200130-c2398f9e.pth')
+            checkpoint='data/work_dirs/extracted_backbones1/img_bbox_head_pretrained.pth'),
         ),
     view_transform=dict(
         type='DepthLSSTransform',
@@ -154,6 +160,7 @@ model = dict(
         init_cfg=dict(
             type='Pretrained',
             checkpoint='data/weights/backbone_base_corr_rev5.0_corrected.pth' # 예시 경로
+            # checkpoint='data/weights/backbone_corr_10deg_7.5m.pth' # 예시 경로
             # checkpoint=None # 가중치 로딩이 필요 없을 경우
         )
     ),
@@ -164,7 +171,7 @@ model = dict(
         hidden_dim=512,
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='data/weights/zestimator_corrected.pth')
+            checkpoint='data/work_dirs/extracted_backbones1/z_estimator_pretrained.pth')
     ),
     calib_head=dict(
         type='CalibrationCorrectionHead',
@@ -471,15 +478,15 @@ test_cfg = dict()
 # --- ✨ 핵심 수정: 옵티마이저 설정을 변경하여 모듈별로 다른 학습률 적용 ---
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=0.00016524, weight_decay=0.01), # 1.9033e-04 # 초기 : 0.0002 1.6693e-04 1.6541e-04 1.6524e-04
+    optimizer=dict(type='AdamW', lr=0.0002, weight_decay=0.01), # 1.9033e-04 # 초기 : 0.0002 1.6693e-04 1.6541e-04 1.6524e-04
     # paramwise_cfg를 통해 특정 파라미터 그룹에 다른 학습률을 설정합니다.
     paramwise_cfg=dict(
         custom_keys={
             # 이미지 백본은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
-            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
-            # 'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
-            # 'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
+            # 'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
+            'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
+            'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
             # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             # 'corr': dict(lr_mult=0.1, decay_mult=1.0),
             # # pts_backbone
@@ -524,8 +531,8 @@ default_hooks = dict(
     ))
 del _base_.custom_hooks
 
-# load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-load_from =  "data/work_dirs/bevfusion/20251112_zestimator_refine_v4/iter_24000.pth"
+load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
+# load_from =  "data/work_dirs/bevfusion/20251115_renew_10deg_0.75m/iter_33000.pth"
 # load_from = None
 resume_from = None
 

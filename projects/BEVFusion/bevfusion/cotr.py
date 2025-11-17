@@ -5,7 +5,7 @@ from .COTR.COTR_models.cotr_model_moon_Ver12_0 import build
 from mmdet3d.registry import MODELS
 from mmengine.model import BaseModule 
 from mmengine.runner import load_checkpoint 
-from mmengine import print_log             
+from mmengine import print_log           
 
 @MODELS.register_module()
 class COTR(BaseModule):

@@ -185,64 +185,168 @@ class BEVFusion(Base3DDetector):
         self.training_step = 0
         self.pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
     
+    # def _freeze_modules(self):
+    #         """
+    #         Selectively freezes parts of the network for targeted training.
+    #         This configuration trains ONLY the image 2D detection pipeline.
+    #         """
+    #         # --- STRATEGY: Freeze everything EXCEPT the Image 2D Detection pipeline. ---
+    #         print("Freezing all modules EXCEPT the Image 2D Detection pipeline.")
+            
+    #         # # 동결할 모듈 목록 (2D 탐지 관련 모듈 제외)
+    #         modules_to_freeze = {
+    #             # LiDAR Path
+    #             # 'pts_voxel_layer': self.pts_voxel_layer,
+    #             # 'pts_voxel_encoder': self.pts_voxel_encoder,
+    #             # 'pts_middle_encoder': self.pts_middle_encoder,
+    #             # 'pts_backbone': self.pts_backbone,
+    #             # 'pts_neck': self.pts_neck,
+                
+    #             # # 3D Detection Head
+    #             # 'bbox_head': self.bbox_head,
+                
+    #             # # Fusion & View Transform
+    #             # 'view_transform': self.view_transform,
+    #             # 'fusion_layer': self.fusion_layer,
+                
+    #             # Custom Modules
+    #             'corr': self.corr,
+    #             # 'z_estimator': self.z_estimator,
+    #         }
+    #         # modules_to_freeze = {
+    #         #     # # LiDAR Path
+    #         #     # 'pts_voxel_layer': self.pts_voxel_layer,
+    #         #     # 'pts_voxel_encoder': self.pts_voxel_encoder,
+    #         #     # 'pts_middle_encoder': self.pts_middle_encoder,
+    #         #     # 'pts_backbone': self.pts_backbone,
+    #         #     # 'pts_neck': self.pts_neck,
+                
+    #         #     # # 3D Detection Head
+    #         #     # 'bbox_head': self.bbox_head,
+                
+    #         #     # # Fusion & View Transform
+    #         #     # 'view_transform': self.view_transform,
+    #         #     # 'fusion_layer': self.fusion_layer,
+                
+    #         #     # # Custom Modules
+    #         #     'corr': self.corr,
+    #         #     # 'z_estimator': self.z_estimator,
+    #         # }
+
+    #         # 선택된 모듈들의 파라미터 업데이트를 중지
+    #         for name, module in modules_to_freeze.items():
+    #             if module is not None:
+    #                 for param in module.parameters():
+    #                     param.requires_grad = False
+    #                 print(f" - ❄️ Module '{name}' has been frozen.")
+    #             else:
+    #                 print(f" - Module '{name}' is None, skipping.")
+            
+    #         print("\n - 🔥 The following modules will be trained: 'img_backbone', 'img_neck', 'img_bbox_head'.")
+    #         print("---------------------------------")
+    
     def _freeze_modules(self):
             """
             Selectively freezes parts of the network for targeted training.
-            This configuration trains ONLY the image 2D detection pipeline.
+            [Stage 1] Trains ONLY the Z-Estimator and the full calibration
+            fusion pipeline (1st stage fusion, 2nd stage predictor, 2nd stage fusion).
             """
-            # --- STRATEGY: Freeze everything EXCEPT the Image 2D Detection pipeline. ---
-            print("Freezing all modules EXCEPT the Image 2D Detection pipeline.")
+            # --- [Stage 1] STRATEGY: Freeze backbones, heads, and 'corr' module.
+            # Train z_estimator and all modules needed for loss_calib_rot_pred. ---
             
-            # # 동결할 모듈 목록 (2D 탐지 관련 모듈 제외)
+            print("--- [Stage 1] Freezing modules for Z-Estimator + 2nd Stage Calib training ---")
+            
+            # [Stage 1]의 목표:
+            # - 🔥 Train: z_estimator
+            # - 🔥 Train: calibration_predictor (loss_calib_rot_pred 계산)
+            # - 🔥 Train: 1단계/2단계 퓨전 모듈들 (calibration_predictor의 입력 생성)
+            # - ❄️ Freeze: LiDAR/Image 백본, 3D/2D 헤드, 1단계 'corr' 모듈, 디코더
+            
+            # 학습할 모듈 목록 (이 모듈들을 제외하고 모두 동결):
+            modules_to_train = [
+                'z_estimator',                  # 1. Z-Estimator
+                'calib_head',                   # 2. 1단계 오차 예측 헤드
+                # 'fusion_cross_attention',       # 3. 1단계 퓨전 (Predictor의 입력)
+                # 'fusion_norm1',
+                # 'fusion_ffn',
+                # 'refined_attention',            # 4. 2단계 퓨전
+                # 'refined_norm1',
+                # 'refined_ffn',
+                # 'bev_query_pos_embedding',      # 5. 퓨전용 임베딩
+                # 'camera_proposal_pos_embedding'
+            ]
+            
+            # modules_to_freeze 딕셔너리 (학습할 모듈 제외)
             modules_to_freeze = {
                 # LiDAR Path
-                # 'pts_voxel_layer': self.pts_voxel_layer,
-                # 'pts_voxel_encoder': self.pts_voxel_encoder,
-                # 'pts_middle_encoder': self.pts_middle_encoder,
-                # 'pts_backbone': self.pts_backbone,
-                # 'pts_neck': self.pts_neck,
+                'pts_voxel_layer': self.pts_voxel_layer,
+                'pts_voxel_encoder': self.pts_voxel_encoder,
+                'pts_middle_encoder': self.pts_middle_encoder,
+                'pts_backbone': self.pts_backbone,
+                'pts_neck': self.pts_neck,
+
+                # Image Path (2D Detection Head)
+                'img_backbone': self.img_backbone,
+                'img_neck': self.img_neck,
+                'img_bbox_head': self.img_bbox_head,
+
+                # 1st stage calibration Head
+                # 'calib_head': self.calib_head,
                 
-                # # 3D Detection Head
-                # 'bbox_head': self.bbox_head,
+                # 3D Detection Head
+                'bbox_head': self.bbox_head,
                 
-                # # Fusion & View Transform
-                # 'view_transform': self.view_transform,
-                # 'fusion_layer': self.fusion_layer,
+                # # Fusion Backbone
+                # 'shared_conv': self.bbox_head.shared_conv,
+
+                # # Query Generation
+                # 'heatmap_head': self.bbox_head.heatmap_head,
+                # 'class_encoding': self.bbox_head.class_encoding,
+
+                # # Decoders & Final Prediction Heads
+                # 'decoder': self.bbox_head.decoder,
+                # 'prediction_heads': self.bbox_head.prediction_heads,
                 
                 # Custom Modules
-                'corr': self.corr,
-                # 'z_estimator': self.z_estimator,
+                'corr': self.corr, # 1st stage calib (Freeze)
             }
-            # modules_to_freeze = {
-            #     # # LiDAR Path
-            #     # 'pts_voxel_layer': self.pts_voxel_layer,
-            #     # 'pts_voxel_encoder': self.pts_voxel_encoder,
-            #     # 'pts_middle_encoder': self.pts_middle_encoder,
-            #     # 'pts_backbone': self.pts_backbone,
-            #     # 'pts_neck': self.pts_neck,
-                
-            #     # # 3D Detection Head
-            #     # 'bbox_head': self.bbox_head,
-                
-            #     # # Fusion & View Transform
-            #     # 'view_transform': self.view_transform,
-            #     # 'fusion_layer': self.fusion_layer,
-                
-            #     # # Custom Modules
-            #     'corr': self.corr,
-            #     # 'z_estimator': self.z_estimator,
-            # }
 
             # 선택된 모듈들의 파라미터 업데이트를 중지
+            print("--- Freezing Modules (❄️) ---")
             for name, module in modules_to_freeze.items():
                 if module is not None:
-                    for param in module.parameters():
-                        param.requires_grad = False
+                    # 모듈이 ModuleList인 경우 (예: decoder, prediction_heads)
+                    if isinstance(module, (torch.nn.ModuleList, list)):
+                        for sub_module in module:
+                            for param in sub_module.parameters():
+                                param.requires_grad = False
+                    else: # 단일 모듈인 경우
+                        for param in module.parameters():
+                            param.requires_grad = False
                     print(f" - ❄️ Module '{name}' has been frozen.")
                 else:
                     print(f" - Module '{name}' is None, skipping.")
+
+            # (확인 사살) 학습 대상 모듈의 파라미터가 확실히 학습되도록 설정
+            print("\n--- Training Modules (🔥) ---")
+            for name in modules_to_train:
+                if hasattr(self, name):
+                    module = getattr(self, name)
+                    if module is not None:
+                        # 모듈이 ModuleList인 경우
+                        if isinstance(module, (torch.nn.ModuleList, list)):
+                            for sub_module in module:
+                                for param in sub_module.parameters():
+                                    param.requires_grad = True
+                        else: # 단일 모듈인 경우
+                            for param in module.parameters():
+                                param.requires_grad = True
+                        print(f" - 🔥 Module '{name}' will be trained.")
+                    else:
+                        print(f" - WARNING: Trainable module '{name}' is None or not found!")
+                else:
+                    print(f" - WARNING: Trainable module '{name}' attribute does not exist!")
             
-            print("\n - 🔥 The following modules will be trained: 'img_backbone', 'img_neck', 'img_bbox_head'.")
             print("---------------------------------")
 
     def _forward(self,
@@ -1740,13 +1844,13 @@ class BEVFusion(Base3DDetector):
             else:
                 losses_2d = dict()
             
-            # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
-            total_losses = dict()
-            for k, v in losses_2d.items():
-                total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
+            # # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
+            # total_losses = dict()
+            # for k, v in losses_2d.items():
+            #     total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
             
-            # losses 딕셔너리를 total_losses로 초기화하여 2D loss를 먼저 담습니다.
-            losses = total_losses
+            # # losses 딕셔너리를 total_losses로 초기화하여 2D loss를 먼저 담습니다.
+            # losses = total_losses
 
             detections_2d = self._generate_and_process_2d_dets(
                 reshaped_img_feats, 
@@ -1833,6 +1937,7 @@ class BEVFusion(Base3DDetector):
 
                 # 3. ZEstimator의 "예측"만 가져옴 - 학습시는 예측값만 사용 
                 z_estimated_active = esitmated_z_active['z_estimated_real'] # [NumActive, Q, 1]
+                z_hybrid = esitmated_z_active['depth']
 
                 # 4. 🚨 "정답지" (TRUE) 준비: Dilation 코드 모두 삭제 (롤백)
                 depth_map_reshaped_TRUE = dense_depth_map_gt.view(B * N, 900, 1600)
@@ -1863,18 +1968,19 @@ class BEVFusion(Base3DDetector):
                                         reduction='mean',
                                         beta=1.0  # beta=1.0이 표준입니다 (오차 1.0 기준 L1/L2 전환)
                                     )
-                    losses['loss_z_estimation'] = loss_z_estimation * 1
+                    losses['loss_z_estimation'] = loss_z_estimation * 0.1
                 
                 # --- ✨ 1. [신규] Z-Estimator의 예측(z')을 Corr 예측(u', v')과 결합 ---
                 # raw_corrs_active: (NumActive, Q, 2)
                 # z_estimated_active: (NumActive, Q, 1)
                 # -> (u', v', z') 3D 대응점 생성
                 corrs_3d_active = torch.cat([raw_corrs_active, z_estimated_active], dim=-1) # (NumActive, Q, 3)
-
+                corrs_3d_hybrid = torch.cat([raw_corrs_active, z_hybrid], dim=-1)
+                
                 pred_delta_6dof_active = self.calib_head(
                     enc_out_active_4d, 
                     query_input_filtered, 
-                    corrs_3d_active, # ✨ Corr 예측 (u', v', z') - 3D
+                    corrs_3d_hybrid, # ✨ Corr 예측 (u', v', z') - 3D
                 )
                 
                 if B == 1:
@@ -1895,8 +2001,8 @@ class BEVFusion(Base3DDetector):
 
                 R_pred_calib = axis_angle_to_matrix(pred_rot_filtered)
                 R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
-                # losses['loss_calib_rot'] = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean() * 5.0
-                losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 500.0
+                # # losses['loss_calib_rot'] = geodesic_distance_loss(R_pred_calib, R_gt_calib).mean() * 5.0
+                losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 2.0
                 losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 1.0
             # --- if/else 블록 끝 ---
             
@@ -1972,7 +2078,8 @@ class BEVFusion(Base3DDetector):
 
             loss_chamfer = chamfer_distance(det_xyz_batch_sampled, gt_lidar_points_sampled).mean()
 
-            losses['loss_chamfer_xyz'] = loss_chamfer * 0.005
+            ##### loss 3d point cloud loss 
+            # losses['loss_chamfer_xyz'] = loss_chamfer * 0.005
 
             det_xyz_ref = det_xyz.clone()
             det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
@@ -2008,7 +2115,7 @@ class BEVFusion(Base3DDetector):
             pred_delta_rot_batch = bbox_loss.pop('pred_delta_rot')
             pred_delta_trans_batch = bbox_loss.pop('pred_delta_trans')
 
-            losses.update(bbox_loss)
+            # losses.update(bbox_loss)
 
             # # --- 4. ✨ VERIFICATION 2: 2nd Stage 시각적 검증 ---
             # if hasattr(self, 'training_step') and self.training_step % 50 == 0:
