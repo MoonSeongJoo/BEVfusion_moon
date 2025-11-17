@@ -27,7 +27,7 @@ data_root = '/workspace/mmdetection3d/data/nuscenes/'
 
 model = dict(
     type='BEVFusion',
-    enable_selective_freezing=True,
+    enable_selective_freezing=False,
     class_names=class_names,
     train_cfg=dict(
         complement_2d_gt=0.35, # <-- 커스텀 설정을 여기로 이동
@@ -163,6 +163,11 @@ model = dict(
             # checkpoint='data/weights/backbone_corr_10deg_7.5m.pth' # 예시 경로
             # checkpoint=None # 가중치 로딩이 필요 없을 경우
         )
+    ),
+    corr_loss=dict(
+        type='CorrelationCycleLoss',
+        corr_weight=2.0,
+        cycle_weight=1.0,
     ),
     z_estimator=dict(
         type='ZEstimator',
