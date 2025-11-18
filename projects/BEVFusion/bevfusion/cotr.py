@@ -120,10 +120,12 @@ class CorrelationCycleLoss(nn.Module):
         if mask.sum() > 0:
             # cycle_loss = torch.nn.functional.mse_loss(cycle[mask], queries[mask])
             cycle_loss = torch.nn.functional.smooth_l1_loss(cycle[mask], queries[mask])
-            corr_loss += cycle_loss 
-
+            # corr_loss += cycle_loss 
+        
+        # (수정) 두 로스를 독립적으로 합산
+        total_loss = (self.corr_weight * corr_loss) + (self.cycle_weight * cycle_loss)
         # return self.loss_weight * corr_loss
-        return self.corr_weight * corr_loss + self.cycle_weight * cycle_loss
+        return total_loss
 
 class PointDistanceLoss(nn.Module):
     def __init__(self, distance_weight=1.0):

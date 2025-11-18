@@ -27,7 +27,7 @@ data_root = '/workspace/mmdetection3d/data/nuscenes/'
 
 model = dict(
     type='BEVFusion',
-    enable_selective_freezing=False,
+    enable_selective_freezing=True,
     class_names=class_names,
     train_cfg=dict(
         complement_2d_gt=0.35, # <-- 커스텀 설정을 여기로 이동
@@ -490,8 +490,8 @@ optim_wrapper = dict(
             # 이미지 백본은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
             # 'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
-            'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
-            'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
+            'img_neck'  :dict(lr_mult=0.1, decay_mult=1.0),
+            'img_bbox_head': dict(lr_mult=0.1, decay_mult=1.0),
             # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             # 'corr': dict(lr_mult=0.1, decay_mult=1.0),
             # # pts_backbone
@@ -521,7 +521,7 @@ default_hooks = dict(
     #     max_keep_ckpts=3,),    # 👈 이 부분을 False로 변경하는 것이 핵심입니다.
     checkpoint=dict(
         type='CheckpointHook',
-        interval=3000,           # 500 이터레이션마다 체크포인트 저장 조건 확인
+        interval=2000,           # 500 이터레이션마다 체크포인트 저장 조건 확인
         by_epoch=False,
         save_best='train/loss',   # 'val/loss'를 기준으로 가장 좋은 모델을 저장
         rule='less',            # loss는 낮을수록 좋으므로 'less'로 설정
@@ -536,9 +536,9 @@ default_hooks = dict(
     ))
 del _base_.custom_hooks
 
-load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-# load_from =  "data/work_dirs/bevfusion/20251115_renew_10deg_0.75m/iter_33000.pth"
-# load_from = None
+# load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
+# load_from =  "data/work_dirs/bevfusion/20251117_renew_all_1ststage_only/iter_12000.pth"
+load_from = None
 resume_from = None
 
 # log_level = 'WARNING' 

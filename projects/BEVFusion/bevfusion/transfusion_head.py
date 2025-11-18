@@ -1066,7 +1066,7 @@ class TransFusionHead(nn.Module):
         )
 
         loss_dict[f'{aux_prefix}_loss_cls'] = loss_aux_cls * 0.5   # 가중치 (예: 0.5)
-        loss_dict[f'{aux_prefix}_loss_bbox'] = loss_aux_bbox * 0.5 # 가중치 (예: 0.5)
+        loss_dict[f'{aux_prefix}_loss_bbox'] = loss_aux_bbox * 0.005 # 가중치 (예: 0.5)
         # ----------------------------------------------------
 
         # compute loss for each layer

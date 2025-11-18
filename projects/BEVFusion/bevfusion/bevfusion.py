@@ -140,12 +140,12 @@ class BEVFusion(Base3DDetector):
             img_backbone) if img_backbone is not None else None
         self.img_neck = MODELS.build(
             img_neck) if img_neck is not None else None
-        self.view_transform = MODELS.build(
-            view_transform) if view_transform is not None else None
+        # self.view_transform = MODELS.build(
+        #     view_transform) if view_transform is not None else None
         self.pts_middle_encoder = MODELS.build(pts_middle_encoder)
 
-        self.fusion_layer = MODELS.build(
-            fusion_layer) if fusion_layer is not None else None
+        # self.fusion_layer = MODELS.build(
+        #     fusion_layer) if fusion_layer is not None else None
 
         self.pts_backbone = MODELS.build(pts_backbone)
         self.pts_neck = MODELS.build(pts_neck)
@@ -168,7 +168,7 @@ class BEVFusion(Base3DDetector):
 
         feat_dim_original = 312 # 입력 차원은 det_feat의 원래 특징 차원입니다 (12 * 64 = 768).
         hidden_channel = bbox_head['hidden_channel'] # (128) 출력 차원은 TransFusionHead의 hidden_channel과 반드시 일치해야 합니다.
-        self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
+        # self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
 
         # =====================================================================
         # ✨ START: Code added for selective module freezing
@@ -288,9 +288,9 @@ class BEVFusion(Base3DDetector):
                 'pts_neck': self.pts_neck,
 
                 # Image Path (2D Detection Head)
-                'img_backbone': self.img_backbone,
-                'img_neck': self.img_neck,
-                'img_bbox_head': self.img_bbox_head,
+                # 'img_backbone': self.img_backbone,
+                # 'img_neck': self.img_neck,
+                # 'img_bbox_head': self.img_bbox_head,
 
                 # 1st stage calibration Head
                 # 'calib_head': self.calib_head,
@@ -310,7 +310,7 @@ class BEVFusion(Base3DDetector):
                 # 'prediction_heads': self.bbox_head.prediction_heads,
                 
                 # Custom Modules
-                'corr': self.corr, # 1st stage calib (Freeze)
+                # 'corr': self.corr, # 1st stage calib (Freeze)
             }
 
             # 선택된 모듈들의 파라미터 업데이트를 중지
@@ -1899,15 +1899,15 @@ class BEVFusion(Base3DDetector):
                 
                 # (mv2d ref) Task A 쿼리 (랜덤 포인트)
                 query_input_random = trimed_uvset[..., :2]
-                query_input_random[..., 0] /= W  # sbs_img.shape[3]
-                query_input_random[..., 1] /= H  # sbs_img.shape[2]
+                query_input_random[..., 0] /= batch_data_samples[0].img_shape[1]  # img.shape[3] = 1600
+                query_input_random[..., 1] /= batch_data_samples[0].img_shape[0]  # sbs_img.shape[2] =900
                 query_input_random[:,:,0] = query_input_random[:,:,0]/2
                 query_input_random[:,:,1] = query_input_random[:,:,1]
 
                 # (mv2d ref) Task A 타겟 (랜덤 포인트)
                 corr_target_random = trimed_uvset[...,2:]
-                corr_target_random[...,0] = corr_target_random[...,0] / W
-                corr_target_random[...,1] = corr_target_random[...,1] / H
+                corr_target_random[...,0] = corr_target_random[...,0] / batch_data_samples[0].img_shape[1]
+                corr_target_random[...,1] = corr_target_random[...,1] / batch_data_samples[0].img_shape[0]
                 corr_target_random[:,:,0] = corr_target_random[:,:,0]/2 + 0.5
                 corr_target_random[:,:,1] = corr_target_random[:,:,1]
                 
@@ -1920,7 +1920,7 @@ class BEVFusion(Base3DDetector):
                 loss_corr = self.corr_loss(raw_corrs_rand, corr_target_random, cycle_rand, query_input_random, corr_mask_rand)
                 
                 # ✨ [중요] 로스 가중치를 적용하여 서열 정리
-                losses['loss_corr'] = loss_corr * 10.0 # (예시: 대응점 학습에 높은 가중치 부여)
+                losses['loss_corr'] = loss_corr * 1000.0 # (예시: 대응점 학습에 높은 가중치 부여)
             else:
                 losses['loss_corr'] = torch.tensor(0.0, device=target_device)
 
@@ -2057,7 +2057,7 @@ class BEVFusion(Base3DDetector):
             # # ##### 검증용 display ######
             # from .imageprocessing_unit import draw_correspondences
             # # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
-            # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
+            # pred_corrs = torch.cat([query_input_bbox_centers,raw_corrs],dim=-1)
             # # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
             # self.vis_step_counter += 1
             # for cid in range(6):
@@ -2087,78 +2087,80 @@ class BEVFusion(Base3DDetector):
             #             score_thr=0.4
             #         )
             #     print ("end")
+   
 
-            corrected_calib_dict = self._get_corrected_calib_from_prediction(
-                            pred_delta_rot,
-                            pred_delta_trans,
-                            broken_camera2lidar,
-                            broken_camera_intrinsics
-                        )
+            #### 1st stage end - 2nd stage start ################
+            # corrected_calib_dict = self._get_corrected_calib_from_prediction(
+            #                 pred_delta_rot,
+            #                 pred_delta_trans,
+            #                 broken_camera2lidar,
+            #                 broken_camera_intrinsics
+            #             )
 
-            # ✨ '보정된' lidar2imag를 사용하여 3D 좌표 변환 수행
-            # ✨ (esitmated_uvz는 이제 if/else 로직에 의해 올바르게 채워졌습니다)
-            det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
+            # # ✨ '보정된' lidar2imag를 사용하여 3D 좌표 변환 수행
+            # # ✨ (esitmated_uvz는 이제 if/else 로직에 의해 올바르게 채워졌습니다)
+            # det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
         
-            # ... (이하 Chamfer Loss, BBox Head 등 나머지 코드는 동일) ...
+            # # ... (이하 Chamfer Loss, BBox Head 등 나머지 코드는 동일) ...
 
-            gt_lidar_points = batch_inputs_dict['points'][0][:, :3]
-            gt_lidar_points = gt_lidar_points.unsqueeze(0).to(target_device)
+            # gt_lidar_points = batch_inputs_dict['points'][0][:, :3]
+            # gt_lidar_points = gt_lidar_points.unsqueeze(0).to(target_device)
             
-            num_queries_per_cam = det_xyz.shape[1]
-            det_xyz_batch = det_xyz.reshape(B, N * num_queries_per_cam, 3)
+            # num_queries_per_cam = det_xyz.shape[1]
+            # det_xyz_batch = det_xyz.reshape(B, N * num_queries_per_cam, 3)
 
-            if gt_lidar_points.shape[1] > 2048:
-                indices = torch.randperm(gt_lidar_points.shape[1], device=target_device)[:2048]
-                gt_lidar_points_sampled = gt_lidar_points[:, indices, :]
-            else:
-                gt_lidar_points_sampled = gt_lidar_points
+            # if gt_lidar_points.shape[1] > 2048:
+            #     indices = torch.randperm(gt_lidar_points.shape[1], device=target_device)[:2048]
+            #     gt_lidar_points_sampled = gt_lidar_points[:, indices, :]
+            # else:
+            #     gt_lidar_points_sampled = gt_lidar_points
                 
-            if det_xyz_batch.shape[1] > 2048:
-                indices = torch.randperm(det_xyz_batch.shape[1], device=target_device)[:2048]
-                det_xyz_batch_sampled = det_xyz_batch[:, indices, :]
-            else:
-                det_xyz_batch_sampled = det_xyz_batch
+            # if det_xyz_batch.shape[1] > 2048:
+            #     indices = torch.randperm(det_xyz_batch.shape[1], device=target_device)[:2048]
+            #     det_xyz_batch_sampled = det_xyz_batch[:, indices, :]
+            # else:
+            #     det_xyz_batch_sampled = det_xyz_batch
 
-            loss_chamfer = chamfer_distance(det_xyz_batch_sampled, gt_lidar_points_sampled).mean()
+            # loss_chamfer = chamfer_distance(det_xyz_batch_sampled, gt_lidar_points_sampled).mean()
 
-            ##### loss 3d point cloud loss 
-            losses['loss_chamfer_xyz'] = loss_chamfer * 0.005
+            # ##### loss 3d point cloud loss 
+            # # losses['loss_chamfer_xyz'] = loss_chamfer * 0.005
 
-            det_xyz_ref = det_xyz.clone()
-            det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
-                    self.pc_range[3] - self.pc_range[0])
-            det_xyz_ref[..., 1:2] = (det_xyz_ref[..., 1:2] - self.pc_range[1]) / (
-                    self.pc_range[4] - self.pc_range[1])
-            det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
-                    self.pc_range[5] - self.pc_range[2])
-            det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
+            # det_xyz_ref = det_xyz.clone()
+            # det_xyz_ref[..., 0:1] = (det_xyz_ref[..., 0:1] - self.pc_range[0]) / (
+            #         self.pc_range[3] - self.pc_range[0])
+            # det_xyz_ref[..., 1:2] = (det_xyz_ref[..., 1:2] - self.pc_range[1]) / (
+            #         self.pc_range[4] - self.pc_range[1])
+            # det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
+            #         self.pc_range[5] - self.pc_range[2])
+            # det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
             
-            det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input_bbox_centers)
-            det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz_ref_clamped,det_feat_sampled,B=B,N_cam=N)
+            # det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input_bbox_centers)
+            # det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz_ref_clamped,det_feat_sampled,B=B,N_cam=N)
 
-            feats = self.extract_feat(batch_inputs_dict=batch_inputs_dict,
-                                    batch_input_metas=batch_input_metas,
-                                    corrected_calib=corrected_calib_dict,
-                                    precomputed_img_feats=img_feats)
+            # feats = self.extract_feat(batch_inputs_dict=batch_inputs_dict,
+            #                         batch_input_metas=batch_input_metas,
+            #                         corrected_calib=corrected_calib_dict,
+            #                         precomputed_img_feats=img_feats)
 
-            if self.with_bbox_head:
-                bbox_loss = self.bbox_head.loss(
-                                feats, 
-                                det_xyz_proc, 
-                                det_feat_proc, 
-                                batch_data_samples,
-                                pred_delta_rot=pred_delta_rot,
-                                pred_delta_trans=pred_delta_trans,
-                                gt_delta_rot=gt_delta_rot,
-                                gt_delta_trans=gt_delta_trans
-                            )
+            # if self.with_bbox_head:
+            #     bbox_loss = self.bbox_head.loss(
+            #                     feats, 
+            #                     det_xyz_proc, 
+            #                     det_feat_proc, 
+            #                     batch_data_samples,
+            #                     pred_delta_rot=pred_delta_rot,
+            #                     pred_delta_trans=pred_delta_trans,
+            #                     gt_delta_rot=gt_delta_rot,
+            #                     gt_delta_trans=gt_delta_trans
+            #                 )
             
-            # --- ✨ 2. 손실과 예측값 분리 ---
-            # 시각화를 위해 예측값을 별도 변수로 빼내고, 딕셔너리에서 제거
-            pred_delta_rot_batch = bbox_loss.pop('pred_delta_rot')
-            pred_delta_trans_batch = bbox_loss.pop('pred_delta_trans')
+            # # --- ✨ 2. 손실과 예측값 분리 ---
+            # # 시각화를 위해 예측값을 별도 변수로 빼내고, 딕셔너리에서 제거
+            # pred_delta_rot_batch = bbox_loss.pop('pred_delta_rot')
+            # pred_delta_trans_batch = bbox_loss.pop('pred_delta_trans')
 
-            losses.update(bbox_loss)
+            # losses.update(bbox_loss)
 
             # # --- 4. ✨ VERIFICATION 2: 2nd Stage 시각적 검증 ---
             # if hasattr(self, 'training_step') and self.training_step % 50 == 0:
