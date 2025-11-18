@@ -483,7 +483,7 @@ test_cfg = dict()
 # --- ✨ 핵심 수정: 옵티마이저 설정을 변경하여 모듈별로 다른 학습률 적용 ---
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=0.0002, weight_decay=0.01), # 1.9033e-04 # 초기 : 0.0002 1.6693e-04 1.6541e-04 1.6524e-04
+    optimizer=dict(type='AdamW', lr=1.9999e-04, weight_decay=0.01), # 1.9033e-04 # 초기 : 0.0002 1.6693e-04 1.6541e-04 1.6524e-04
     # paramwise_cfg를 통해 특정 파라미터 그룹에 다른 학습률을 설정합니다.
     paramwise_cfg=dict(
         custom_keys={
@@ -537,7 +537,7 @@ default_hooks = dict(
 del _base_.custom_hooks
 
 # load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-load_from =  "data/work_dirs/bevfusion/20251118_corr_e2e_1st_stage/iter_2000.pth"
+load_from =  "data/work_dirs/bevfusion/20251118_corr_e2e_1st_stage/iter_4000.pth"
 # load_from = None
 resume_from = None
 

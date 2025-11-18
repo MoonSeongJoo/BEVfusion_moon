@@ -1754,66 +1754,136 @@ class BEVFusion(Base3DDetector):
         
         return x_neck
     
+    # def _get_corrected_calib_from_prediction(
+    #     self,
+    #     pred_delta_rot: torch.Tensor, # ✨ 입력이 (B, N, 3) 
+    #     pred_delta_trans: torch.Tensor, # (B, N, 3)
+    #     broken_camera2lidar: torch.Tensor,
+    #     broken_camera_intrinsics: torch.Tensor
+    # ) -> Dict[str, torch.Tensor]:
+    #     """
+    #     예측된 delta 값과 broken calibration을 사용하여 
+    #     보정된 calibration 파라미터 딕셔너리를 생성합니다.
+    #     """
+    #     # --- 1. 예측된 오차를 사용하여 corrected_camera2lidar 생성 ---
+    #     pred_delta_rot_mat = axis_angle_to_matrix(pred_delta_rot)
+    #     broken_rots = broken_camera2lidar[..., :3, :3]
+    #     broken_trans = broken_camera2lidar[..., :3, 3]
+
+    #     corrected_camera2lidar_trans = broken_trans + pred_delta_trans
+    #     corrected_camera2lidar_rots = pred_delta_rot_mat @ broken_rots
+        
+    #     # --- ✨ FIX: In-place 할당 대신 torch.cat으로 새로운 4x4 행렬 조립 ---
+        
+    #     # 1. 상단 3x4 부분 [R_corr | t_corr] 생성
+    #     top_3x4 = torch.cat(
+    #         [corrected_camera2lidar_rots, corrected_camera2lidar_trans.unsqueeze(-1)], 
+    #         dim=-1
+    #     ) # shape: (B, N, 3, 4)
+
+    #     # 2. 하단 1x4 부분 [0, 0, 0, 1] 생성
+    #     B, N = broken_camera2lidar.shape[:2]
+    #     bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], 
+    #                             device=broken_camera2lidar.device, 
+    #                             dtype=broken_camera2lidar.dtype)
+    #     bottom_row = bottom_row.expand(B, N, -1, -1) # shape: (B, N, 1, 4)
+
+    #     # 3. 상단과 하단을 합쳐 최종 4x4 행렬 생성
+    #     corrected_camera2lidar = torch.cat([top_3x4, bottom_row], dim=-2)
+        
+    #     # --- (이후 lidar2img 계산 로직은 기존과 동일) ---
+    #     corrected_lidar2camera_rots = corrected_camera2lidar_rots.transpose(-1, -2)
+    #     corrected_lidar2camera_trans = -torch.matmul(
+    #         corrected_lidar2camera_rots,
+    #         corrected_camera2lidar_trans.unsqueeze(-1)
+    #     ).squeeze(-1)
+    #     corrected_lidar2camera_3x4 = torch.cat(
+    #         [corrected_lidar2camera_rots, corrected_lidar2camera_trans.unsqueeze(-1)], dim=-1
+    #     )
+
+    #     # 최종 투영 행렬 계산 (3x4)
+    #     intrinsics_3x3 = broken_camera_intrinsics[..., :3, :3]
+    #     corrected_lidar2imag_3x4 = intrinsics_3x3 @ corrected_lidar2camera_3x4
+        
+    #     # 4x4 동차 좌표계 행렬로 변환
+    #     B, N, _, _ = corrected_lidar2imag_3x4.shape
+    #     bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], 
+    #                             device=corrected_lidar2imag_3x4.device, 
+    #                             dtype=corrected_lidar2imag_3x4.dtype)
+    #     bottom_row = bottom_row.expand(B, N, -1, -1)
+    #     corrected_lidar2imag_4x4 = torch.cat([corrected_lidar2imag_3x4, bottom_row], dim=-2)
+
+    #     # --- 3. 최종 결과 딕셔너리 반환 ---
+    #     corrected_calib_dict = {
+    #         'lidar2img': corrected_lidar2imag_4x4,
+    #         'cam2img': broken_camera_intrinsics,
+    #         'cam2lidar': corrected_camera2lidar
+    #     }
+        
+    #     return corrected_calib_dict
+    
     def _get_corrected_calib_from_prediction(
         self,
-        pred_delta_rot: torch.Tensor, # ✨ 입력이 (B, N, 4) 쿼터니언으로 변경됨
+        pred_delta_rot: torch.Tensor, # (B, N, 3)
         pred_delta_trans: torch.Tensor, # (B, N, 3)
-        broken_camera2lidar: torch.Tensor,
+        broken_camera2lidar: torch.Tensor, # (B, N, 4, 4)
         broken_camera_intrinsics: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        예측된 delta 값과 broken calibration을 사용하여 
-        보정된 calibration 파라미터 딕셔너리를 생성합니다.
+        예측된 delta 값으로 4x4 보정 행렬을 만들고, 
+        broken calibration에 행렬 곱셈을 수행하여 보정합니다.
         """
-        # --- 1. 예측된 오차를 사용하여 corrected_camera2lidar 생성 ---
-        pred_delta_rot_mat = axis_angle_to_matrix(pred_delta_rot)
-        broken_rots = broken_camera2lidar[..., :3, :3]
-        broken_trans = broken_camera2lidar[..., :3, 3]
-
-        corrected_camera2lidar_trans = broken_trans + pred_delta_trans
-        corrected_camera2lidar_rots = pred_delta_rot_mat @ broken_rots
-        
-        # --- ✨ FIX: In-place 할당 대신 torch.cat으로 새로운 4x4 행렬 조립 ---
-        
-        # 1. 상단 3x4 부분 [R_corr | t_corr] 생성
-        top_3x4 = torch.cat(
-            [corrected_camera2lidar_rots, corrected_camera2lidar_trans.unsqueeze(-1)], 
-            dim=-1
-        ) # shape: (B, N, 3, 4)
-
-        # 2. 하단 1x4 부분 [0, 0, 0, 1] 생성
         B, N = broken_camera2lidar.shape[:2]
-        bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], 
-                                device=broken_camera2lidar.device, 
-                                dtype=broken_camera2lidar.dtype)
-        bottom_row = bottom_row.expand(B, N, -1, -1) # shape: (B, N, 1, 4)
+        device = broken_camera2lidar.device
+        dtype = broken_camera2lidar.dtype
 
-        # 3. 상단과 하단을 합쳐 최종 4x4 행렬 생성
-        corrected_camera2lidar = torch.cat([top_3x4, bottom_row], dim=-2)
+        # --- 1. 예측값으로 4x4 보정 행렬 (T_correction) 생성 ---
+        # T_correction: Misaligned LiDAR -> Corrected LiDAR (lidar2lidar)
         
-        # --- (이후 lidar2img 계산 로직은 기존과 동일) ---
-        corrected_lidar2camera_rots = corrected_camera2lidar_rots.transpose(-1, -2)
-        corrected_lidar2camera_trans = -torch.matmul(
-            corrected_lidar2camera_rots,
-            corrected_camera2lidar_trans.unsqueeze(-1)
-        ).squeeze(-1)
+        # 1-1. 회전 행렬 (3x3)
+        pred_rot_mat = axis_angle_to_matrix(pred_delta_rot) # (B, N, 3, 3)
+        
+        # 1-2. 이동 벡터 (3x1)
+        pred_trans_vec = pred_delta_trans.unsqueeze(-1) # (B, N, 3, 1)
+        
+        # 1-3. 4x4 행렬 조립
+        # [ R_pred  t_pred ]
+        # [   0       1    ]
+        top_row = torch.cat([pred_rot_mat, pred_trans_vec], dim=-1) # (B, N, 3, 4)
+        
+        bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], device=device, dtype=dtype)
+        bottom_row = bottom_row.expand(B, N, -1, -1) # (B, N, 1, 4)
+        
+        T_correction = torch.cat([top_row, bottom_row], dim=-2) # (B, N, 4, 4)
+        
+        # --- 2. 행렬 곱셈으로 보정 적용 (핵심 수정) ---
+        # Corrected = Correction @ Broken
+        # T_{Cam->Lidar_Corrected} = T_{Lidar_Mis->Lidar_Corr} @ T_{Cam->Lidar_Mis}
+        corrected_camera2lidar = torch.matmul(T_correction, broken_camera2lidar)
+        
+        # --- 3. lidar2img 계산 (기존 로직 활용) ---
+        # corrected_camera2lidar의 역행렬 계산 (lidar2camera)
+        # (일반적인 inverse보다 R.T를 이용한 방식이 수치적으로 더 안정적일 수 있음)
+        R_corr = corrected_camera2lidar[..., :3, :3]
+        t_corr = corrected_camera2lidar[..., :3, 3:4]
+        
+        corrected_lidar2camera_rots = R_corr.transpose(-1, -2)
+        corrected_lidar2camera_trans = -torch.matmul(corrected_lidar2camera_rots, t_corr)
+        
         corrected_lidar2camera_3x4 = torch.cat(
-            [corrected_lidar2camera_rots, corrected_lidar2camera_trans.unsqueeze(-1)], dim=-1
-        )
+            [corrected_lidar2camera_rots, corrected_lidar2camera_trans], dim=-1
+        ) # (B, N, 3, 4)
 
         # 최종 투영 행렬 계산 (3x4)
         intrinsics_3x3 = broken_camera_intrinsics[..., :3, :3]
-        corrected_lidar2imag_3x4 = intrinsics_3x3 @ corrected_lidar2camera_3x4
+        corrected_lidar2imag_3x4 = torch.matmul(intrinsics_3x3, corrected_lidar2camera_3x4)
         
-        # 4x4 동차 좌표계 행렬로 변환
-        B, N, _, _ = corrected_lidar2imag_3x4.shape
-        bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], 
-                                device=corrected_lidar2imag_3x4.device, 
-                                dtype=corrected_lidar2imag_3x4.dtype)
-        bottom_row = bottom_row.expand(B, N, -1, -1)
-        corrected_lidar2imag_4x4 = torch.cat([corrected_lidar2imag_3x4, bottom_row], dim=-2)
+        # 4x4 변환
+        bottom_row_proj = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], device=device, dtype=dtype)
+        bottom_row_proj = bottom_row_proj.expand(B, N, -1, -1)
+        corrected_lidar2imag_4x4 = torch.cat([corrected_lidar2imag_3x4, bottom_row_proj], dim=-2)
 
-        # --- 3. 최종 결과 딕셔너리 반환 ---
+        # --- 4. 결과 반환 ---
         corrected_calib_dict = {
             'lidar2img': corrected_lidar2imag_4x4,
             'cam2img': broken_camera_intrinsics,
@@ -1966,10 +2036,32 @@ class BEVFusion(Base3DDetector):
                     losses['loss_z_estimation'] = loss_z_estimation * 1.0 
                 else:
                     losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device)
+                
+                z_hybrid = esitmated_z_rand['depth'] # Teacher-Forcing용 'depth' 사용
+                corrs_3d_hybrid = torch.cat([raw_corrs_rand, z_hybrid], dim=-1)             
+                pred_delta_6dof_random = self.calib_head(
+                    enc_out_rand, 
+                    query_input_random, 
+                    corrs_3d_hybrid,
+                    # ✨[제안] 여기에도 FPN 특징을 추가로 전달하면
+                    # calib_head의 정체 현상을 더 확실히 풀 수 있습니다.
+                    # fpn_feats=img_feats[active_cam_indices]
+                )
+                # (기존) Calib-Head Loss 계산
+                pred_rot_random = pred_delta_6dof_random[..., :3]
+                pred_trans_random = pred_delta_6dof_random[..., 3:]
+                R_pred_calib = axis_angle_to_matrix(pred_rot_random)
+                R_gt_calib = axis_angle_to_matrix(gt_delta_rot.squeeze(0))
+                
+                # ✨ 가중치 조절
+                losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 2.0
+                losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_random, gt_delta_trans.squeeze(0), reduction='mean') * 1.0
 
             else:
                 losses['loss_corr'] = torch.tensor(0.0, device=target_device)
                 losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device) # Z-Est 로스도 0으로 초기화
+                losses['loss_calib_rot'] = torch.tensor(0.0, device=target_device, requires_grad=True)
+                losses['loss_calib_trans'] = torch.tensor(0.0, device=target_device, requires_grad=True)
 
             # --- 5. ✨ [Task B] Downstream 태스크 (Z-Est, Calib) (기존 로직) ---
         
@@ -1981,10 +2073,7 @@ class BEVFusion(Base3DDetector):
             raw_corrs = torch.zeros(raw_corrs_shape, device=target_device)
             enc_out = torch.zeros(enc_out_shape, device=target_device)
             esitmated_uvz = torch.zeros(esitmated_uvz_shape, device=target_device)
-            pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
-            losses['loss_calib_rot'] = torch.tensor(0.0, device=target_device, requires_grad=True)
-            losses['loss_calib_trans'] = torch.tensor(0.0, device=target_device, requires_grad=True)
-            
+
             # (기존) 2D Bbox가 감지된 카메라에 대해서만 Task B 실행
             if len(active_cam_indices) > 0:
                 sbs_img_filtered = sbs_img[:, active_cam_indices]
@@ -2015,46 +2104,19 @@ class BEVFusion(Base3DDetector):
                         depth_map=depth_map_active_BROKEN,
                         enc_out=enc_out_active_4d
                     )
-                z_hybrid = esitmated_z_active['depth'] # Teacher-Forcing용 'depth' 사용
-                
-                # (기존) Calib-Head 로직
-                corrs_3d_hybrid = torch.cat([raw_corrs_active, z_hybrid], dim=-1)
-                
-                pred_delta_6dof_active = self.calib_head(
-                    enc_out_active_4d, 
-                    query_input_filtered, 
-                    corrs_3d_hybrid,
-                    # ✨[제안] 여기에도 FPN 특징을 추가로 전달하면
-                    # calib_head의 정체 현상을 더 확실히 풀 수 있습니다.
-                    # fpn_feats=img_feats[active_cam_indices]
-                )
                 
                 # (기존) 텐서 인덱싱
                 if B == 1:
                     raw_corrs[active_cam_indices] = raw_corrs_active
                     enc_out[active_cam_indices] = enc_out_active_3d
-                    pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_active
-                    
                     esitmated_uvz_active = torch.cat(
                         [uv_pixels_from_corr, esitmated_z_active['depth']], dim=-1
                     )
                     esitmated_uvz[active_cam_indices] = esitmated_uvz_active
-
-                # (기존) Calib-Head Loss 계산
-                pred_rot_filtered = pred_delta_6dof_active[..., :3]
-                pred_trans_filtered = pred_delta_6dof_active[..., 3:]
-                gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
-                gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
-                R_pred_calib = axis_angle_to_matrix(pred_rot_filtered)
-                R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
-                
-                # ✨ 가중치 조절
-                losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 2.0
-                losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 1.0
             
             enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
-            pred_delta_rot = pred_delta_6dof[..., :3]
-            pred_delta_trans = pred_delta_6dof[..., 3:]
+            pred_delta_rot = pred_rot_random
+            pred_delta_trans = pred_trans_random
 
             # # ##### 검증용 display ######
             # from .imageprocessing_unit import draw_correspondences

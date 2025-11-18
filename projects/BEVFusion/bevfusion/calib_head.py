@@ -320,7 +320,7 @@ class _CalibHeadRegressor(nn.Module):
         
         # --- ✨ 1. Local Feature 차원 수정 (6 -> 8) ---
         # (u,v), (u',v',z'), (u-u'), (v-v'), (z') = 8 dims per Kp
-        self.corrs_emb_dim = self.num_kp * 8
+        self.corrs_emb_dim = self.num_kp * 7
         
         # 3. MLP 입력 차원 = Global (in_channels) + Local (corrs_emb_dim)
         self.mlp_input_dim = self.corrs_emb_dim + in_channels # 예: (200 * 6) + 312 = 1512
@@ -396,57 +396,130 @@ class CalibrationCorrectionHead(nn.Module):
             num_kp=num_kp
         )
 
+    # def forward(self, 
+    #             enc_out: torch.Tensor, 
+    #             query_input: torch.Tensor, 
+    #             corrs_pred_3d: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Args:
+    #         enc_out (torch.Tensor): (B*N, C, H, W) e.g., (B*N, 312, 12, 64)
+    #         query_input (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
+    #         corrs_pred (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
+        
+    #     Returns:
+    #         torch.Tensor: 예측된 7-DoF 파라미터 (B*N, 7)
+    #                      [..., :4] = quaternion (w, x, y, z) 또는 (x, y, z, w)
+    #                      [..., 4:] = translation (x, y, z)
+    #     """
+        
+    #     # 1. Global Feature (enc_out) 처리
+    #     # (B*N, C, H, W) -> (B*N, C, 1, 1) -> (B*N, C)
+    #     x_global = self.regressor.flatten(self.regressor.avgpool(enc_out))
+        
+    #     # 2. Local Feature (corrs_emb) 처리 (✨ z' 추가 ✨)
+        
+    #     # (u,v)와 (u',v',z') 결합
+    #     # [수정] corrs_pred_3d에서 (u',v')와 (z') 분리
+    #     corrs_pred_2d = corrs_pred_3d[..., :2] # (B*N, 200, 2)
+    #     corrs_pred_z = corrs_pred_3d[..., 2:3] # (B*N, 200, 1)
+        
+    #     concat_pred_corrs = torch.cat((query_input, corrs_pred_2d), dim=-1) # (B*N, 200, 4) (u,v, u',v')
+        
+    #     # (u-u')와 (v-v') 차이 벡터 계산 (동일)
+    #     x_diff = concat_pred_corrs[..., 0] - concat_pred_corrs[..., 2] # u - u'
+    #     y_diff = concat_pred_corrs[..., 1] - concat_pred_corrs[..., 3] # v - v'
+    #     concat_pred_corrs_diff = torch.stack([x_diff, y_diff], dim=2)  # (B*N, 200, 2)
+        
+    #     # [수정] (u,v, u',v', u-u', v-v') + (z') + (z') = 8D
+    #     # (u,v), (u',v',z'), (u-u'), (v-v'), (z') -> 8D
+    #     corrs_emb = torch.cat(
+    #         (query_input,           # (B*N, 200, 2)
+    #          corrs_pred_3d,         # (B*N, 200, 3)
+    #          concat_pred_corrs_diff, # (B*N, 200, 2)
+    #          corrs_pred_z),          # (B*N, 200, 1) -> z'를 한 번 더 넣어줌 (중요도 강조)
+    #         dim=-1
+    #     ) # (B*N, 200, 8)
+        
+    #     # MLP 입력을 위해 (B*N, 200, 8) -> (B*N, 200 * 8)
+    #     y_local_flat = corrs_emb.view(corrs_emb.size(0), -1) # (B*N, 1600)
+        
+    #     # 3. Regressor 호출 (동일)
+    #     pred_rot, pred_trans = self.regressor(x_global, y_local_flat)
+        
+    #     # 4. 결과 결합 (동일)
+    #     pred_delta_7dof = torch.cat([pred_rot, pred_trans], dim=1)
+        
+    #     return pred_delta_7dof
+
     def forward(self, 
-                enc_out: torch.Tensor, 
-                query_input: torch.Tensor, 
-                corrs_pred_3d: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            enc_out (torch.Tensor): (B*N, C, H, W) e.g., (B*N, 312, 12, 64)
-            query_input (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
-            corrs_pred (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
-        
-        Returns:
-            torch.Tensor: 예측된 7-DoF 파라미터 (B*N, 7)
-                         [..., :4] = quaternion (w, x, y, z) 또는 (x, y, z, w)
-                         [..., 4:] = translation (x, y, z)
-        """
-        
-        # 1. Global Feature (enc_out) 처리
-        # (B*N, C, H, W) -> (B*N, C, 1, 1) -> (B*N, C)
-        x_global = self.regressor.flatten(self.regressor.avgpool(enc_out))
-        
-        # 2. Local Feature (corrs_emb) 처리 (✨ z' 추가 ✨)
-        
-        # (u,v)와 (u',v',z') 결합
-        # [수정] corrs_pred_3d에서 (u',v')와 (z') 분리
-        corrs_pred_2d = corrs_pred_3d[..., :2] # (B*N, 200, 2)
-        corrs_pred_z = corrs_pred_3d[..., 2:3] # (B*N, 200, 1)
-        
-        concat_pred_corrs = torch.cat((query_input, corrs_pred_2d), dim=-1) # (B*N, 200, 4) (u,v, u',v')
-        
-        # (u-u')와 (v-v') 차이 벡터 계산 (동일)
-        x_diff = concat_pred_corrs[..., 0] - concat_pred_corrs[..., 2] # u - u'
-        y_diff = concat_pred_corrs[..., 1] - concat_pred_corrs[..., 3] # v - v'
-        concat_pred_corrs_diff = torch.stack([x_diff, y_diff], dim=2)  # (B*N, 200, 2)
-        
-        # [수정] (u,v, u',v', u-u', v-v') + (z') + (z') = 8D
-        # (u,v), (u',v',z'), (u-u'), (v-v'), (z') -> 8D
-        corrs_emb = torch.cat(
-            (query_input,           # (B*N, 200, 2)
-             corrs_pred_3d,         # (B*N, 200, 3)
-             concat_pred_corrs_diff, # (B*N, 200, 2)
-             corrs_pred_z),          # (B*N, 200, 1) -> z'를 한 번 더 넣어줌 (중요도 강조)
-            dim=-1
-        ) # (B*N, 200, 8)
-        
-        # MLP 입력을 위해 (B*N, 200, 8) -> (B*N, 200 * 8)
-        y_local_flat = corrs_emb.view(corrs_emb.size(0), -1) # (B*N, 1600)
-        
-        # 3. Regressor 호출 (동일)
-        pred_rot, pred_trans = self.regressor(x_global, y_local_flat)
-        
-        # 4. 결과 결합 (동일)
-        pred_delta_7dof = torch.cat([pred_rot, pred_trans], dim=1)
-        
-        return pred_delta_7dof
+                    enc_out: torch.Tensor, 
+                    query_input: torch.Tensor, 
+                    corrs_pred_3d: torch.Tensor) -> torch.Tensor:
+            """
+            Args:
+                enc_out (torch.Tensor): (B*N, C, H, W) e.g., (B*N, 312, 12, 64)
+                query_input (torch.Tensor): (B*N, N_kp, 2) (u: [0, 0.5], v: [0, 1])
+                corrs_pred_3d (torch.Tensor): (B*N, N_kp, 3) (u': [0.5, 1], v': [0, 1], z': [0, 80])
+            ...
+            """
+            
+            # 1. Global Feature (enc_out) 처리 (동일)
+            x_global = self.regressor.flatten(self.regressor.avgpool(enc_out))
+            
+            # --- 2. Local Feature (corrs_emb) 처리 (✨ [0, 1] 정규화 ✨) ---
+            
+            # 2a. 입력 텐서 분리
+            query_u = query_input[..., 0:1] # (B*N, 200, 1) - [0, 0.5]
+            query_v = query_input[..., 1:2] # (B*N, 200, 1) - [0, 1]
+            
+            corrs_u_prime = corrs_pred_3d[..., 0:1] # (B*N, 200, 1) - [0.5, 1]
+            corrs_v_prime = corrs_pred_3d[..., 1:2] # (B*N, 200, 1) - [0, 1]
+            corrs_z_prime = corrs_pred_3d[..., 2:3] # (B*N, 200, 1) - [0, 80]
+
+            # 2b. 모든 입력을 [0, 1] 범위로 정규화
+            # [0, 0.5]  -> [0, 1]  (x * 2.0)
+            query_u_norm = query_u * 2.0
+            
+            # [0.5, 1]  -> [0, 1]  ( (x - 0.5) * 2.0 )
+            corrs_u_prime_norm = (corrs_u_prime - 0.5) * 2.0
+            
+            # [0, 1]    -> [0, 1]  (변경 없음)
+            query_v_norm = query_v
+            corrs_v_prime_norm = corrs_v_prime
+            
+            # [0, 80]   -> [0, 1]  (x / 80.0)
+            corrs_z_prime_norm = corrs_z_prime / 80.0
+
+            # 2c. [0, 1] 정규화된 좌표로 차이(diff) 벡터 계산
+            # (u - u')와 (v - v') 차이 벡터
+            x_diff = query_u_norm - corrs_u_prime_norm # [0, 1] - [0, 1] -> [-1, 1]
+            y_diff = query_v_norm - corrs_v_prime_norm # [0, 1] - [0, 1] -> [-1, 1]
+            
+            # diff 벡터도 [0, 1] 범위로 스케일링
+            x_diff_norm = (x_diff + 1.0) / 2.0 # [-1, 1] -> [0, 2] -> [0, 1]
+            y_diff_norm = (y_diff + 1.0) / 2.0 # [-1, 1] -> [0, 2] -> [0, 1]
+            
+            concat_pred_corrs_diff_norm = torch.cat([x_diff_norm, y_diff_norm], dim=-1) # (B*N, 200, 2)
+            
+            # 2d. [0, 1]로 정규화된 모든 특징 결합
+            # (u,v) + (u',v') + (z') + (u-u')_norm + (v-v')_norm -> 7D
+            corrs_emb = torch.cat(
+                (query_u_norm,              # (B*N, 200, 1)
+                query_v_norm,              # (B*N, 200, 1)
+                corrs_u_prime_norm,        # (B*N, 200, 1)
+                corrs_v_prime_norm,        # (B*N, 200, 1)
+                corrs_z_prime_norm,        # (B*N, 200, 1)
+                concat_pred_corrs_diff_norm),# (B*N, 200, 2)
+                dim=-1
+            ) # (B*N, 200, 7)
+            
+            # MLP 입력을 위해 (B*N, 200, 7) -> (B*N, 200 * 7)
+            y_local_flat = corrs_emb.view(corrs_emb.size(0), -1) # (B*N, 1400)
+            
+            # 3. Regressor 호출 (동일)
+            pred_rot, pred_trans = self.regressor(x_global, y_local_flat)
+            
+            # 4. 결과 결합 (동일)
+            pred_delta_6dof = torch.cat([pred_rot, pred_trans], dim=1)
+            
+            return pred_delta_6dof
