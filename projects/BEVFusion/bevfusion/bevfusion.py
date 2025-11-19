@@ -734,10 +734,62 @@ class BEVFusion(Base3DDetector):
 
     #     return x, raw_img_feature,lidar2image, camera_intrinsics, camera2lidar
     
+    # def extract_sbs_img(
+    #     self,
+    #     batch_inputs_dict,
+    #     batch_input_metas,
+    #     visualize=False,
+    #     **kwargs,
+    # ):
+    #     imgs = batch_inputs_dict.get('img_original', None)
+    #     points = batch_inputs_dict.get('perturbed_points', None)
+        
+    #     if imgs is not None:
+    #         imgs = imgs.contiguous()
+    #         lidar_depth_mis, lidar_depth_gt = [], []
+    #         for i, meta in enumerate(batch_input_metas):
+    #             lidar_depth_mis.append(meta['lidar_depth_mis'])
+    #             lidar_depth_gt.append(meta['lidar_depth_gt'])
+
+    #         lidar_depth_mis = imgs.new_tensor(np.asarray(lidar_depth_mis))
+    #         lidar_depth_gt = imgs.new_tensor(np.asarray(lidar_depth_gt))
+
+    #         dense_depth_map_mis = dense_map_from_depth_batch_v2(lidar_depth_mis,grid=3,iterations=3)
+    #         dense_depth_img_mis = dense_depth_map_mis.to(dtype=torch.uint8)
+    #         dense_depth_img_color_mis = batch_colormap(dense_depth_img_mis)
+
+    #         dense_depth_map = dense_map_from_depth_batch_v2(lidar_depth_gt,grid=3,iterations=3)
+    #         # dense_depth_img = dense_depth_map.to(dtype=torch.uint8)
+    #         # dense_depth_img_color = batch_colormap(dense_depth_img)
+
+    #         # 픽셀 값을 0.0 ~ 1.0 범위로 정규화하여 imshow가 올바르게 표시하도록 함
+    #         img_min, img_max = imgs.min(), imgs.max()
+    #         imgs = (imgs - img_min) / (img_max - img_min + 1e-8) # 0으로 나누는 것 방지
+
+    #         N, V, C, H, W = imgs.shape
+    #         imgs_reshaped = imgs.view(N * V, C, H, W)
+    #         depth_reshaped_mis = dense_depth_img_color_mis.view(N * V, C, H, W)
+
+    #         img_resized = F.interpolate(imgs_reshaped, size=[192, 640], mode="bilinear")
+    #         lidar_depth_mis_resized = F.interpolate(depth_reshaped_mis, size=[192, 640], mode="bilinear")
+
+    #         sbs_img = two_images_side_by_side_gpu(img_resized, lidar_depth_mis_resized)
+    #         sbs_img = sbs_img.permute(0,3,1,2)
+    #         sbs_img = tvtf.normalize(sbs_img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    #         sbs_img = sbs_img.view(N, V, C, 192, 640*2)
+
+    #         # ############## input display ##########################
+    #         if visualize and sbs_img is not None:
+    #             display_depth_maps(imgs,dense_depth_img_color_mis,sbs_img)
+    #             print("input dispaly end")
+        
+    #     return sbs_img, points ,dense_depth_map_mis,dense_depth_map
+    
     def extract_sbs_img(
         self,
         batch_inputs_dict,
-        batch_input_metas,
+        lidar_depth_mis,
+        lidar_depth_gt,
         visualize=False,
         **kwargs,
     ):
@@ -746,14 +798,6 @@ class BEVFusion(Base3DDetector):
         
         if imgs is not None:
             imgs = imgs.contiguous()
-            lidar_depth_mis, lidar_depth_gt = [], []
-            for i, meta in enumerate(batch_input_metas):
-                lidar_depth_mis.append(meta['lidar_depth_mis'])
-                lidar_depth_gt.append(meta['lidar_depth_gt'])
-
-            lidar_depth_mis = imgs.new_tensor(np.asarray(lidar_depth_mis))
-            lidar_depth_gt = imgs.new_tensor(np.asarray(lidar_depth_gt))
-
             dense_depth_map_mis = dense_map_from_depth_batch_v2(lidar_depth_mis,grid=3,iterations=3)
             dense_depth_img_mis = dense_depth_map_mis.to(dtype=torch.uint8)
             dense_depth_img_color_mis = batch_colormap(dense_depth_img_mis)
@@ -1904,6 +1948,8 @@ class BEVFusion(Base3DDetector):
             original_camera2lidar = torch.stack([s.camera2lidar for s in batch_data_samples]).to(target_device)
             gt_delta_rot = torch.stack([s.gt_delta_rot for s in batch_data_samples]).to(target_device)
             gt_delta_trans = torch.stack([s.gt_delta_trans for s in batch_data_samples]).to(target_device)
+            lidar_depth_gt = torch.stack([s.lidar_depth_gt for s in batch_data_samples]).to(target_device)
+            lidar_depth_mis = torch.stack([s.lidar_depth_mis for s in batch_data_samples]).to(target_device)
 
             img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
 
@@ -1955,168 +2001,168 @@ class BEVFusion(Base3DDetector):
             else:
                 query_input_bbox_centers = torch.stack([q_x, q_y], dim=-1)
 
-            # --- 3. SBS 이미지 및 깊이 맵 생성 (공통) ---
-            sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
-            B,N,C,H,W = sbs_img.shape
-            d_model = 312
-            feat_h, feat_w = 12, 64
+            # # --- 3. SBS 이미지 및 깊이 맵 생성 (공통) ---
+            # sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(batch_inputs_dict,lidar_depth_mis,lidar_depth_gt,visualize=False)
+            # B,N,C,H,W = sbs_img.shape
+            # d_model = 312
+            # feat_h, feat_w = 12, 64
 
-            if batch_data_samples[0].matched_uvset is not None and self.training: # 학습 시에만 실행
-            # --- ✨ [NEW] Task A: Corr 네트워크 학습 (mv2d reference code 삽입) ---
-                uv_set = batch_data_samples[0].matched_uvset.to(target_device)
-                    # (mv2d ref) 랜덤 대응점 GT 준비
-                trimed_uvset = batched_trim_corrs(uv_set).to(dtype=torch.float32, device=target_device)
+            # if batch_data_samples[0].matched_uvset is not None and self.training: # 학습 시에만 실행
+            # # --- ✨ [NEW] Task A: Corr 네트워크 학습 (mv2d reference code 삽입) ---
+            #     uv_set = batch_data_samples[0].matched_uvset.to(target_device)
+            #         # (mv2d ref) 랜덤 대응점 GT 준비
+            #     trimed_uvset = batched_trim_corrs(uv_set).to(dtype=torch.float32, device=target_device)
                 
-                # (mv2d ref) Task A 쿼리 (랜덤 포인트)
-                query_input_random = trimed_uvset[..., :2]
-                query_input_random[..., 0] /= batch_data_samples[0].img_shape[1]  # img.shape[3] = 1600
-                query_input_random[..., 1] /= batch_data_samples[0].img_shape[0]  # sbs_img.shape[2] =900
-                query_input_random[:,:,0] = query_input_random[:,:,0]/2
-                query_input_random[:,:,1] = query_input_random[:,:,1]
+            #     # (mv2d ref) Task A 쿼리 (랜덤 포인트)
+            #     query_input_random = trimed_uvset[..., :2]
+            #     query_input_random[..., 0] /= batch_data_samples[0].img_shape[1]  # img.shape[3] = 1600
+            #     query_input_random[..., 1] /= batch_data_samples[0].img_shape[0]  # sbs_img.shape[2] =900
+            #     query_input_random[:,:,0] = query_input_random[:,:,0]/2
+            #     query_input_random[:,:,1] = query_input_random[:,:,1]
 
-                # (mv2d ref) Task A 타겟 (랜덤 포인트)
-                corr_target_random = trimed_uvset[...,2:]
-                corr_target_random[...,0] = corr_target_random[...,0] / batch_data_samples[0].img_shape[1]
-                corr_target_random[...,1] = corr_target_random[...,1] / batch_data_samples[0].img_shape[0]
-                corr_target_random[:,:,0] = corr_target_random[:,:,0]/2 + 0.5
-                corr_target_random[:,:,1] = corr_target_random[:,:,1]
+            #     # (mv2d ref) Task A 타겟 (랜덤 포인트)
+            #     corr_target_random = trimed_uvset[...,2:]
+            #     corr_target_random[...,0] = corr_target_random[...,0] / batch_data_samples[0].img_shape[1]
+            #     corr_target_random[...,1] = corr_target_random[...,1] / batch_data_samples[0].img_shape[0]
+            #     corr_target_random[:,:,0] = corr_target_random[:,:,0]/2 + 0.5
+            #     corr_target_random[:,:,1] = corr_target_random[:,:,1]
                 
-                # (mv2d ref) Task A 실행
-                # (주의: sbs_img, query_input_random의 B, N 차원이 맞아야 함)
-                sbs_img_flat = sbs_img.view(B*N, C, H, W)
-                raw_corrs_rand, cycle_rand, corr_mask_rand, enc_out_rand = self.corr(sbs_img_flat, query_input_random)
+            #     # (mv2d ref) Task A 실행
+            #     # (주의: sbs_img, query_input_random의 B, N 차원이 맞아야 함)
+            #     sbs_img_flat = sbs_img.view(B*N, C, H, W)
+            #     raw_corrs_rand, cycle_rand, corr_mask_rand, enc_out_rand = self.corr(sbs_img_flat, query_input_random)
 
-                # (mv2d ref) Task A 로스 계산
-                loss_corr = self.corr_loss(raw_corrs_rand, corr_target_random, cycle_rand, query_input_random, corr_mask_rand)
+            #     # (mv2d ref) Task A 로스 계산
+            #     loss_corr = self.corr_loss(raw_corrs_rand, corr_target_random, cycle_rand, query_input_random, corr_mask_rand)
                 
-                # ✨ [중요] 로스 가중치를 적용하여 서열 정리
-                losses['loss_corr'] = loss_corr * 1000.0 # (예시: 대응점 학습에 높은 가중치 부여)
+            #     # ✨ [중요] 로스 가중치를 적용하여 서열 정리
+            #     losses['loss_corr'] = loss_corr * 1000.0 # (예시: 대응점 학습에 높은 가중치 부여)
             
-                # (u', v') 정규화 좌표 -> (u', v') 픽셀 좌표 변환
-                r_x_rand = (raw_corrs_rand[..., 0] - 0.5) * 2 * 1600 
-                r_y_rand = raw_corrs_rand[..., 1] * 900
-                uv_pixels_rand = torch.stack([r_x_rand, r_y_rand], dim=-1) # [B*N, Q, 2]
+            #     # (u', v') 정규화 좌표 -> (u', v') 픽셀 좌표 변환
+            #     r_x_rand = (raw_corrs_rand[..., 0] - 0.5) * 2 * 1600 
+            #     r_y_rand = raw_corrs_rand[..., 1] * 900
+            #     uv_pixels_rand = torch.stack([r_x_rand, r_y_rand], dim=-1) # [B*N, Q, 2]
                 
-                # "문제지" (BROKEN) - Z-Est는 내부적으로 사용 안 함 (학습용)
-                depth_map_reshaped_BROKEN = dense_depth_map.view(B * N, 900, 1600)
+            #     # "문제지" (BROKEN) - Z-Est는 내부적으로 사용 안 함 (학습용)
+            #     depth_map_reshaped_BROKEN = dense_depth_map.view(B * N, 900, 1600)
                 
-                # ZEstimator 호출 (Task A의 결과물 사용)
-                esitmated_z_rand = self.z_estimator(
-                    uv_sbs_normalized=raw_corrs_rand,
-                    uv_orig_pixels=uv_pixels_rand,
-                    depth_map=depth_map_reshaped_BROKEN, # "문제지" 전달
-                    enc_out=enc_out_rand
-                )
-                z_estimated_rand = esitmated_z_rand['z_estimated_real'] # [B*N, Q, 1]
+            #     # ZEstimator 호출 (Task A의 결과물 사용)
+            #     esitmated_z_rand = self.z_estimator(
+            #         uv_sbs_normalized=raw_corrs_rand,
+            #         uv_orig_pixels=uv_pixels_rand,
+            #         depth_map=depth_map_reshaped_BROKEN, # "문제지" 전달
+            #         enc_out=enc_out_rand
+            #     )
+            #     z_estimated_rand = esitmated_z_rand['z_estimated_real'] # [B*N, Q, 1]
 
-                # "정답지" (TRUE) 준비
-                depth_map_reshaped_TRUE = dense_depth_map_gt.view(B * N, 900, 1600)
+            #     # "정답지" (TRUE) 준비
+            #     depth_map_reshaped_TRUE = dense_depth_map_gt.view(B * N, 900, 1600)
                 
-                # GT 샘플링
-                num_active_rand, Q_rand, _ = uv_pixels_rand.shape
-                H_gt, W_gt = 900, 1600
-                uv_orig_flat_rand = uv_pixels_rand.view(-1, 2)
-                cam_ids_flat_rand = torch.arange(num_active_rand, device=target_device).unsqueeze(1).expand(num_active_rand, Q_rand).reshape(-1)
-                u_coords_flat_rand = uv_orig_flat_rand[:, 0].round().long().clamp(0, W_gt - 1)
-                v_coords_flat_rand = uv_orig_flat_rand[:, 1].round().long().clamp(0, H_gt - 1)
+            #     # GT 샘플링
+            #     num_active_rand, Q_rand, _ = uv_pixels_rand.shape
+            #     H_gt, W_gt = 900, 1600
+            #     uv_orig_flat_rand = uv_pixels_rand.view(-1, 2)
+            #     cam_ids_flat_rand = torch.arange(num_active_rand, device=target_device).unsqueeze(1).expand(num_active_rand, Q_rand).reshape(-1)
+            #     u_coords_flat_rand = uv_orig_flat_rand[:, 0].round().long().clamp(0, W_gt - 1)
+            #     v_coords_flat_rand = uv_orig_flat_rand[:, 1].round().long().clamp(0, H_gt - 1)
 
-                z_lidar_sparse_gt_TRUE_flat_rand = depth_map_reshaped_TRUE[cam_ids_flat_rand, v_coords_flat_rand, u_coords_flat_rand]
-                z_lidar_sparse_gt_TRUE_rand = z_lidar_sparse_gt_TRUE_flat_rand.view(num_active_rand, Q_rand)
+            #     z_lidar_sparse_gt_TRUE_flat_rand = depth_map_reshaped_TRUE[cam_ids_flat_rand, v_coords_flat_rand, u_coords_flat_rand]
+            #     z_lidar_sparse_gt_TRUE_rand = z_lidar_sparse_gt_TRUE_flat_rand.view(num_active_rand, Q_rand)
 
-                # Z-Estimator 손실 계산 (랜덤 포인트 기준)
-                valid_mask_rand = (z_lidar_sparse_gt_TRUE_rand > 0)
-                if valid_mask_rand.any():
-                    loss_z_estimation = F.smooth_l1_loss(
-                                        z_estimated_rand.squeeze(-1)[valid_mask_rand],
-                                        z_lidar_sparse_gt_TRUE_rand[valid_mask_rand],
-                                        reduction='mean',
-                                        beta=1.0
-                                    )
-                    # ✨ 가중치 적용 (예: 1.0 또는 0.1)
-                    losses['loss_z_estimation'] = loss_z_estimation * 1.0 
-                else:
-                    losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device)
+            #     # Z-Estimator 손실 계산 (랜덤 포인트 기준)
+            #     valid_mask_rand = (z_lidar_sparse_gt_TRUE_rand > 0)
+            #     if valid_mask_rand.any():
+            #         loss_z_estimation = F.smooth_l1_loss(
+            #                             z_estimated_rand.squeeze(-1)[valid_mask_rand],
+            #                             z_lidar_sparse_gt_TRUE_rand[valid_mask_rand],
+            #                             reduction='mean',
+            #                             beta=1.0
+            #                         )
+            #         # ✨ 가중치 적용 (예: 1.0 또는 0.1)
+            #         losses['loss_z_estimation'] = loss_z_estimation * 1.0 
+            #     else:
+            #         losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device)
                 
-                z_hybrid = esitmated_z_rand['depth'] # Teacher-Forcing용 'depth' 사용
-                corrs_3d_hybrid = torch.cat([raw_corrs_rand, z_hybrid], dim=-1)             
-                pred_delta_6dof_random = self.calib_head(
-                    enc_out_rand, 
-                    query_input_random, 
-                    corrs_3d_hybrid,
-                    # ✨[제안] 여기에도 FPN 특징을 추가로 전달하면
-                    # calib_head의 정체 현상을 더 확실히 풀 수 있습니다.
-                    # fpn_feats=img_feats[active_cam_indices]
-                )
-                # (기존) Calib-Head Loss 계산
-                pred_rot_random = pred_delta_6dof_random[..., :3]
-                pred_trans_random = pred_delta_6dof_random[..., 3:]
-                R_pred_calib = axis_angle_to_matrix(pred_rot_random)
-                R_gt_calib = axis_angle_to_matrix(gt_delta_rot.squeeze(0))
+            #     z_hybrid = esitmated_z_rand['depth'] # Teacher-Forcing용 'depth' 사용
+            #     corrs_3d_hybrid = torch.cat([raw_corrs_rand, z_hybrid], dim=-1)             
+            #     pred_delta_6dof_random = self.calib_head(
+            #         enc_out_rand, 
+            #         query_input_random, 
+            #         corrs_3d_hybrid,
+            #         # ✨[제안] 여기에도 FPN 특징을 추가로 전달하면
+            #         # calib_head의 정체 현상을 더 확실히 풀 수 있습니다.
+            #         # fpn_feats=img_feats[active_cam_indices]
+            #     )
+            #     # (기존) Calib-Head Loss 계산
+            #     pred_rot_random = pred_delta_6dof_random[..., :3]
+            #     pred_trans_random = pred_delta_6dof_random[..., 3:]
+            #     R_pred_calib = axis_angle_to_matrix(pred_rot_random)
+            #     R_gt_calib = axis_angle_to_matrix(gt_delta_rot.squeeze(0))
                 
-                # ✨ 가중치 조절
-                losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 2.0
-                losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_random, gt_delta_trans.squeeze(0), reduction='mean') * 1.0
+            #     # ✨ 가중치 조절
+            #     losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 2.0
+            #     losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_random, gt_delta_trans.squeeze(0), reduction='mean') * 1.0
 
-            else:
-                losses['loss_corr'] = torch.tensor(0.0, device=target_device)
-                losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device) # Z-Est 로스도 0으로 초기화
-                losses['loss_calib_rot'] = torch.tensor(0.0, device=target_device, requires_grad=True)
-                losses['loss_calib_trans'] = torch.tensor(0.0, device=target_device, requires_grad=True)
+            # else:
+            #     losses['loss_corr'] = torch.tensor(0.0, device=target_device)
+            #     losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device) # Z-Est 로스도 0으로 초기화
+            #     losses['loss_calib_rot'] = torch.tensor(0.0, device=target_device, requires_grad=True)
+            #     losses['loss_calib_trans'] = torch.tensor(0.0, device=target_device, requires_grad=True)
 
-            # --- 5. ✨ [Task B] Downstream 태스크 (Z-Est, Calib) (기존 로직) ---
+            # # --- 5. ✨ [Task B] Downstream 태스크 (Z-Est, Calib) (기존 로직) ---
         
-            # (기존) 텐서 초기화
-            raw_corrs_shape = (B * N, query_input_bbox_centers.shape[1], query_input_bbox_centers.shape[2])
-            enc_out_shape = (B * N, feat_h * feat_w, d_model)
-            esitmated_uvz_shape = (B * N, query_input_bbox_centers.shape[1], 3)
+            # # (기존) 텐서 초기화
+            # raw_corrs_shape = (B * N, query_input_bbox_centers.shape[1], query_input_bbox_centers.shape[2])
+            # enc_out_shape = (B * N, feat_h * feat_w, d_model)
+            # esitmated_uvz_shape = (B * N, query_input_bbox_centers.shape[1], 3)
             
-            raw_corrs = torch.zeros(raw_corrs_shape, device=target_device)
-            enc_out = torch.zeros(enc_out_shape, device=target_device)
-            esitmated_uvz = torch.zeros(esitmated_uvz_shape, device=target_device)
+            # raw_corrs = torch.zeros(raw_corrs_shape, device=target_device)
+            # enc_out = torch.zeros(enc_out_shape, device=target_device)
+            # esitmated_uvz = torch.zeros(esitmated_uvz_shape, device=target_device)
 
-            # (기존) 2D Bbox가 감지된 카메라에 대해서만 Task B 실행
-            if len(active_cam_indices) > 0:
-                sbs_img_filtered = sbs_img[:, active_cam_indices]
-                query_input_filtered = query_input_bbox_centers[active_cam_indices] # Bbox 중심점 쿼리 사용
+            # # (기존) 2D Bbox가 감지된 카메라에 대해서만 Task B 실행
+            # if len(active_cam_indices) > 0:
+            #     sbs_img_filtered = sbs_img[:, active_cam_indices]
+            #     query_input_filtered = query_input_bbox_centers[active_cam_indices] # Bbox 중심점 쿼리 사용
                 
-                num_active_cams = sbs_img_filtered.shape[1]
-                sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
+            #     num_active_cams = sbs_img_filtered.shape[1]
+            #     sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
                 
-                # (기존) Task B 실행
-                # ✨[MTL] self.corr는 이제 Task A의 loss_corr에서도 그래디언트를 받음
-                raw_corrs_active, cycle, corr_mask, enc_out_active_4d = self.corr(sbs_view, query_input_filtered)
+            #     # (기존) Task B 실행
+            #     # ✨[MTL] self.corr는 이제 Task A의 loss_corr에서도 그래디언트를 받음
+            #     raw_corrs_active, cycle, corr_mask, enc_out_active_4d = self.corr(sbs_view, query_input_filtered)
 
-                b_act, c_f, h_f, w_f = enc_out_active_4d.shape
-                enc_out_active_3d = enc_out_active_4d.flatten(2).permute(0, 2, 1)
+            #     b_act, c_f, h_f, w_f = enc_out_active_4d.shape
+            #     enc_out_active_3d = enc_out_active_4d.flatten(2).permute(0, 2, 1)
                 
-                # (기존) Z-Estimator 로직
-                r_x = (raw_corrs_active[..., 0] - 0.5) * 2 * 1600 
-                r_y = raw_corrs_active[..., 1] * 900
-                uv_pixels_from_corr = torch.stack([r_x, r_y], dim=-1)
+            #     # (기존) Z-Estimator 로직
+            #     r_x = (raw_corrs_active[..., 0] - 0.5) * 2 * 1600 
+            #     r_y = raw_corrs_active[..., 1] * 900
+            #     uv_pixels_from_corr = torch.stack([r_x, r_y], dim=-1)
                 
-                depth_map_reshaped_BROKEN = dense_depth_map.view(B * N, 900, 1600)
-                depth_map_active_BROKEN = depth_map_reshaped_BROKEN[active_cam_indices]
+            #     depth_map_reshaped_BROKEN = dense_depth_map.view(B * N, 900, 1600)
+            #     depth_map_active_BROKEN = depth_map_reshaped_BROKEN[active_cam_indices]
 
-                with torch.no_grad(): # ✨ Calib-Head 학습에 Z-Est가 영향 주지 않도록 no_grad
-                    esitmated_z_active = self.z_estimator(
-                        uv_sbs_normalized=raw_corrs_active,
-                        uv_orig_pixels=uv_pixels_from_corr,
-                        depth_map=depth_map_active_BROKEN,
-                        enc_out=enc_out_active_4d
-                    )
+            #     with torch.no_grad(): # ✨ Calib-Head 학습에 Z-Est가 영향 주지 않도록 no_grad
+            #         esitmated_z_active = self.z_estimator(
+            #             uv_sbs_normalized=raw_corrs_active,
+            #             uv_orig_pixels=uv_pixels_from_corr,
+            #             depth_map=depth_map_active_BROKEN,
+            #             enc_out=enc_out_active_4d
+            #         )
                 
-                # (기존) 텐서 인덱싱
-                if B == 1:
-                    raw_corrs[active_cam_indices] = raw_corrs_active
-                    enc_out[active_cam_indices] = enc_out_active_3d
-                    esitmated_uvz_active = torch.cat(
-                        [uv_pixels_from_corr, esitmated_z_active['depth']], dim=-1
-                    )
-                    esitmated_uvz[active_cam_indices] = esitmated_uvz_active
+            #     # (기존) 텐서 인덱싱
+            #     if B == 1:
+            #         raw_corrs[active_cam_indices] = raw_corrs_active
+            #         enc_out[active_cam_indices] = enc_out_active_3d
+            #         esitmated_uvz_active = torch.cat(
+            #             [uv_pixels_from_corr, esitmated_z_active['depth']], dim=-1
+            #         )
+            #         esitmated_uvz[active_cam_indices] = esitmated_uvz_active
             
-            enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
-            pred_delta_rot = pred_rot_random
-            pred_delta_trans = pred_trans_random
+            # enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
+            # pred_delta_rot = pred_rot_random
+            # pred_delta_trans = pred_trans_random
 
             # # ##### 검증용 display ######
             # from .imageprocessing_unit import draw_correspondences
@@ -2152,7 +2198,6 @@ class BEVFusion(Base3DDetector):
             #         )
             #     print ("end")
    
-
             #### 1st stage end - 2nd stage start ################
             # corrected_calib_dict = self._get_corrected_calib_from_prediction(
             #                 pred_delta_rot,
