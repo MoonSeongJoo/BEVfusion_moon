@@ -1833,6 +1833,7 @@ class BEVFusion(Base3DDetector):
 
                 # 3. ZEstimator의 "예측"만 가져옴 - 학습시는 예측값만 사용 
                 z_estimated_active = esitmated_z_active['z_estimated_real'] # [NumActive, Q, 1]
+                z_estimated_hybrid = esitmated_z_active['depth']
 
                 # 4. 🚨 "정답지" (TRUE) 준비: Dilation 코드 모두 삭제 (롤백)
                 depth_map_reshaped_TRUE = dense_depth_map_gt.view(B * N, 900, 1600)
@@ -1869,7 +1870,7 @@ class BEVFusion(Base3DDetector):
                 # raw_corrs_active: (NumActive, Q, 2)
                 # z_estimated_active: (NumActive, Q, 1)
                 # -> (u', v', z') 3D 대응점 생성
-                corrs_3d_active = torch.cat([raw_corrs_active, z_estimated_active], dim=-1) # (NumActive, Q, 3)
+                corrs_3d_active = torch.cat([raw_corrs_active, z_estimated_hybrid], dim=-1) # (NumActive, Q, 3)
 
                 pred_delta_6dof_active = self.calib_head(
                     enc_out_active_4d, 
@@ -1905,39 +1906,39 @@ class BEVFusion(Base3DDetector):
             pred_delta_rot = pred_delta_6dof[..., :3]
             pred_delta_trans = pred_delta_6dof[..., 3:]
 
-            # # ##### 검증용 display ######
-            # from .imageprocessing_unit import draw_correspondences
-            # # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
-            # pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
-            # # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
-            # self.vis_step_counter += 1
-            # for cid in range(6):
-            #     # idx = id_to_idx[cid.item()]
-            #     # draw_correspondences(
-            #     #     trimed_corrs = gt_corrs[cid][:10,...],  # 첫 번째 배치 선택
-            #     #     sbs_img=sbs_img[cid],
-            #     #     save_path='correspondence_visualization_gt.jpg'
-            #     # )
-            #     bboxes_for_this_view = detections_2d_orig_coords[cid]
-            #     draw_correspondences(
-            #         trimed_corrs = pred_corrs[cid][:3,...],  # 첫 번째 배치 선택
-            #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
-            #         save_path='correspondence_visualization_pred.jpg',
-            #         bboxes_to_draw = bboxes_for_this_view, # 원본 좌표계 BBox 전달
-            #         score_thr = 0.4
-            #     )
-            #     # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
-            #     save_batch_predictions_to_file(
-            #             batch_inputs_dict=batch_inputs_dict,
-            #             reshaped_data_samples=reshaped_data_samples,
-            #             augmented_preds_list=detections_2d,
-            #             original_preds_list=detections_2d_orig_coords,
-            #             current_step=self.vis_step_counter,
-            #             save_dir='work_dirs/my_exp/vis_results',
-            #             view_index=cid, # 루프 변수 cid를 view_index로 사용
-            #             score_thr=0.4
-            #         )
-            #     print ("end")
+            # ##### 검증용 display ######
+            from .imageprocessing_unit import draw_correspondences
+            # gt_corrs = torch.cat([query_input,corr_target],dim=-1)
+            pred_corrs = torch.cat([query_input,raw_corrs],dim=-1)
+            # vis_step_counter는 __init__에서 0으로 초기화 되어야 합니다.
+            self.vis_step_counter += 1
+            for cid in range(6):
+                # idx = id_to_idx[cid.item()]
+                # draw_correspondences(
+                #     trimed_corrs = gt_corrs[cid][:10,...],  # 첫 번째 배치 선택
+                #     sbs_img=sbs_img[cid],
+                #     save_path='correspondence_visualization_gt.jpg'
+                # )
+                bboxes_for_this_view = detections_2d_orig_coords[cid]
+                draw_correspondences(
+                    trimed_corrs = pred_corrs[cid][:3,...],  # 첫 번째 배치 선택
+                    sbs_img=sbs_img.view(B*N,C,H,W)[cid],
+                    save_path='correspondence_visualization_pred.jpg',
+                    bboxes_to_draw = bboxes_for_this_view, # 원본 좌표계 BBox 전달
+                    score_thr = 0.4
+                )
+                # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
+                save_batch_predictions_to_file(
+                        batch_inputs_dict=batch_inputs_dict,
+                        reshaped_data_samples=reshaped_data_samples,
+                        augmented_preds_list=detections_2d,
+                        original_preds_list=detections_2d_orig_coords,
+                        current_step=self.vis_step_counter,
+                        save_dir='work_dirs/my_exp/vis_results',
+                        view_index=cid, # 루프 변수 cid를 view_index로 사용
+                        score_thr=0.4
+                    )
+                print ("end")
 
             corrected_calib_dict = self._get_corrected_calib_from_prediction(
                             pred_delta_rot,

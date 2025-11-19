@@ -153,7 +153,8 @@ model = dict(
         # 가중치 파일이 있다면 아래와 같이 설정합니다.
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='data/weights/backbone_base_corr_rev5.0_corrected.pth' # 예시 경로
+            # checkpoint='data/weights/backbone_base_corr_rev5.0_corrected.pth' # 예시 경로
+            checkpoint='data/work_dirs/extracted_backbones2/corr_pretrained.pth' # 예시 경로
             # checkpoint=None # 가중치 로딩이 필요 없을 경우
         )
     ),
@@ -477,9 +478,9 @@ optim_wrapper = dict(
         custom_keys={
             # 이미지 백본은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
-            'z_estimator': dict(lr_mult=10), # z_estimator의 학습률만 10배로
-            # 'img_neck'  :dict(lr_mult=1.0, decay_mult=1.0),
-            # 'img_bbox_head': dict(lr_mult=1.0, decay_mult=1.0),
+            # 'z_estimator': dict(lr_mult=1.0), # z_estimator의 학습률만 10배로
+            'img_neck'  :dict(lr_mult=0.1, decay_mult=1.0),
+            'img_bbox_head': dict(lr_mult=0.1, decay_mult=1.0),
             # corr 모듈은 사전 학습된 가중치를 사용하므로, 더 작은 학습률로 미세 조정합니다.
             # 'corr': dict(lr_mult=0.1, decay_mult=1.0),
             # # pts_backbone
@@ -524,8 +525,8 @@ default_hooks = dict(
     ))
 del _base_.custom_hooks
 
-# load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-load_from =  "data/work_dirs/bevfusion/20251112_zestimator_refine_v4/iter_24000.pth"
+load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
+# load_from =  "data/work_dirs/bevfusion/20251112_zestimator_refine_v4/iter_24000.pth"
 # load_from = None
 resume_from = None
 
