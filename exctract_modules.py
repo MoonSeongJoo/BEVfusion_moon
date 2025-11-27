@@ -5,10 +5,10 @@ from collections import OrderedDict
 # --- 1. 설정: 이 부분만 수정하세요 ---
 
 # 불러올 원본 BEVFusion 체크포인트 파일 경로
-FULL_CHECKPOINT_PATH = "data/work_dirs/bevfusion/20251118_corr_e2e_1st_stage/iter_18000.pth"
+FULL_CHECKPOINT_PATH = "data/work_dirs/bevfusion/20251118_corr_e2e_1st_stage_v2.0/iter_156000.pth"
 
 # 추출한 파라미터를 저장할 디렉토리
-OUTPUT_DIR = "data/work_dirs/extracted_backbones2"
+OUTPUT_DIR = "data/work_dirs/extracted_backbones5"
 
 # config 파일에 정의된 모듈 이름과 정확히 일치해야 합니다.
 MODULE_PREFIXES_TO_EXTRACT = [
@@ -16,14 +16,15 @@ MODULE_PREFIXES_TO_EXTRACT = [
     # "pts_middle_encoder",
     # "pts_backbone",
     # "pts_neck",
-    # "img_neck",
-    # "img_bbox_head",
-    # "img_backbone",
+    "img_neck",
+    "img_bbox_head",
+    "img_backbone",
     # "pts_voxel_layer"는 일반적으로 학습 가능한 파라미터가 없습니다.
     # 만약 커스텀 VoxelLayer에 파라미터가 있다면 리스트에 추가하세요.
     # "pts_voxel_layer", 
-    # "z_estimator",
+    "z_estimator",
     "corr",
+    "calib_head",
 ]
 
 # -------------------------------------

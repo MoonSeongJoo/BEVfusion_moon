@@ -5469,16 +5469,12 @@ def visualize_full_pipeline(
     )
     fig.colorbar(scatter0, ax=ax0, label='Feature Norm (Strength)')
 
-    # --- ✨✨✨ START: FIX - 시각화 편향 보정 ✨✨✨ ---
-    # '좌하향' 편향(e.g., 피처가 -0.5 셀만큼 밀림)을 보정하기 위해
-    # 쿼리 위치(pos)에 0.5 그리드 셀만큼의 오프셋을 더해줍니다.
     pos_corrected = pos
-    # --- ✨✨✨ END: FIX --- ✨✨✨
-
+ 
     # --- Plot 1: 초기 (LiDAR-Only Queries) ---
     ax1.set_title("1. Initial (LiDAR-Only)")
     ax1.set_facecolor('black')
-    out_size_factor = 4 # Transfusion의 경우
+    out_size_factor = 8 # Transfusion의 경우
     metric_x = pos_corrected[:, 0] * voxel_size[0] * out_size_factor + pc_range[0]
     metric_y = pos_corrected[:, 1] * voxel_size[1] * out_size_factor + pc_range[1]
     scatter1 = ax1.scatter(metric_x, metric_y, c=lidar_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)

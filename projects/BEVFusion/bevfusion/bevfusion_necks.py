@@ -6,6 +6,8 @@ from mmcv.cnn import ConvModule
 from mmengine.model import BaseModule
 
 from mmdet3d.registry import MODELS
+from mmengine.runner import load_checkpoint 
+from mmengine import print_log   
 
 
 @MODELS.register_module()
@@ -23,8 +25,10 @@ class GeneralizedLSSFPN(BaseModule):
             norm_cfg=dict(type='BN2d'),
             act_cfg=dict(type='ReLU'),
             upsample_cfg=dict(mode='bilinear', align_corners=True),
+            init_cfg=None,
     ) -> None:
-        super().__init__()
+        # <-- ✨ 2. super()에 init_cfg 전달
+        super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -73,6 +77,29 @@ class GeneralizedLSSFPN(BaseModule):
 
             self.lateral_convs.append(l_conv)
             self.fpn_convs.append(fpn_conv)
+        
+        # --- ✨ 3. 가중치 수동 로드 로직 (모든 레이어 생성 후) ---
+        if self.init_cfg and self.init_cfg.get('type') == 'Pretrained':
+            checkpoint_path = self.init_cfg.get('checkpoint')
+            if checkpoint_path:
+                print_log(f'Manually loading checkpoint for GeneralizedLSSFPN from: {checkpoint_path}', logger='current')
+                
+                # ⭐️ (중요) 'self' (GeneralizedLSSFPN 인스턴스)에 로드합니다.
+                load_checkpoint(
+                    self, 
+                    checkpoint_path, 
+                    map_location='cpu', 
+                    strict=False, # True로 하면 키가 정확히 일치해야 함
+                    
+                    # ⭐️ (중요) 체크포인트의 접두사에 맞게 수정하세요.
+                    # 예: 체크포인트 키가 'img_neck.lateral_convs...' 라면
+                    revise_keys=[('^img_neck\\.', '')]
+                    # 예: 체크포인트 키가 'neck.lateral_convs...' 라면
+                    # revise_keys=[('^neck\\.', '')]
+                    # 예: 접두사가 없다면 이 'revise_keys' 라인을 삭제하거나 주석 처리
+                )
+            else:
+                print_log('No checkpoint path in init_cfg for GeneralizedLSSFPN.', logger='current', level='WARNING')
 
     def forward(self, inputs):
         """Forward function."""

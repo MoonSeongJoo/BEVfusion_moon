@@ -1448,16 +1448,20 @@ class PointToMultiViewDepth(object):
             miscalibrated_points2img ,perturbed_points, extrinsic_perturb, lidar2img_original ,lidar2img_mis = add_mis_calibration_adv(
                                                                                     lidar2img,lidar2cam,cam2img, points_lidar, max_r=10.0,max_t=0.75)
             
-            # --- ✨ CORRECTED LOGIC V2: 올바른 행렬 곱셈 적용 ---
-            # 1. 'broken_camera2lidar' 계산
+            # # --- ✨ CORRECTED LOGIC V2: 올바른 행렬 곱셈 적용 ---
+            # # 1. 'broken_camera2lidar' 계산
             # ❗️ CRITICAL CHANGE: Perturbation의 '역행렬'을 구합니다.
             try:
                 extrinsic_perturb_inv = torch.linalg.inv(extrinsic_perturb)
             except torch.linalg.LinAlgError:
                 extrinsic_perturb_inv = torch.eye(4, dtype=torch.float32, device=extrinsic_perturb.device)
 
-            # ❗️ CRITICAL CHANGE: T_c2l_broken = inv(T_perturb) @ T_c2l
-            broken_camera2lidar = extrinsic_perturb_inv @ original_camera2lidar
+            # # ❗️ CRITICAL CHANGE: T_c2l_broken = inv(T_perturb) @ T_c2l
+            # broken_camera2lidar = extrinsic_perturb_inv @ original_camera2lidar
+           
+            # 🛑 [수정] inv 행렬이 아니라, T_perturb (extrinsic_perturb) 행렬 자체를 곱해야 합니다.
+            # T_{Cam->MisL} = T_{L->MisL} @ T_{Cam->L}
+            broken_camera2lidar = extrinsic_perturb @ original_camera2lidar
             
             # 2. 'gt_delta_trans' 와 'gt_delta_rot' 추출 (이전과 동일)
             gt_delta_trans = extrinsic_perturb[:3, 3]

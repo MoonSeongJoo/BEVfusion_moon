@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS
+from mmengine.runner import load_checkpoint 
+from mmengine import print_log   
 
 def axis_angle_to_matrix(axis_angle: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
     """
@@ -158,23 +161,6 @@ def geodesic_distance_loss(R_pred, R_gt, epsilon=1e-7):
     angle = torch.acos((trace - 1) / 2.0)
     return angle
 
-# # --- 새로 추가된 헬퍼 함수 ---
-# def create_transformation_matrix(rot_vec, trans_vec):
-#     """3D 회전 벡터와 3D 이동 벡터로부터 4x4 동차 변환 행렬 생성"""
-#     batch_size = rot_vec.shape[0]
-#     rotation_matrix = axis_angle_to_matrix(rot_vec) # [B, 3, 3]
-    
-#     # 4x4 행렬 생성 (기본은 단위 행렬 형태)
-#     transformation_matrix = torch.eye(4, device=rot_vec.device, dtype=rot_vec.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
-    
-#     # 회전 부분 채우기
-#     transformation_matrix[:, :3, :3] = rotation_matrix
-    
-#     # 이동 부분 채우기
-#     transformation_matrix[:, :3, 3] = trans_vec
-    
-#     return transformation_matrix
-
 # --- ✨ START: 수정할 함수 ✨ ---
 def create_transformation_matrix(rot_input: torch.Tensor, trans_vec: torch.Tensor) -> torch.Tensor:
     """
@@ -241,14 +227,22 @@ def correct_camera_proposals(det_xyz_norm, pred_delta_rot, pred_delta_trans, pc_
 
     # 2. 보정 변환 행렬 생성
     #    pred_delta_*는 각 배치 샘플에 대해 하나의 값만 가지므로, 모든 제안에 동일하게 적용
-    correction_matrix = create_transformation_matrix(pred_delta_rot, pred_delta_trans) # [B, 4, 4]
+    T_Error = create_transformation_matrix(pred_delta_rot, pred_delta_trans) # [B, 4, 4]
+
+    # 🛑 [CRITICAL FIX] 2.2 T_Error의 역행렬을 계산하여 T_Correction으로 사용
+    try:
+        # T_Correction = T_Error_inverse
+        T_Correction = torch.linalg.inv(T_Error)
+    except torch.linalg.LinAlgError:
+        # 역행렬 계산이 불가능한 경우 단위 행렬로 대체 (보정 없음)
+        T_Correction = torch.eye(4, dtype=T_Error.dtype, device=T_Error.device).expand_as(T_Error)
 
     # 3. 보정 변환 적용
     points_h = F.pad(det_xyz_metric, (0, 1), mode='constant', value=1.0) # [B, N, 4]
     # 행렬 곱셈을 위해 차원 조정 및 반복:
     # correction_matrix: [B, 4, 4] -> [B, 1, 4, 4] -> [B, N, 4, 4]
     # points_h: [B, N, 4] -> [B, N, 4, 1]
-    points_corrected_h = (correction_matrix.unsqueeze(1).expand(-1, N, -1, -1) @ points_h.unsqueeze(-1)).squeeze(-1)
+    points_corrected_h = (T_Correction.unsqueeze(1).expand(-1, N, -1, -1) @ points_h.unsqueeze(-1)).squeeze(-1)
     det_xyz_corrected_metric = points_corrected_h[..., :3]
 
     # 4. 다시 정규화: 실제 미터 좌표 -> [0,1]
@@ -374,7 +368,7 @@ class _CalibHeadRegressor(nn.Module):
 # 2. 새로운 CalibrationCorrectionHead (기존 스텁 덮어쓰기)
 # --------------------------------------------------------------------
 @MODELS.register_module()
-class CalibrationCorrectionHead(nn.Module):
+class CalibrationCorrectionHead(BaseModule):
     """
     특징 맵(enc_out)과 대응점(corrs)을 입력받아
     'regressor' 로직을 사용해 6-DoF 보정 파라미터를 예측하는 헤드.
@@ -385,8 +379,8 @@ class CalibrationCorrectionHead(nn.Module):
         num_kp (int): correspondence keypoint의 수. (기본값: 200)
         dropout_p (float): 드롭아웃 확률. (기본값: 0.5)
     """
-    def __init__(self, in_channels: int = 312, num_kp: int = 200, dropout_p: float = 0.5):
-        super().__init__()
+    def __init__(self, in_channels: int = 312, num_kp: int = 200, dropout_p: float = 0.5, init_cfg=None):
+        super().__init__(init_cfg=init_cfg)
         self.num_kp = num_kp
         
         # regressor 로직을 포함하는 내부 모듈 생성
@@ -395,62 +389,29 @@ class CalibrationCorrectionHead(nn.Module):
             dropout=dropout_p, 
             num_kp=num_kp
         )
+                # --- ✨ 3. 가중치 수동 로드 로직 (모든 레이어 생성 후) ---
+        if self.init_cfg and self.init_cfg.get('type') == 'Pretrained':
+            checkpoint_path = self.init_cfg.get('checkpoint')
+            if checkpoint_path:
+                print_log(f'Manually loading checkpoint for CalibHead from: {checkpoint_path}', logger='current')
+                
+                # ⭐️ (중요) 'self' (GeneralizedLSSFPN 인스턴스)에 로드합니다.
+                load_checkpoint(
+                    self, 
+                    checkpoint_path, 
+                    map_location='cpu', 
+                    strict=False, # True로 하면 키가 정확히 일치해야 함
+                    
+                    # ⭐️ (중요) 체크포인트의 접두사에 맞게 수정하세요.
+                    # 예: 체크포인트 키가 'img_neck.lateral_convs...' 라면
+                    revise_keys=[('^calib_head\\.', '')]
+                    # 예: 체크포인트 키가 'neck.lateral_convs...' 라면
+                    # revise_keys=[('^neck\\.', '')]
+                    # 예: 접두사가 없다면 이 'revise_keys' 라인을 삭제하거나 주석 처리
+                )
+            else:
+                print_log('No checkpoint path in init_cfg for CalibHead.', logger='current', level='WARNING')
 
-    # def forward(self, 
-    #             enc_out: torch.Tensor, 
-    #             query_input: torch.Tensor, 
-    #             corrs_pred_3d: torch.Tensor) -> torch.Tensor:
-    #     """
-    #     Args:
-    #         enc_out (torch.Tensor): (B*N, C, H, W) e.g., (B*N, 312, 12, 64)
-    #         query_input (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
-    #         corrs_pred (torch.Tensor): (B*N, N_kp, 2) e.g., (B*N, 200, 2)
-        
-    #     Returns:
-    #         torch.Tensor: 예측된 7-DoF 파라미터 (B*N, 7)
-    #                      [..., :4] = quaternion (w, x, y, z) 또는 (x, y, z, w)
-    #                      [..., 4:] = translation (x, y, z)
-    #     """
-        
-    #     # 1. Global Feature (enc_out) 처리
-    #     # (B*N, C, H, W) -> (B*N, C, 1, 1) -> (B*N, C)
-    #     x_global = self.regressor.flatten(self.regressor.avgpool(enc_out))
-        
-    #     # 2. Local Feature (corrs_emb) 처리 (✨ z' 추가 ✨)
-        
-    #     # (u,v)와 (u',v',z') 결합
-    #     # [수정] corrs_pred_3d에서 (u',v')와 (z') 분리
-    #     corrs_pred_2d = corrs_pred_3d[..., :2] # (B*N, 200, 2)
-    #     corrs_pred_z = corrs_pred_3d[..., 2:3] # (B*N, 200, 1)
-        
-    #     concat_pred_corrs = torch.cat((query_input, corrs_pred_2d), dim=-1) # (B*N, 200, 4) (u,v, u',v')
-        
-    #     # (u-u')와 (v-v') 차이 벡터 계산 (동일)
-    #     x_diff = concat_pred_corrs[..., 0] - concat_pred_corrs[..., 2] # u - u'
-    #     y_diff = concat_pred_corrs[..., 1] - concat_pred_corrs[..., 3] # v - v'
-    #     concat_pred_corrs_diff = torch.stack([x_diff, y_diff], dim=2)  # (B*N, 200, 2)
-        
-    #     # [수정] (u,v, u',v', u-u', v-v') + (z') + (z') = 8D
-    #     # (u,v), (u',v',z'), (u-u'), (v-v'), (z') -> 8D
-    #     corrs_emb = torch.cat(
-    #         (query_input,           # (B*N, 200, 2)
-    #          corrs_pred_3d,         # (B*N, 200, 3)
-    #          concat_pred_corrs_diff, # (B*N, 200, 2)
-    #          corrs_pred_z),          # (B*N, 200, 1) -> z'를 한 번 더 넣어줌 (중요도 강조)
-    #         dim=-1
-    #     ) # (B*N, 200, 8)
-        
-    #     # MLP 입력을 위해 (B*N, 200, 8) -> (B*N, 200 * 8)
-    #     y_local_flat = corrs_emb.view(corrs_emb.size(0), -1) # (B*N, 1600)
-        
-    #     # 3. Regressor 호출 (동일)
-    #     pred_rot, pred_trans = self.regressor(x_global, y_local_flat)
-        
-    #     # 4. 결과 결합 (동일)
-    #     pred_delta_7dof = torch.cat([pred_rot, pred_trans], dim=1)
-        
-    #     return pred_delta_7dof
-    
     def forward(self, 
                 enc_out: torch.Tensor, 
                 query_input: torch.Tensor, 
