@@ -66,7 +66,7 @@ model = dict(
         #     'https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth'),
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='data/work_dirs/extracted_backbones5/img_backbone_pretrained.pth'),  # noqa: E501)
+            checkpoint='data/work_dirs/extracted_backbones6/img_backbone_pretrained.pth'),  # noqa: E501)
         ),
     img_neck=dict(
         type='GeneralizedLSSFPN',
@@ -77,7 +77,7 @@ model = dict(
         norm_cfg=dict(type='BN2d', requires_grad=True),
         act_cfg=dict(type='ReLU', inplace=True),
         upsample_cfg=dict(mode='bilinear', align_corners=False),
-        init_cfg=dict(type='Pretrained', checkpoint='data/work_dirs/extracted_backbones5/img_neck_pretrained.pth'),
+        init_cfg=dict(type='Pretrained', checkpoint='data/work_dirs/extracted_backbones6/img_neck_pretrained.pth'),
         ),
     # --- 2. 새로 추가할 2D Detection Head ---
     img_bbox_head=dict(
@@ -126,7 +126,7 @@ model = dict(
             max_per_img=100),
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='data/work_dirs/extracted_backbones5/img_bbox_head_pretrained.pth'),
+            checkpoint='data/work_dirs/extracted_backbones6/img_bbox_head_pretrained.pth'),
         ),
     view_transform=dict(
         type='DepthLSSTransform',
@@ -161,7 +161,7 @@ model = dict(
         init_cfg=dict(
             type='Pretrained',
             # checkpoint='data/weights/backbone_base_corr_rev5.0_corrected.pth' # 예시 경로
-            checkpoint='data/work_dirs/extracted_backbones5/corr_pretrained.pth' # 예시 경로
+            checkpoint='data/work_dirs/extracted_backbones6/corr_pretrained.pth' # 예시 경로
             # checkpoint=None # 가중치 로딩이 필요 없을 경우
         )
     ),
@@ -172,7 +172,7 @@ model = dict(
         hidden_dim=512,
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='data/work_dirs/extracted_backbones5/z_estimator_pretrained.pth')
+            checkpoint='data/work_dirs/extracted_backbones6/z_estimator_pretrained.pth')
     ),
     calib_head=dict(
         type='CalibrationCorrectionHead',
@@ -181,7 +181,7 @@ model = dict(
         # out_dim=6,
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='data/work_dirs/extracted_backbones5/calib_head_pretrained.pth')
+            checkpoint='data/work_dirs/extracted_backbones6/calib_head_pretrained.pth')
     ),
     fusion_layer=dict(
         type='ConvFuser', in_channels=[80, 256], out_channels=256)
@@ -369,6 +369,11 @@ train_dataloader = dict(
             modality=input_modality,
             test_mode=False,
             box_type_3d='LiDAR')),
+    # # ✨✨ 핵심 수정: Sampler를 DefaultSampler로 지정하고 shuffle=False 설정
+    # sampler=dict(
+    #     type='DefaultSampler',
+    #     shuffle=False
+    # ),
     collate_fn=dict(type='custom_collate')
 )
 
@@ -535,8 +540,8 @@ default_hooks = dict(
     ))
 del _base_.custom_hooks
 
-# load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
-load_from =  "data/work_dirs/bevfusion/20251121_renew_10deg_0.75m_corr_pretrained_v2.0/iter_267000.pth"
+load_from =  "data/weights/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth"
+# load_from =  "data/work_dirs/bevfusion/20251126_renew_10deg_0.75m_corr_pretrained_v4.0/iter_36000.pth"
 # load_from = None
 resume_from = None
 

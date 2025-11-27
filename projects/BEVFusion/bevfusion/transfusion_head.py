@@ -180,11 +180,42 @@ class TransFusionHead(nn.Module):
         calibration_input_dim = hidden_channel
         calibration_hidden_dim = 256 # Intermediate dimension, can be tuned
 
-        self.calibration_predictor = nn.Sequential(
+        # 🛑 1. 특징 추출기 (SHARED HEAD) - Input -> Hidden
+        self.calib_shared_fc = nn.Sequential(
             nn.Linear(calibration_input_dim, calibration_hidden_dim),
-            nn.ReLU(), # Or nn.LeakyReLU(0.01) for potentially better stability
-            nn.Linear(calibration_hidden_dim, 6) # Output: 3 for rotation, 3 for translation
+            nn.ReLU() # Or nn.LeakyReLU(0.01)
         )
+
+        # 🛑 수정 후 (Capacity 및 Stability 증가):
+        # 🛑 2. 회전 예측 브랜치 (DECOUPLED ROTATION)
+        self.calib_rot_predictor = nn.Sequential(
+            nn.Linear(calibration_hidden_dim, 512),
+            nn.GroupNorm(32, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.GroupNorm(32, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3) # 최종 Axis-Angle 출력
+        )
+
+        # 🛑 3. 이동 예측 브랜치 (DECOUPLED TRANSLATION)
+        self.calib_trans_predictor = nn.Sequential(
+            nn.Linear(calibration_hidden_dim, 512),
+            nn.GroupNorm(32, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.GroupNorm(32, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3) # 최종 Delta XYZ 출력
+        )
+
+        # --- ✨ 4. Zero Initialization 적용 위치 ---
+        # nn.Sequential 내부의 마지막 Linear 레이어에 적용해야 합니다.
+        torch.nn.init.constant_(self.calib_rot_predictor[-1].weight.data, 0.)
+        torch.nn.init.constant_(self.calib_rot_predictor[-1].bias.data, 0.)
+
+        torch.nn.init.constant_(self.calib_trans_predictor[-1].weight.data, 0.)
+        torch.nn.init.constant_(self.calib_trans_predictor[-1].bias.data, 0.)
 
         # --- ✨ 추가: 2단계 정제 퓨전을 위한 레이어들 ✨ ---
         self.refined_attention = nn.MultiheadAttention(
@@ -369,7 +400,16 @@ class TransFusionHead(nn.Module):
 
             # --- 2b. 캘리브레이션 오차 예측 ---
             pooled_coarse_feat = coarse_fused_query_feat.mean(dim=-1) # [B, C]
-            pred_delta_6dof = self.calibration_predictor(pooled_coarse_feat) # [B, 6]
+            # 1. Input Feature Processing (예: pooled_coarse_feat)
+            x = pooled_coarse_feat # [B*N, calibration_input_dim]
+            # 2. 공유 특징 추출
+            x_shared = self.calib_shared_fc(x)
+            # 3. 분리된 예측
+            pred_rot = self.calib_rot_predictor(x_shared)
+            pred_trans = self.calib_trans_predictor(x_shared)
+            # 4. 결과 결합 (pred_delta_6dof_active 생성)
+            pred_delta_6dof = torch.cat([pred_rot, pred_trans], dim=-1) # [B*N, 6]
+
             pred_delta_rot = pred_delta_6dof[..., :3]
             pred_delta_trans = pred_delta_6dof[..., 3:]
 

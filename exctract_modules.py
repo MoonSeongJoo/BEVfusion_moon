@@ -5,10 +5,10 @@ from collections import OrderedDict
 # --- 1. 설정: 이 부분만 수정하세요 ---
 
 # 불러올 원본 BEVFusion 체크포인트 파일 경로
-FULL_CHECKPOINT_PATH = "data/work_dirs/bevfusion/20251118_corr_e2e_1st_stage_v2.0/iter_156000.pth"
+FULL_CHECKPOINT_PATH = "data/work_dirs/bevfusion/20251118_corr_e2e_1st_stage_v2.0/iter_176000.pth"
 
 # 추출한 파라미터를 저장할 디렉토리
-OUTPUT_DIR = "data/work_dirs/extracted_backbones5"
+OUTPUT_DIR = "data/work_dirs/extracted_backbones6"
 
 # config 파일에 정의된 모듈 이름과 정확히 일치해야 합니다.
 MODULE_PREFIXES_TO_EXTRACT = [
