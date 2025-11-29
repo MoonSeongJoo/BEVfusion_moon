@@ -18,7 +18,7 @@ from mmdet3d.models.dense_heads.centerpoint_head import SeparateHead
 from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
-from .imageprocessing_unit import visualize_full_pipeline,project_points_to_image,visualize_calibration_effect
+from .imageprocessing_unit import visualize_full_pipeline_enhanced,project_points_to_image,visualize_calibration_effect
 from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,quaternion_to_matrix,identity_matrix_loss
 
 def clip_sigmoid(x, eps=1e-4):
@@ -432,7 +432,7 @@ class TransFusionHead(nn.Module):
         #         vis_cam_xyz = det_xyz[0] if det_xyz is not None else torch.empty(0, 3, device=decoder_output_feat.device)
         #         vis_cam_feat = det_feats[0] if det_feats is not None else torch.empty(0, lidar_only_query_feat.shape[1], device=decoder_output_feat.device)
                 
-        #         visualize_full_pipeline(
+        #         visualize_full_pipeline_enhanced(
         #             cam_proposals_xyz=vis_cam_xyz,
         #             cam_proposals_feat=vis_cam_feat,
         #             query_pos=query_pos[0], # 항상 초기 위치 전달

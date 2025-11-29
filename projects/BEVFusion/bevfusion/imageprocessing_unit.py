@@ -5413,111 +5413,217 @@ def visualize_bev_proposals(det_xyz, gt_bboxes_3d, step, save_path="bev_visualiz
     plt.close(fig)
     print(f"✅ BEV visualization saved to {save_path}")
 
-def visualize_full_pipeline(
-    cam_proposals_xyz, cam_proposals_feat,  # <-- 추가된 인자
+# def visualize_full_pipeline(
+#     cam_proposals_xyz, cam_proposals_feat,  # <-- 추가된 인자
+#     query_pos, lidar_only_feat, fused_feat, final_feat, 
+#     gt_bboxes_3d, pc_range, voxel_size, step, save_path
+# ):
+#     """
+#     카메라 퓨전 전/후의 BEV 쿼리 특징을 시각화합니다.
+#     """
+#     # 텐서를 CPU의 NumPy 배열로 변환
+#     cam_xyz = cam_proposals_xyz.detach().cpu().numpy()
+#     cam_feat = cam_proposals_feat.detach().cpu().numpy()
+#     pos = query_pos.detach().cpu().numpy()
+#     feat1 = lidar_only_feat.detach().cpu().numpy()
+#     feat2 = fused_feat.detach().cpu().numpy()
+#     feat3 = final_feat.detach().cpu().numpy()
+#     gt_boxes = gt_bboxes_3d.tensor.cpu().numpy()
+
+#     # --- ✨✨✨ START: FIX - 카메라 제안 좌표 역정규화 ✨✨✨ ---
+#     # 입력된 cam_xyz는 [0, 1]로 정규화된 상태입니다.
+#     # 이를 pc_range를 이용해 다시 실제 미터(m) 단위 좌표로 변환합니다.
+#     cam_metric_x = cam_xyz[:, 0] * (pc_range[3] - pc_range[0]) + pc_range[0]
+#     cam_metric_y = cam_xyz[:, 1] * (pc_range[4] - pc_range[1]) + pc_range[1]
+#     # Z 좌표는 색상으로만 사용되므로 변환이 필수는 아니지만, 일관성을 위해 변환할 수 있습니다.
+#     # cam_metric_z = cam_xyz[:, 2] * (pc_range[5] - pc_range[2]) + pc_range[2]
+#     # --- ✨✨✨ END: FIX --- ✨✨✨
+
+#     # 각 특징 벡터의 L2 Norm(크기)을 계산
+#     cam_norms = np.linalg.norm(cam_feat, axis=-1)
+#     lidar_norms = np.linalg.norm(feat1, axis=-1)
+#     fused_norms = np.linalg.norm(feat2, axis=-1)
+#     final_norms = np.linalg.norm(feat3, axis=-1)
+
+#     all_norms = np.concatenate([cam_norms, lidar_norms, fused_norms, final_norms])
+#     vmin = all_norms.min()
+#     vmax = all_norms.max()
+
+#     # ✨ FIX: 1x4 서브플롯 생성
+#     fig, (ax0, ax1, ax2, ax3) = plt.subplots(1, 4, figsize=(48, 12))
+#     fig.suptitle(f"BEV Feature Pipeline @ Step {step}", fontsize=20)
+
+#     # --- Plot 0: 초기 (Camera-Only Proposals) ---
+#     ax0.set_title("0. Initial (Camera-Only)")
+#     ax0.set_facecolor('black')
+#     # ✨ FIX: 역정규화된 미터 단위 좌표를 사용하여 그립니다.
+#     scatter0 = ax0.scatter(
+#         cam_metric_x, 
+#         cam_metric_y, 
+#         c=cam_norms, 
+#         cmap='viridis', 
+#         s=5, 
+#         alpha=0.7, 
+#         vmin=vmin, 
+#         vmax=vmax
+#     )
+#     fig.colorbar(scatter0, ax=ax0, label='Feature Norm (Strength)')
+
+#     pos_corrected = pos
+ 
+#     # --- Plot 1: 초기 (LiDAR-Only Queries) ---
+#     ax1.set_title("1. Initial (LiDAR-Only)")
+#     ax1.set_facecolor('black')
+#     out_size_factor = 8 # Transfusion의 경우
+#     metric_x = pos_corrected[:, 0] * voxel_size[0] * out_size_factor + pc_range[0]
+#     metric_y = pos_corrected[:, 1] * voxel_size[1] * out_size_factor + pc_range[1]
+#     scatter1 = ax1.scatter(metric_x, metric_y, c=lidar_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
+#     fig.colorbar(scatter1, ax=ax1, label='Feature Norm (Strength)')
+
+#     # --- Plot 2: 중간 (After Camera Fusion) ---
+#     ax2.set_title("2. Mid-Fusion (LiDAR + Camera)")
+#     ax2.set_facecolor('black')
+#     scatter2 = ax2.scatter(metric_x, metric_y, c=fused_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
+#     fig.colorbar(scatter2, ax=ax2, label='Feature Norm (Strength)')
+    
+#     # --- Plot 3: 최종 (After Decoder Refinement) ---
+#     ax3.set_title("3. Final (Refined)")
+#     ax3.set_facecolor('black')
+#     scatter3 = ax3.scatter(metric_x, metric_y, c=final_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
+#     fig.colorbar(scatter3, ax=ax3, label='Feature Norm (Strength)')
+
+#     # ✨ FIX: 모든 플롯에 공통 요소 그리기
+#     for ax in [ax0, ax1, ax2, ax3]:
+#         # ... (GT Box, Ego Vehicle, 축 설정 등 공통 로직은 이전과 동일) ...
+#         for i in range(len(gt_boxes)):
+#             corners = gt_bboxes_3d[i].corners.cpu().numpy()
+#             bev_corners = corners[0, [0, 1, 2, 3], :2]
+#             polygon = patches.Polygon(bev_corners, edgecolor='lime', facecolor='none', linewidth=2,
+#                                       label='Ground Truth' if i == 0 else "")
+#             ax.add_patch(polygon)
+        
+#         ego_vehicle = patches.Rectangle((-1.0, -2.5), 2.0, 5.0, edgecolor='white', facecolor='none',
+#                                         linewidth=2, label='Ego Vehicle')
+#         ax.add_patch(ego_vehicle)
+        
+#         ax.set_xlim(pc_range[0], pc_range[3])
+#         ax.set_ylim(pc_range[1], pc_range[4])
+#         ax.set_aspect('equal', adjustable='box')
+#         ax.set_xlabel("X (m)")
+#         ax.set_ylabel("Y (m)")
+#         handles, labels = ax.get_legend_handles_labels()
+#         by_label = dict(zip(labels, handles))
+#         ax.legend(by_label.values(), by_label.keys())
+
+#     plt.savefig(save_path, bbox_inches='tight')
+#     plt.close(fig)
+#     print(f"✅ Full pipeline visualization saved to {save_path}")
+
+def visualize_full_pipeline_enhanced(
+    cam_proposals_xyz, cam_proposals_feat,
     query_pos, lidar_only_feat, fused_feat, final_feat, 
     gt_bboxes_3d, pc_range, voxel_size, step, save_path
 ):
-    """
-    카메라 퓨전 전/후의 BEV 쿼리 특징을 시각화합니다.
-    """
-    # 텐서를 CPU의 NumPy 배열로 변환
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from scipy.stats import gaussian_kde
+
+    # === Convert to numpy ===
     cam_xyz = cam_proposals_xyz.detach().cpu().numpy()
     cam_feat = cam_proposals_feat.detach().cpu().numpy()
     pos = query_pos.detach().cpu().numpy()
-    feat1 = lidar_only_feat.detach().cpu().numpy()
-    feat2 = fused_feat.detach().cpu().numpy()
-    feat3 = final_feat.detach().cpu().numpy()
+    feat_lidar = lidar_only_feat.detach().cpu().numpy()
+    feat_fused = fused_feat.detach().cpu().numpy()
+    feat_final = final_feat.detach().cpu().numpy()
     gt_boxes = gt_bboxes_3d.tensor.cpu().numpy()
 
-    # --- ✨✨✨ START: FIX - 카메라 제안 좌표 역정규화 ✨✨✨ ---
-    # 입력된 cam_xyz는 [0, 1]로 정규화된 상태입니다.
-    # 이를 pc_range를 이용해 다시 실제 미터(m) 단위 좌표로 변환합니다.
-    cam_metric_x = cam_xyz[:, 0] * (pc_range[3] - pc_range[0]) + pc_range[0]
-    cam_metric_y = cam_xyz[:, 1] * (pc_range[4] - pc_range[1]) + pc_range[1]
-    # Z 좌표는 색상으로만 사용되므로 변환이 필수는 아니지만, 일관성을 위해 변환할 수 있습니다.
-    # cam_metric_z = cam_xyz[:, 2] * (pc_range[5] - pc_range[2]) + pc_range[2]
-    # --- ✨✨✨ END: FIX --- ✨✨✨
+    # === Denormalize Camera xyz ===
+    cam_x = cam_xyz[:, 0] * (pc_range[3] - pc_range[0]) + pc_range[0]
+    cam_y = cam_xyz[:, 1] * (pc_range[4] - pc_range[1]) + pc_range[1]
 
-    # 각 특징 벡터의 L2 Norm(크기)을 계산
+    # === Feature Norms ===
     cam_norms = np.linalg.norm(cam_feat, axis=-1)
-    lidar_norms = np.linalg.norm(feat1, axis=-1)
-    fused_norms = np.linalg.norm(feat2, axis=-1)
-    final_norms = np.linalg.norm(feat3, axis=-1)
+    lidar_norms = np.linalg.norm(feat_lidar, axis=-1)
+    fused_norms = np.linalg.norm(feat_fused, axis=-1)
+    final_norms = np.linalg.norm(feat_final, axis=-1)
 
-    all_norms = np.concatenate([cam_norms, lidar_norms, fused_norms, final_norms])
-    vmin = all_norms.min()
-    vmax = all_norms.max()
+    # ==== Compute Metric coords for Query ====
+    out_factor = 8  # transfusion
+    qx = pos[:, 0] * voxel_size[0] * out_factor + pc_range[0]
+    qy = pos[:, 1] * voxel_size[1] * out_factor + pc_range[1]
 
-    # ✨ FIX: 1x4 서브플롯 생성
-    fig, (ax0, ax1, ax2, ax3) = plt.subplots(1, 4, figsize=(48, 12))
-    fig.suptitle(f"BEV Feature Pipeline @ Step {step}", fontsize=20)
+    # === Prepare Figure (6 subplots) ===
+    fig, axes = plt.subplots(2, 3, figsize=(42, 24))
+    fig.suptitle(f"BEV Feature Evolution @ Step {step}", fontsize=28)
 
-    # --- Plot 0: 초기 (Camera-Only Proposals) ---
-    ax0.set_title("0. Initial (Camera-Only)")
-    ax0.set_facecolor('black')
-    # ✨ FIX: 역정규화된 미터 단위 좌표를 사용하여 그립니다.
-    scatter0 = ax0.scatter(
-        cam_metric_x, 
-        cam_metric_y, 
-        c=cam_norms, 
-        cmap='viridis', 
-        s=5, 
-        alpha=0.7, 
-        vmin=vmin, 
-        vmax=vmax
-    )
-    fig.colorbar(scatter0, ax=ax0, label='Feature Norm (Strength)')
+    ax0, ax1, ax2, ax3, ax4, ax5 = axes.flatten()
 
-    pos_corrected = pos
- 
-    # --- Plot 1: 초기 (LiDAR-Only Queries) ---
-    ax1.set_title("1. Initial (LiDAR-Only)")
-    ax1.set_facecolor('black')
-    out_size_factor = 8 # Transfusion의 경우
-    metric_x = pos_corrected[:, 0] * voxel_size[0] * out_size_factor + pc_range[0]
-    metric_y = pos_corrected[:, 1] * voxel_size[1] * out_size_factor + pc_range[1]
-    scatter1 = ax1.scatter(metric_x, metric_y, c=lidar_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
-    fig.colorbar(scatter1, ax=ax1, label='Feature Norm (Strength)')
-
-    # --- Plot 2: 중간 (After Camera Fusion) ---
-    ax2.set_title("2. Mid-Fusion (LiDAR + Camera)")
-    ax2.set_facecolor('black')
-    scatter2 = ax2.scatter(metric_x, metric_y, c=fused_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
-    fig.colorbar(scatter2, ax=ax2, label='Feature Norm (Strength)')
-    
-    # --- Plot 3: 최종 (After Decoder Refinement) ---
-    ax3.set_title("3. Final (Refined)")
-    ax3.set_facecolor('black')
-    scatter3 = ax3.scatter(metric_x, metric_y, c=final_norms, cmap='viridis', s=15, alpha=0.8, vmin=vmin, vmax=vmax)
-    fig.colorbar(scatter3, ax=ax3, label='Feature Norm (Strength)')
-
-    # ✨ FIX: 모든 플롯에 공통 요소 그리기
-    for ax in [ax0, ax1, ax2, ax3]:
-        # ... (GT Box, Ego Vehicle, 축 설정 등 공통 로직은 이전과 동일) ...
+    # === Utility: draw GT boxes & ego ===
+    def draw_common(ax):
         for i in range(len(gt_boxes)):
             corners = gt_bboxes_3d[i].corners.cpu().numpy()
-            bev_corners = corners[0, [0, 1, 2, 3], :2]
-            polygon = patches.Polygon(bev_corners, edgecolor='lime', facecolor='none', linewidth=2,
-                                      label='Ground Truth' if i == 0 else "")
-            ax.add_patch(polygon)
-        
-        ego_vehicle = patches.Rectangle((-1.0, -2.5), 2.0, 5.0, edgecolor='white', facecolor='none',
-                                        linewidth=2, label='Ego Vehicle')
-        ax.add_patch(ego_vehicle)
-        
+            bev_corners = corners[0, [0,1,2,3], :2]
+            poly = patches.Polygon(bev_corners, edgecolor='lime',
+                                   facecolor='none', linewidth=2)
+            ax.add_patch(poly)
+
+        ego = patches.Rectangle((-1.0, -2.5), 2.0, 5.0,
+                                edgecolor='white', facecolor='none', linewidth=2)
+        ax.add_patch(ego)
+
         ax.set_xlim(pc_range[0], pc_range[3])
         ax.set_ylim(pc_range[1], pc_range[4])
         ax.set_aspect('equal', adjustable='box')
-        ax.set_xlabel("X (m)")
-        ax.set_ylabel("Y (m)")
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys())
+        ax.set_facecolor('black')
+
+    # === Plot 0: Camera-only ===
+    ax0.set_title("Stage 0 — Camera-Only (Ghost Features)")
+    sc0 = ax0.scatter(cam_x, cam_y, c=cam_norms, cmap='inferno', s=4, alpha=0.8)
+    fig.colorbar(sc0, ax=ax0)
+    draw_common(ax0)
+
+    # === Plot 1: LiDAR-only ===
+    ax1.set_title("Stage 1 — LiDAR-only")
+    sc1 = ax1.scatter(qx, qy, c=lidar_norms, cmap='viridis', s=6, alpha=0.8)
+    fig.colorbar(sc1, ax=ax1)
+    draw_common(ax1)
+
+    # === Plot 2: Mid-Fusion ===
+    ax2.set_title("Stage 2 — LiDAR + Camera Fusion")
+    sc2 = ax2.scatter(qx, qy, c=fused_norms, cmap='turbo', s=6, alpha=0.8)
+    fig.colorbar(sc2, ax=ax2)
+    draw_common(ax2)
+
+    # === Plot 3: Final Refined ===
+    ax3.set_title("Stage 3 — Final Refined (After Decoder)")
+    sc3 = ax3.scatter(qx, qy, c=final_norms, cmap='viridis', s=6, alpha=0.8)
+    fig.colorbar(sc3, ax=ax3)
+    draw_common(ax3)
+
+    # === ★ NEW Plot 4: Ghost Density Map (Camera Noise KDE) ===
+    ax4.set_title("Ghost Feature Density Map (Camera Noise)")
+    xy = np.vstack([cam_x, cam_y])
+    kde = gaussian_kde(xy)(xy)
+    sc4 = ax4.scatter(cam_x, cam_y, c=kde, cmap="magma", s=4, alpha=0.7)
+    fig.colorbar(sc4, ax=ax4)
+    draw_common(ax4)
+
+    # === ★ NEW Plot 5: Difference Map (Camera − Final) ===
+    ax5.set_title("Ghost Reduction Map (Camera − Final)")
+    # interpolate norms to query grid (nearest)
+    from sklearn.neighbors import NearestNeighbors
+    nbr = NearestNeighbors(n_neighbors=1).fit(np.vstack([cam_x, cam_y]).T)
+    dist, idx = nbr.kneighbors(np.vstack([qx, qy]).T)
+    cam_interp = cam_norms[idx.flatten()]
+
+    ghost_diff = cam_interp - final_norms
+    sc5 = ax5.scatter(qx, qy, c=ghost_diff, cmap='coolwarm', s=6, alpha=0.8)
+    fig.colorbar(sc5, ax=ax5)
+    draw_common(ax5)
 
     plt.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
-    print(f"✅ Full pipeline visualization saved to {save_path}")
 
 # --- ✨ START: Calibration Visualization Helpers ✨ ---
 
