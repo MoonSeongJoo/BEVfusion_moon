@@ -1,6 +1,7 @@
 # modify from https://github.com/mit-han-lab/bevfusion
 import copy
-from typing import List, Tuple
+from typing import Any, Dict, Optional, Tuple,List
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -18,12 +19,328 @@ from mmdet3d.models.dense_heads.centerpoint_head import SeparateHead
 from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
-from .imageprocessing_unit import visualize_full_pipeline,project_points_to_image,visualize_calibration_effect
+from .imageprocessing_unit import visualize_full_pipeline_enhanced,project_points_to_image,visualize_calibration_effect
 from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,quaternion_to_matrix,identity_matrix_loss
+from mmengine.evaluator import BaseMetric
+from mmdet3d.registry import METRICS
+
+from collections import defaultdict
+from mmengine.logging import MMLogger
+from mmengine.dist import is_main_process
 
 def clip_sigmoid(x, eps=1e-4):
     y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
     return y
+
+def _to_tensor(x: Any, device=None) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.to(device) if device is not None else x
+    try:
+        return torch.as_tensor(x, device=device)
+    except Exception:
+        return None
+
+def _squeeze_bn(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    # (1,N,3) -> (N,3)
+    if x.dim() == 3 and x.shape[0] == 1:
+        return x[0]
+    return x
+
+
+def _mean_any_shape_to_3(t: torch.Tensor) -> torch.Tensor:
+    """Whatever shape (..., 3) -> (3,) by averaging all leading dims."""
+    if t.numel() == 3 and t.shape == (3,):
+        return t
+    t = t.reshape(-1, 3)
+    return t.mean(dim=0)
+
+
+def axis_angle_to_matrix(aa: torch.Tensor) -> torch.Tensor:
+    """aa: (...,3) axis-angle -> (...,3,3)"""
+    orig_shape = aa.shape[:-1]
+    aa = aa.reshape(-1, 3).float()
+
+    theta = torch.linalg.norm(aa, dim=1, keepdim=True).clamp(min=1e-12)
+    k = aa / theta
+
+    kx, ky, kz = k[:, 0], k[:, 1], k[:, 2]
+    zero = torch.zeros_like(kx)
+
+    K = torch.stack([
+        zero, -kz,  ky,
+        kz,  zero, -kx,
+        -ky, kx,  zero
+    ], dim=1).reshape(-1, 3, 3)
+
+    I = torch.eye(3, device=aa.device, dtype=aa.dtype).unsqueeze(0).expand_as(K)
+    sin_t = torch.sin(theta).view(-1, 1, 1)
+    cos_t = torch.cos(theta).view(-1, 1, 1)
+
+    R = I + sin_t * K + (1 - cos_t) * (K @ K)
+    return R.reshape(*orig_shape, 3, 3)
+
+
+def geodesic_rot_error_deg(Ra: torch.Tensor, Rb: torch.Tensor) -> torch.Tensor:
+    """Ra,Rb: (...,3,3) -> (...,) degrees"""
+    R = Ra.transpose(-1, -2) @ Rb
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    cos = ((tr - 1.0) * 0.5).clamp(-1.0, 1.0)
+    ang = torch.acos(cos)
+    return ang * (180.0 / np.pi)
+
+def _get_metainfo(x: Any) -> dict:
+    """Det3DDataSample / InstanceData / dict 모두에서 stage1/2 키를 찾기 위해 flatten."""
+    out = {}
+    if x is None:
+        return out
+
+    # 1) metainfo (Det3DDataSample / BaseDataElement)
+    if hasattr(x, 'metainfo'):
+        try:
+            out.update(dict(x.metainfo))
+        except Exception:
+            pass
+
+    # 2) data fields (InstanceData는 repr이 dict처럼 보임)
+    if isinstance(x, Mapping):
+        out.update(dict(x))
+    elif hasattr(x, 'items'):
+        try:
+            out.update(dict(x.items()))
+        except Exception:
+            pass
+
+    # 3) nested pred_instances_3d / pred_instances inside a sample OR dict
+    for key in ('pred_instances_3d', 'pred_instances'):
+        y = None
+        if hasattr(x, key):
+            y = getattr(x, key)
+        elif isinstance(x, Mapping) and key in x:
+            y = x.get(key)
+
+        if y is None:
+            continue
+
+        if hasattr(y, 'metainfo'):
+            try:
+                out.update(dict(y.metainfo))
+            except Exception:
+                pass
+
+        if isinstance(y, Mapping):
+            out.update(dict(y))
+        elif hasattr(y, 'items'):
+            try:
+                out.update(dict(y.items()))
+            except Exception:
+                pass
+
+    return out
+
+def _pick(meta: dict, *keys):
+    """meta에서 keys 순서대로 'None이 아닌 첫 값'을 반환 (Tensor도 안전)"""
+    for k in keys:
+        if k in meta:
+            v = meta.get(k, None)
+            if v is not None:
+                return v
+    return None
+
+@METRICS.register_module()
+class CalibRecoveryMetric(BaseMetric):
+    def __init__(self, collect_device='cpu', prefix='calib_recovery', debug=False, debug_n=3):
+        super().__init__(collect_device=collect_device, prefix=prefix)
+        self.debug = debug
+        self.debug_n = debug_n
+        self._dbg_printed = 0
+        self._skip = defaultdict(int) 
+
+    def _get_gt_from_batch(self, gt_sample) -> (Optional[torch.Tensor], Optional[torch.Tensor]):
+        """GT는 data_batch 쪽에서 읽는다."""
+        meta = getattr(gt_sample, 'metainfo', {}) or {}
+
+        gt_rot = meta.get('gt_delta_rot', None)
+        gt_trans = meta.get('gt_delta_trans', None)
+
+        # 혹시 attribute로 들어오는 구현이면 fallback
+        if gt_rot is None and hasattr(gt_sample, 'gt_delta_rot'):
+            gt_rot = getattr(gt_sample, 'gt_delta_rot', None)
+        if gt_trans is None and hasattr(gt_sample, 'gt_delta_trans'):
+            gt_trans = getattr(gt_sample, 'gt_delta_trans', None)
+
+        gt_rot_t = _to_tensor(gt_rot)
+        gt_trans_t = _to_tensor(gt_trans)
+        if gt_rot_t is not None:
+            gt_rot_t = _mean_any_shape_to_3(gt_rot_t)
+        if gt_trans_t is not None:
+            gt_trans_t = _mean_any_shape_to_3(gt_trans_t)
+        return gt_rot_t, gt_trans_t
+
+    def _get_stage1_from_pred(self, pred_sample) -> (Optional[torch.Tensor], Optional[torch.Tensor]):
+        meta = _get_metainfo(pred_sample)
+
+        pred1_rot = _pick(meta,
+            'pred_delta_rot_1st',
+            'stage1_pred_delta_rot',
+            'stage1_pred_delta_rot_mean',
+        )
+        pred1_trans = _pick(meta,
+            'pred_delta_trans_1st',
+            'stage1_pred_delta_trans',
+            'stage1_pred_delta_trans_mean',
+        )
+
+        r = _to_tensor(pred1_rot)
+        t = _to_tensor(pred1_trans)
+        if r is not None:
+            r = _mean_any_shape_to_3(r)
+        if t is not None:
+            t = _mean_any_shape_to_3(t)
+        return r, t
+
+    def _get_stage2_from_pred(self, pred_sample) -> (Optional[torch.Tensor], Optional[torch.Tensor]):
+        meta = _get_metainfo(pred_sample)
+
+        pred2_rot = _pick(meta,
+            'pred_delta_rot_2nd',
+            'stage2_pred_delta_rot',
+            'pred_delta_rot',          # 너가 기존에 stage2를 이 키로도 저장했었음
+        )
+        pred2_trans = _pick(meta,
+            'pred_delta_trans_2nd',
+            'stage2_pred_delta_trans',
+            'pred_delta_trans',
+        )
+
+        r = _to_tensor(pred2_rot)
+        t = _to_tensor(pred2_trans)
+        if r is not None:
+            r = _mean_any_shape_to_3(r)
+        if t is not None:
+            t = _mean_any_shape_to_3(t)
+        return r, t
+
+    def process(self, data_batch, data_samples):
+        logger = MMLogger.get_current_instance()
+
+        # GT는 data_batch에서, pred는 data_samples에서 꺼낸다
+        gt_list = None
+        if isinstance(data_batch, dict) and 'data_samples' in data_batch:
+            gt_list = data_batch['data_samples']
+
+        if gt_list is None:
+            # 이 경우는 dataloader가 GT를 안 주는 구조 (test set / format_only 등)
+            self._skip['no_data_batch_gt_list'] += len(data_samples)
+            return
+
+        for gt_s, pred_s in zip(gt_list, data_samples):
+            self._skip['total'] += 1
+
+            gt_rot_t, gt_trans_t = self._get_gt_from_batch(gt_s)
+            if gt_rot_t is None or gt_trans_t is None:
+                self._skip['no_gt'] += 1
+                continue
+
+            pred1_rot_t, pred1_trans_t = self._get_stage1_from_pred(pred_s)
+            pred2_rot_t, pred2_trans_t = self._get_stage2_from_pred(pred_s)
+
+            has_s1 = (pred1_rot_t is not None) and (pred1_trans_t is not None)
+            has_s2 = (pred2_rot_t is not None) and (pred2_trans_t is not None)
+
+            if not has_s1:
+                self._skip['no_stage1'] += 1
+                pred1_rot_t = torch.zeros_like(gt_rot_t)
+                pred1_trans_t = torch.zeros_like(gt_trans_t)
+
+            if not has_s2:
+                self._skip['no_stage2'] += 1
+                pred2_rot_t = torch.zeros_like(gt_rot_t)
+                pred2_trans_t = torch.zeros_like(gt_trans_t)
+
+            # rotations
+            R_gt = axis_angle_to_matrix(gt_rot_t[None])          # (1,3,3)
+            R1   = axis_angle_to_matrix(pred1_rot_t[None])       # (1,3,3)
+            R2   = axis_angle_to_matrix(pred2_rot_t[None])       # (1,3,3)
+            R0   = torch.eye(3, device=R_gt.device, dtype=R_gt.dtype)[None]  # (1,3,3)
+
+            # ✅ residual target for stage2 (s2가 맞춰야 하는 남은 오차)
+            R_res = R_gt @ R1.transpose(-1, -2)   # (1,3,3)
+
+            # final compose (s2@ s1)
+            R_total = R2 @ R1
+
+            # translations
+            t0 = torch.zeros_like(gt_trans_t)
+            t1 = pred1_trans_t
+            t2 = pred2_trans_t
+            t_total = t1 + t2
+
+            # ✅ residual target for stage2 translation
+            t_res = gt_trans_t - t1
+
+            # ---- metrics ----
+            rot_before = geodesic_rot_error_deg(R0, R_gt)[0].item()
+            rot_s1     = geodesic_rot_error_deg(R1, R_gt)[0].item()
+
+            # ✅ s2 "단독" 평가는 R2 vs R_res (잔여 오차를 얼마나 잘 맞추는지)
+            rot_s2     = geodesic_rot_error_deg(R2, R_res)[0].item() if has_s2 else float('nan')
+
+            rot_final  = geodesic_rot_error_deg(R_total, R_gt)[0].item()
+
+            trans_before = torch.norm(t0 - gt_trans_t, p=2).item()
+            trans_s1     = torch.norm(t1 - gt_trans_t, p=2).item()
+            trans_s2     = torch.norm(t2 - t_res, p=2).item() if has_s2 else float('nan')
+            trans_final  = torch.norm(t_total - gt_trans_t, p=2).item()
+
+            self.results.append(dict(
+                rot_before_deg=rot_before,
+                rot_s1_deg=rot_s1,
+                rot_s2_deg=rot_s2,          # ✅ 추가
+                rot_final_deg=rot_final,
+                trans_before_m=trans_before,
+                trans_s1_m=trans_s1,
+                trans_s2_m=trans_s2,        # ✅ 추가
+                trans_final_m=trans_final,
+                has_s2=float(has_s2),       # ✅ NaN 평균낼 때 유용 (옵션)
+            ))
+            self._skip['appended'] += 1
+
+            if self.debug and is_main_process() and self._dbg_printed < self.debug_n:
+                pm = _get_metainfo(pred_s)
+                gm = _get_metainfo(gt_s)
+                s1_ok = ('pred_delta_rot_1st' in pm) or ('stage1_pred_delta_rot' in pm)
+                s2_ok = (
+                            ('pred_delta_rot_2nd' in pm) or
+                            ('stage2_pred_delta_rot' in pm) or
+                            ('pred_delta_rot' in pm)   # ✅ 너의 기존 stage2 저장 키까지 포함
+                    )
+
+                logger.info(
+                    f"[CalibRecoveryMetric] sample_idx={gm.get('sample_idx', None)} "
+                    f"GT(meta) keys has rot/trans={('gt_delta_rot' in gm)}/{('gt_delta_trans' in gm)} | "
+                    f"PRED(meta) has s1={s1_ok}, "
+                    f"s2={s2_ok}"
+                )
+                self._dbg_printed += 1
+
+    def compute_metrics(self, results):
+        logger = MMLogger.get_current_instance()
+        if is_main_process():
+            logger.info(f"[CalibRecoveryMetric] skip_stats={dict(self._skip)}")
+
+        if len(results) == 0:
+            return dict()
+
+        keys = results[0].keys()
+        out = {}
+        for k in keys:
+            vals = np.array([r.get(k, np.nan) for r in results], dtype=np.float64)
+            out[k] = float(np.nanmean(vals))
+        return out
 
 @MODELS.register_module()
 class ConvFuser(nn.Sequential):
@@ -88,7 +405,7 @@ class TransFusionHead(nn.Module):
 
         self.use_sigmoid_cls = loss_cls.get('use_sigmoid', False)
         if not self.use_sigmoid_cls:
-            self.num_classes += 1
+            self.num_classes  += 1
         self.loss_cls = MODELS.build(loss_cls)
         self.loss_bbox = MODELS.build(loss_bbox)
         self.loss_heatmap = MODELS.build(loss_heatmap)
@@ -121,13 +438,13 @@ class TransFusionHead(nn.Module):
             build_conv_layer(
                 dict(type='Conv2d'),
                 hidden_channel,
-                num_classes,
+                self.num_classes,
                 kernel_size=3,
                 padding=1,
                 bias=bias,
             ))
         self.heatmap_head = nn.Sequential(*layers)
-        self.class_encoding = nn.Conv1d(num_classes, hidden_channel, 1)
+        self.class_encoding = nn.Conv1d(self.num_classes, hidden_channel, 1)
 
         # transformer decoder layers for object query with LiDAR feature
         self.decoder = nn.ModuleList()
@@ -180,42 +497,51 @@ class TransFusionHead(nn.Module):
         calibration_input_dim = hidden_channel
         calibration_hidden_dim = 256 # Intermediate dimension, can be tuned
 
-        # 🛑 1. 특징 추출기 (SHARED HEAD) - Input -> Hidden
-        self.calib_shared_fc = nn.Sequential(
+        ########### old calibration_predictor version ##############
+        self.calibration_predictor = nn.Sequential(
             nn.Linear(calibration_input_dim, calibration_hidden_dim),
-            nn.ReLU() # Or nn.LeakyReLU(0.01)
+            nn.ReLU(inplace=True),
+            nn.Linear(calibration_hidden_dim, 6),  # (rot 3 + trans 3)
         )
 
-        # 🛑 수정 후 (Capacity 및 Stability 증가):
-        # 🛑 2. 회전 예측 브랜치 (DECOUPLED ROTATION)
-        self.calib_rot_predictor = nn.Sequential(
-            nn.Linear(calibration_hidden_dim, 512),
-            nn.GroupNorm(32, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.GroupNorm(32, 256),
-            nn.ReLU(),
-            nn.Linear(256, 3) # 최종 Axis-Angle 출력
-        )
+        # # 🛑 1. 특징 추출기 (SHARED HEAD) - Input -> Hidden
+        # self.calib_shared_fc = nn.Sequential(
+        #     nn.Linear(calibration_input_dim, calibration_hidden_dim),
+        #     nn.ReLU() # Or nn.LeakyReLU(0.01)
+        # )
 
-        # 🛑 3. 이동 예측 브랜치 (DECOUPLED TRANSLATION)
-        self.calib_trans_predictor = nn.Sequential(
-            nn.Linear(calibration_hidden_dim, 512),
-            nn.GroupNorm(32, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.GroupNorm(32, 256),
-            nn.ReLU(),
-            nn.Linear(256, 3) # 최종 Delta XYZ 출력
-        )
+        # # 🛑 수정 후 (Capacity 및 Stability 증가):
+        # # 🛑 2. 회전 예측 브랜치 (DECOUPLED ROTATION)
+        # self.calib_rot_predictor = nn.Sequential(
+        #     nn.Linear(calibration_hidden_dim, 512),
+        #     nn.GroupNorm(32, 512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, 256),
+        #     nn.GroupNorm(32, 256),
+        #     nn.ReLU(),
+        #     nn.Linear(256, 3) # 최종 Axis-Angle 출력
+        # )
 
-        # --- ✨ 4. Zero Initialization 적용 위치 ---
-        # nn.Sequential 내부의 마지막 Linear 레이어에 적용해야 합니다.
-        torch.nn.init.constant_(self.calib_rot_predictor[-1].weight.data, 0.)
-        torch.nn.init.constant_(self.calib_rot_predictor[-1].bias.data, 0.)
+        # # 🛑 3. 이동 예측 브랜치 (DECOUPLED TRANSLATION)
+        # self.calib_trans_predictor = nn.Sequential(
+        #     nn.Linear(calibration_hidden_dim, 512),
+        #     nn.GroupNorm(32, 512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, 256),
+        #     nn.GroupNorm(32, 256),
+        #     nn.ReLU(),
+        #     nn.Linear(256, 3) # 최종 Delta XYZ 출력
+        # )
 
-        torch.nn.init.constant_(self.calib_trans_predictor[-1].weight.data, 0.)
-        torch.nn.init.constant_(self.calib_trans_predictor[-1].bias.data, 0.)
+        # # --- ✨ 4. Zero Initialization 적용 위치 ---
+        # # nn.Sequential 내부의 마지막 Linear 레이어에 적용해야 합니다.
+        # torch.nn.init.constant_(self.calib_rot_predictor[-1].weight.data, 0.)
+        # torch.nn.init.constant_(self.calib_rot_predictor[-1].bias.data, 0.)
+
+        # torch.nn.init.constant_(self.calib_trans_predictor[-1].weight.data, 0.)
+        # torch.nn.init.constant_(self.calib_trans_predictor[-1].bias.data, 0.)
+
+
 
         # --- ✨ 추가: 2단계 정제 퓨전을 위한 레이어들 ✨ ---
         self.refined_attention = nn.MultiheadAttention(
@@ -265,8 +591,8 @@ class TransFusionHead(nn.Module):
         # NOTE: modified
         batch_x, batch_y = torch.meshgrid(
             *[torch.linspace(it[0], it[1], it[2]) for it in meshgrid])
-        batch_x = batch_x + 0.5
-        batch_y = batch_y + 0.5
+        batch_x = batch_x +  0.5
+        batch_y = batch_y +  0.5
         coord_base = torch.cat([batch_x[None], batch_y[None]], dim=0)[None]
         coord_base = coord_base.view(1, 2, -1).permute(0, 2, 1)
         return coord_base
@@ -306,6 +632,9 @@ class TransFusionHead(nn.Module):
         Args:
             inputs (torch.Tensor): Input feature map with the shape of
                 [B, 512, 128(H), 128(W)]. (consistent with L748)
+            ablation_mode (str): 
+                - 'full': 전체 파이프라인 (LGPC   2-Stage Refinement) 실행
+                - 'lgpc_only': LGPC로 오차는 예측하지만, Refinement 없이 1단계 특징을 그대로 사용
         Returns:
             list[dict]: Output results for tasks.
         """
@@ -365,7 +694,7 @@ class TransFusionHead(nn.Module):
             top_proposals_class,
             num_classes=self.num_classes).permute(0, 2, 1)
         query_cat_encoding = self.class_encoding(one_hot.float())
-        query_feat += query_cat_encoding
+        query_feat  += query_cat_encoding
 
         query_pos = bev_pos.gather(
             index=top_proposals_index[:, None, :].permute(0, 2, 1).expand(
@@ -390,47 +719,72 @@ class TransFusionHead(nn.Module):
             cam_proposal_pos_embed = self.camera_proposal_pos_embedding(det_xyz) # det_xyz는 [0,1] 정규화 상태 가정
 
             fused_feat_stage1 = self.fusion_cross_attention(
-                query=bev_query_feat_stage1 + bev_query_pos_embed,
-                key=cam_proposal_feat + cam_proposal_pos_embed,
+                query=bev_query_feat_stage1 +  bev_query_pos_embed,
+                key=cam_proposal_feat +  cam_proposal_pos_embed,
                 value=cam_proposal_feat
             )[0]
-            bev_query_feat_stage1 = self.fusion_norm1(bev_query_feat_stage1 + fused_feat_stage1)
-            bev_query_feat_stage1 = self.fusion_norm2(bev_query_feat_stage1 + self.fusion_ffn(bev_query_feat_stage1))
+            bev_query_feat_stage1 = self.fusion_norm1(bev_query_feat_stage1 +  fused_feat_stage1)
+            bev_query_feat_stage1 = self.fusion_norm2(bev_query_feat_stage1 +  self.fusion_ffn(bev_query_feat_stage1))
             coarse_fused_query_feat = bev_query_feat_stage1.permute(0, 2, 1).contiguous() # [B, C, Nq]
 
+            # --- 시각화용: 중간 퓨전 결과 저장 ---
+            # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
+            coarse_fused_query_feat_for_vis = coarse_fused_query_feat
+
             # --- 2b. 캘리브레이션 오차 예측 ---
+            # LGPC Only 모드여도 오차 예측은 수행해야 함 (Rotation Loss 계산 및 검증을 위해)
             pooled_coarse_feat = coarse_fused_query_feat.mean(dim=-1) # [B, C]
-            # 1. Input Feature Processing (예: pooled_coarse_feat)
-            x = pooled_coarse_feat # [B*N, calibration_input_dim]
-            # 2. 공유 특징 추출
-            x_shared = self.calib_shared_fc(x)
-            # 3. 분리된 예측
-            pred_rot = self.calib_rot_predictor(x_shared)
-            pred_trans = self.calib_trans_predictor(x_shared)
-            # 4. 결과 결합 (pred_delta_6dof_active 생성)
-            pred_delta_6dof = torch.cat([pred_rot, pred_trans], dim=-1) # [B*N, 6]
+            
+            ########### old calibration network ##################
+            pred_delta_6dof = self.calibration_predictor(pooled_coarse_feat)  # [B, 6]
+           
+            ######### new calibration network ####################
+            # x = pooled_coarse_feat # [B*N, calibration_input_dim]
+            # x_shared = self.calib_shared_fc(x)
+            # pred_rot = self.calib_rot_predictor(x_shared)
+            # pred_trans = self.calib_trans_predictor(x_shared)
+            # pred_delta_6dof = torch.cat([pred_rot, pred_trans], dim=-1) # [B*N, 6]
 
             pred_delta_rot = pred_delta_6dof[..., :3]
             pred_delta_trans = pred_delta_6dof[..., 3:]
 
+            # ==========================================================
+            # 🚀 비교 실험 분기점 (Ablation Strategy)
+            # ==========================================================
+            ablation_mode='full'
             # --- 2c. 카메라 제안 보정 ---
-            pc_range_tensor = torch.tensor(self.train_cfg['point_cloud_range'], device=det_xyz.device)
-            # 보정 시에는 그래디언트 흐름 차단 가능 (오차 예측 학습에만 집중)
-            det_xyz_corrected_norm = correct_camera_proposals(
-                det_xyz, pred_delta_rot.detach(), pred_delta_trans.detach(), pc_range_tensor
-            )
-            cam_proposal_pos_embed_corrected = self.camera_proposal_pos_embedding(det_xyz_corrected_norm)
+            if ablation_mode == 'full':
+                # [Full Model]: 보정된 위치를 사용하여 2단계 정제(Refinement) 수행
+                pc_range_tensor = torch.tensor(self.train_cfg['point_cloud_range'], device=det_xyz.device)
+                # 보정 시에는 그래디언트 흐름 차단 가능 (오차 예측 학습에만 집중)
+                det_xyz_corrected_norm = correct_camera_proposals(
+                    det_xyz, pred_delta_rot.detach(), pred_delta_trans.detach(), pc_range_tensor
+                )
+                cam_proposal_pos_embed_corrected = self.camera_proposal_pos_embedding(det_xyz_corrected_norm)
 
-            # --- 2d. 2단계: 정제된 퓨전 ---
-            refined_bev_query_feat = coarse_fused_query_feat.permute(0, 2, 1) # 1단계 결과 재사용
-            refined_fused_feat = self.refined_attention(
-                query=refined_bev_query_feat + bev_query_pos_embed,
-                key=cam_proposal_feat + cam_proposal_pos_embed_corrected, # 보정된 위치 사용
-                value=cam_proposal_feat
-            )[0]
-            refined_bev_query_feat = self.refined_norm1(refined_bev_query_feat + refined_fused_feat)
-            refined_bev_query_feat = self.refined_norm2(refined_bev_query_feat + self.refined_ffn(refined_bev_query_feat))
-            refined_query_feat = refined_bev_query_feat.permute(0, 2, 1).contiguous() # [B, C, Nq]
+                # --- 2d. 2단계: 정제된 퓨전 ---
+                refined_bev_query_feat = coarse_fused_query_feat.permute(0, 2, 1) # 1단계 결과 재사용
+                refined_fused_feat = self.refined_attention(
+                    query=refined_bev_query_feat +  bev_query_pos_embed,
+                    key=cam_proposal_feat +  cam_proposal_pos_embed_corrected, # 보정된 위치 사용
+                    value=cam_proposal_feat
+                )[0]
+                refined_bev_query_feat = self.refined_norm1(refined_bev_query_feat +  refined_fused_feat)
+                refined_bev_query_feat = self.refined_norm2(refined_bev_query_feat +  self.refined_ffn(refined_bev_query_feat))
+                # 최종 출력: 정제된 특징
+                refined_query_feat = refined_bev_query_feat.permute(0, 2, 1).contiguous() # [B, C, Nq]
+            
+            elif ablation_mode == 'lgpc_only':
+                # [LGPC Only]: 오차는 예측했으나(위에서 수행함), 정제(Refinement) 과정 생략
+                # 논리: "LGPC가 오차를 알아냈다 하더라도, 이를 반영하여 
+                #       특징맵을 다시 퓨전하지 않으면 성능 향상은 없다"는 것을 증명
+                
+                # 최종 출력: 1단계 거친 특징 (보정 전 특징)
+                refined_query_feat = coarse_fused_query_feat
+                
+            else:
+                raise ValueError(f"Unknown ablation mode: {ablation_mode}")
+            
         
         # --- 시각화용: 중간 퓨전 결과 저장 ---
         # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
@@ -472,11 +826,12 @@ class TransFusionHead(nn.Module):
         #         vis_cam_xyz = det_xyz[0] if det_xyz is not None else torch.empty(0, 3, device=decoder_output_feat.device)
         #         vis_cam_feat = det_feats[0] if det_feats is not None else torch.empty(0, lidar_only_query_feat.shape[1], device=decoder_output_feat.device)
                 
-        #         visualize_full_pipeline(
+        #         visualize_full_pipeline_enhanced(
         #             cam_proposals_xyz=vis_cam_xyz,
         #             cam_proposals_feat=vis_cam_feat,
         #             query_pos=query_pos[0], # 항상 초기 위치 전달
         #             lidar_only_feat=lidar_only_query_feat[0].permute(1, 0),
+        #             coarse_fused_feat=coarse_fused_query_feat_for_vis[0].permute(1, 0),
         #             fused_feat=fused_query_feat_for_vis[0].permute(1, 0),
         #             final_feat=final_query_feat_for_vis[0].permute(1, 0),
         #             gt_bboxes_3d=gt_instances_3d.bboxes_3d,
@@ -485,7 +840,7 @@ class TransFusionHead(nn.Module):
         #             step=self.training_step,
         #             save_path=f"work_dirs/full_pipeline_step_{self.training_step}.png"
         #         )
-        # self.training_step += 1
+        # self.training_step  = 1
 
         # --- 5. 결과 처리 및 반환 ---
         ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
@@ -540,6 +895,7 @@ class TransFusionHead(nn.Module):
         res = multi_apply(self.forward_single, feats, [det_xyz], [det_feats], [metas],[batch_gt_instances_3d])
         
         assert len(res) == 1, 'only support one level features.'
+        # return res
         return res
 
     # def predict(self, batch_feats, batch_input_metas):
@@ -645,11 +1001,11 @@ class TransFusionHead(nn.Module):
                 labels = temp[i]['labels']
                 # adopt circle nms for different categories
                 if self.test_cfg['nms_type'] is not None:
-                    keep_mask = torch.zeros_like(scores)
+                    keep_mask = torch.zeros_like(scores,dtype=torch.bool)
                     for task in self.tasks:
-                        task_mask = torch.zeros_like(scores)
+                        task_mask = torch.zeros_like(scores,dtype=torch.bool)
                         for cls_idx in task['indices']:
-                            task_mask += labels == cls_idx
+                            task_mask  = labels == cls_idx
                         task_mask = task_mask.bool()
                         if task['radius'] > 0:
                             if self.test_cfg['nms_type'] == 'circle':
@@ -681,9 +1037,11 @@ class TransFusionHead(nn.Module):
                         else:
                             task_keep_indices = torch.arange(task_mask.sum())
                         if task_keep_indices.shape[0] != 0:
-                            keep_indices = torch.where(
-                                task_mask != 0)[0][task_keep_indices]
-                            keep_mask[keep_indices] = 1
+                            # keep_indices = torch.where(
+                            #     task_mask != 0)[0][task_keep_indices]
+                            # keep_mask[keep_indices] = 1
+                             keep_indices = torch.where(task_mask)[0][task_keep_indices.to(scores.device)]
+                             keep_mask[keep_indices] = True
                     keep_mask = keep_mask.bool()
                     ret = dict(
                         bboxes=boxes3d[keep_mask],
@@ -694,10 +1052,116 @@ class TransFusionHead(nn.Module):
                     ret = dict(bboxes=boxes3d, scores=scores, labels=labels)
 
                 temp_instances = InstanceData()
-                temp_instances.bboxes_3d = metas[0]['box_type_3d'](
+                # temp_instances.bboxes_3d = metas[0]['box_type_3d'](
+                temp_instances.bboxes_3d = metas[i]['box_type_3d'](
                     ret['bboxes'], box_dim=ret['bboxes'].shape[-1])
                 temp_instances.scores_3d = ret['scores']
                 temp_instances.labels_3d = ret['labels'].int()
+
+                # # ===================== [HERE] stage1 값을 stage2에서 읽는 위치 =====================
+                # # metas == img_metas (배치별 dict 리스트)
+                # stage1_rot = metas[i].get('stage1_pred_delta_rot', None)      # (N_cam, 3) 기대
+                # stage1_trans = metas[i].get('stage1_pred_delta_trans', None)  # (N_cam, 3) 기대
+                # active = metas[i].get('stage1_active_cam_indices', None)
+                # # ================================================================================
+
+                pred_rot = preds_dict[0].get('pred_delta_rot', None)
+                pred_trans = preds_dict[0].get('pred_delta_trans', None)
+                # ===================== [NEW] 캘리브레이션 예측값도 같이 저장 =====================
+                # preds_dict[0]는 dict, batch 차원은 i
+                # 수정 (OK): metainfo로 저장 (길이 체크 없음)
+                if pred_rot is not None and pred_trans is not None:
+                    # temp_instances.set_metainfo(dict(
+                    #     pred_delta_rot=pred_rot[i].detach().cpu(),
+                    #     pred_delta_trans=pred_trans[i].detach().cpu(),
+                    # ))
+                    metas[i]['pred_delta_rot_2nd'] = pred_rot[i].detach().cpu()
+                    metas[i]['pred_delta_trans_2nd'] = pred_trans[i].detach().cpu()
+                # ===============================================================================
+
+                # ===================== [COMPLETE] stage1   stage2(잔차) 합성 & 저장 =====================
+                def _as_cpu_tensor(x):
+                    if x is None:
+                        return None
+                    if torch.is_tensor(x):
+                        return x.detach().cpu()
+                    return torch.tensor(x).detach().cpu()
+
+                # --- stage1 읽기 (카메라별) ---
+                stage1_rot_cam = _as_cpu_tensor(metas[i].get('stage1_pred_delta_rot', None))      # (N_cam,3)
+                stage1_trans_cam = _as_cpu_tensor(metas[i].get('stage1_pred_delta_trans', None))  # (N_cam,3)
+                active = metas[i].get('stage1_active_cam_indices', None)
+                active_mask = metas[i].get('stage1_active_cam_mask', None)
+                active = _as_cpu_tensor(active) if active is not None else None
+                active_mask = _as_cpu_tensor(active_mask).bool() if active_mask is not None else None
+
+                # --- stage2 읽기 (residual, 배치별 1개) ---
+                pred2_rot = _as_cpu_tensor(pred_rot[i]) if pred_rot is not None else None         # (3,)
+                pred2_trans = _as_cpu_tensor(pred_trans[i]) if pred_trans is not None else None   # (3,)
+
+                # --- stage1 mean 계산 (active만 평균내는 게 물리적으로 가장 정확) ---
+                stage1_rot_mean = None
+                stage1_trans_mean = None
+                if stage1_rot_cam is not None and stage1_trans_cam is not None:
+                    if active_mask is not None and active_mask.any():
+                        stage1_rot_mean = stage1_rot_cam[active_mask].mean(dim=0)     # (3,)
+                        stage1_trans_mean = stage1_trans_cam[active_mask].mean(dim=0) # (3,)
+                    elif active is not None and active.numel() > 0:
+                        act_idx = active.long().view(-1)
+                        stage1_rot_mean = stage1_rot_cam[act_idx].mean(dim=0)
+                        stage1_trans_mean = stage1_trans_cam[act_idx].mean(dim=0)
+                    else:
+                        # active 정보 없으면 전체 평균(차선책)
+                        stage1_rot_mean = stage1_rot_cam.mean(dim=0)
+                        stage1_trans_mean = stage1_trans_cam.mean(dim=0)
+
+                    # metric 호환 alias도 metas에 같이 심어둠 (선택이지만 추천)
+                    metas[i]['pred_delta_rot_1st'] = stage1_rot_cam
+                    metas[i]['pred_delta_trans_1st'] = stage1_trans_cam
+
+                # --- 최종 합성 (R_total = R2@R1, t_total = t1 t2) ---
+                total_R = None
+                total_t = None
+                if (stage1_rot_mean is not None) and (pred2_rot is not None):
+                    R1 = axis_angle_to_matrix(stage1_rot_mean[None].float())   # (1,3,3)
+                    R2 = axis_angle_to_matrix(pred2_rot[None].float())         # (1,3,3)
+                    total_R = (R2 @ R1).squeeze(0)                              # (3,3)
+                if (stage1_trans_mean is not None) and (pred2_trans is not None):
+                    total_t = (stage1_trans_mean.float() + pred2_trans.float()) # (3,)
+
+                # --- 저장(InstanceData.metainfo): stage2 residual   stage1   total ---
+                meta_payload = {}
+                if pred2_rot is not None and pred2_trans is not None:
+                    meta_payload.update(dict(
+                        # ✅ metric이 찾는 키들 (권장)
+                        pred_delta_rot_2nd=pred2_rot,
+                        pred_delta_trans_2nd=pred2_trans,
+                        stage2_pred_delta_rot=pred2_rot,
+                        stage2_pred_delta_trans=pred2_trans,
+
+                        # ✅ 기존 호환 (너 코드/다른 모듈이 쓰는 키)
+                        pred_delta_rot=pred2_rot,
+                        pred_delta_trans=pred2_trans,
+                    ))
+                if stage1_rot_cam is not None and stage1_trans_cam is not None:
+                    meta_payload.update(dict(
+                        stage1_pred_delta_rot=stage1_rot_cam,       # (N_cam,3)
+                        stage1_pred_delta_trans=stage1_trans_cam,
+                        stage1_pred_delta_rot_mean=stage1_rot_mean,  # (3,)
+                        stage1_pred_delta_trans_mean=stage1_trans_mean,
+                    ))
+                if active is not None:
+                    meta_payload['stage1_active_cam_indices'] = active.long()
+                if active_mask is not None:
+                    meta_payload['stage1_active_cam_mask'] = active_mask
+                if total_R is not None:
+                    meta_payload['pred_delta_rot_total_R'] = total_R
+                if total_t is not None:
+                    meta_payload['pred_delta_trans_total'] = total_t
+
+                if len(meta_payload) > 0:
+                    temp_instances.set_metainfo(meta_payload)
+                # ===================== [END COMPLETE] ================================================
 
                 ret_layer.append(temp_instances)
 
@@ -879,7 +1343,7 @@ class TransFusionHead(nn.Module):
             num_proposals, dtype=torch.long)
 
         if gt_labels_3d is not None:  # default label is -1
-            labels += self.num_classes
+            labels  += self.num_classes
 
         # both pos and neg have classification loss, only pos has regression
         # and iou loss
@@ -1142,7 +1606,7 @@ class TransFusionHead(nn.Module):
                                                                     1) *
                                                 self.num_proposals, ]
             layer_height = preds_dict['height'][..., idx_layer *
-                                                self.num_proposals:(idx_layer +
+                                                self.num_proposals:(idx_layer +  
                                                                     1) *
                                                 self.num_proposals, ]
             layer_rot = preds_dict['rot'][..., idx_layer *
@@ -1167,7 +1631,7 @@ class TransFusionHead(nn.Module):
                                       1)  # [BS, num_proposals, code_size]
             code_weights = self.train_cfg.get('code_weights', None)
             layer_bbox_weights = bbox_weights[:, idx_layer *
-                                              self.num_proposals:(idx_layer +
+                                              self.num_proposals:(idx_layer + 
                                                                   1) *
                                               self.num_proposals, :, ]
             layer_reg_weights = layer_bbox_weights * layer_bbox_weights.new_tensor(  # noqa: E501

@@ -389,7 +389,7 @@ class CalibrationCorrectionHead(BaseModule):
             dropout=dropout_p, 
             num_kp=num_kp
         )
-                # --- ✨ 3. 가중치 수동 로드 로직 (모든 레이어 생성 후) ---
+        # --- ✨ 3. 가중치 수동 로드 로직 (모든 레이어 생성 후) ---
         if self.init_cfg and self.init_cfg.get('type') == 'Pretrained':
             checkpoint_path = self.init_cfg.get('checkpoint')
             if checkpoint_path:

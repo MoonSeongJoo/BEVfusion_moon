@@ -26,7 +26,7 @@ data_prefix = dict(
     CAM_BACK_RIGHT='samples/CAM_BACK_RIGHT',
     CAM_BACK_LEFT='samples/CAM_BACK_LEFT',
     sweeps='sweeps/LIDAR_TOP')
-input_modality = dict(use_lidar=True, use_camera=False)
+input_modality = dict(use_lidar=True, use_camera=True)
 # backend_args = dict(
 #     backend='petrel',
 #     path_mapping=dict({
@@ -234,7 +234,7 @@ train_pipeline = [
             'ori_lidar2img', 'img_aug_matrix', 'box_type_3d', 'sample_idx',
             'lidar_path', 'img_path', 'transformation_3d_flow', 'pcd_rotation',
             'pcd_scale_factor', 'pcd_trans', 'img_aug_matrix',
-            'lidar_aug_matrix'
+            'lidar_aug_matrix','gt_delta_rot', 'gt_delta_trans',
         ])
 ]
 
@@ -262,7 +262,8 @@ test_pipeline = [
         meta_keys=[
             'cam2img', 'ori_cam2img', 'lidar2cam', 'lidar2img', 'cam2lidar',
             'ori_lidar2img', 'img_aug_matrix', 'box_type_3d', 'sample_idx',
-            'lidar_path', 'img_path', 'num_pts_feats', 'num_views'
+            'lidar_path', 'img_path', 'num_pts_feats', 'num_views',
+            'gt_delta_rot', 'gt_delta_trans',
         ])
 ]
 
@@ -330,14 +331,16 @@ test_dataloader = val_dataloader
 #         box_type_3d='LiDAR',
 #         backend_args=backend_args))
 
-val_evaluator = dict(
-    type='NuScenesMetric',
+val_evaluator = [
+    dict(type='CalibRecoveryMetric', prefix='calib_recovery',debug=True, debug_n=5),
+    dict(type='NuScenesMetric',
     data_root=data_root,
     ann_file=data_root + 'new_infos_retry_infos_val.pkl',
     # ann_file=data_root+ 'debug_infos_val_with_2d.pkl',
     # ann_file=data_root + 'nuscenes_bevfusion_2d_gt_insert_infos_val.pkl',
     metric='bbox',
-    backend_args=backend_args)
+    backend_args=backend_args),
+    ]
 test_evaluator = val_evaluator
 
 vis_backends = [dict(type='LocalVisBackend')]

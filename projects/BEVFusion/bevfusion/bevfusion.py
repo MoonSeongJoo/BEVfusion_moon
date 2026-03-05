@@ -25,6 +25,7 @@ from .imageprocessing_unit import (dense_map_from_depth_batch_v2,
                                    display_depth_maps,
                                    save_batch_predictions_to_file,
                                    visualize_bev_proposals,
+                                   visualize_ours_fusion_result,
                                    )
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -2007,23 +2008,23 @@ class BEVFusion(Base3DDetector):
             #     # )
             #     bboxes_for_this_view = detections_2d_orig_coords[cid]
             #     draw_correspondences(
-            #         trimed_corrs = pred_corrs[cid][:3,...],  # 첫 번째 배치 선택
+            #         trimed_corrs = pred_corrs[cid][:20,...],  # 첫 번째 배치 선택
             #         sbs_img=sbs_img.view(B*N,C,H,W)[cid],
             #         save_path='correspondence_visualization_pred.jpg',
             #         bboxes_to_draw = bboxes_for_this_view, # 원본 좌표계 BBox 전달
             #         score_thr = 0.4
             #     )
-            #     # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
-            #     save_batch_predictions_to_file(
-            #             batch_inputs_dict=batch_inputs_dict,
-            #             reshaped_data_samples=reshaped_data_samples,
-            #             augmented_preds_list=detections_2d,
-            #             original_preds_list=detections_2d_orig_coords,
-            #             current_step=self.vis_step_counter,
-            #             save_dir='work_dirs/my_exp/vis_results',
-            #             view_index=cid, # 루프 변수 cid를 view_index로 사용
-            #             score_thr=0.4
-            #         )
+            #     # # --- 2. 원본 vs 증강 BBox 비교 시각화 저장 (요청하신 부분) ---
+            #     # save_batch_predictions_to_file(
+            #     #         batch_inputs_dict=batch_inputs_dict,
+            #     #         reshaped_data_samples=reshaped_data_samples,
+            #     #         augmented_preds_list=detections_2d,
+            #     #         original_preds_list=detections_2d_orig_coords,
+            #     #         current_step=self.vis_step_counter,
+            #     #         save_dir='work_dirs/my_exp/vis_results',
+            #     #         view_index=cid, # 루프 변수 cid를 view_index로 사용
+            #     #         score_thr=0.4
+            #     #     )
             #     print ("end")
 
             corrected_calib_dict = self._get_corrected_calib_from_prediction(
@@ -2256,6 +2257,17 @@ class BEVFusion(Base3DDetector):
         """
         (Function description remains the same)
         """
+        # """
+        # 전체 네트워크 추론 시간을 측정합니다.
+        # """
+        # # 1. 측정을 위한 CUDA Event 생성
+        # start_event = torch.cuda.Event(enable_timing=True)
+        # end_event = torch.cuda.Event(enable_timing=True)
+
+        # # 2. 이전 GPU 연산이 끝날 때까지 대기 후 기록 시작
+        # torch.cuda.synchronize()
+        # start_event.record()
+
         # --- 1. & 2. Data Prep and 2D Detections (Same as before) ---
         target_device = batch_inputs_dict['imgs'].device
         batch_input_metas = [item.metainfo for item in batch_data_samples]
@@ -2293,6 +2305,7 @@ class BEVFusion(Base3DDetector):
         else:
             query_input = torch.stack([q_x, q_y], dim=-1)
 
+
         # sbs_img, _, dense_depth_map = self.extract_sbs_img(
         #     batch_inputs_dict, batch_input_metas, visualize=False)
         sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(
@@ -2319,9 +2332,24 @@ class BEVFusion(Base3DDetector):
             num_active_cams = sbs_img_filtered.shape[1]
             sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
             
-            # Call the correlation network with filtered data
+            # # Call the correlation network with filtered data
+            # # --- ⏱️ Stage-1 (LGPC) 순수 오버헤드 측정 시작 ---
+            # s1_start = torch.cuda.Event(enable_timing=True)
+            # s1_end = torch.cuda.Event(enable_timing=True)
+
+            # torch.cuda.synchronize() # 이전 연산(2D Detection 등) 완료 보장
+            # s1_start.record()
+
             raw_corrs_filtered, _, _, enc_out_filtered_4d  = self.corr(sbs_view, query_input_filtered)
+
+            # s1_end.record()
+            # torch.cuda.synchronize() # LGPC 연산 완료 대기
             
+            # t1_ms = s1_start.elapsed_time(s1_end)
+            # # --- ⏱️ Stage-1 (LGPC) 측정 종료 ---
+
+            # print(f"✅ [Stage-1: LGPC Latency]: {t1_ms:.2f} ms")
+                
             # 1. Convert normalized corrs to pixel coordinates
             r_x = (raw_corrs_filtered[..., 0] - 0.5) * 2 * 1600 
             r_y = raw_corrs_filtered[..., 1] * 900
@@ -2375,6 +2403,38 @@ class BEVFusion(Base3DDetector):
         pred_delta_rot = pred_delta_6dof[..., :3]
         pred_delta_trans = pred_delta_6dof[..., 3:]
 
+        # 1) 배치별 active_cam_indices를 준비 (현재 코드가 B==1 only면 그 사실을 명시적으로 반영)
+        #    - 현재 snippet에서는 active_cam_indices가 "한 개"만 존재하므로 B==1로 가정한 형태
+        if B == 1:
+            active_list = [active_cam_indices]  # length B
+        else:
+            # TODO: B>1이면 반드시 b별 active 인덱스를 만들어야 함
+            # active_list = active_cam_indices_per_batch  # e.g., List[Tensor] length B
+            raise RuntimeError("B>1이면 active_cam_indices를 배치별로 따로 만들어 저장해야 합니다.")
+
+        for b in range(B):
+            # stage1 per-cam
+            batch_input_metas[b]['stage1_pred_delta_rot'] = pred_delta_rot[b].detach()
+            batch_input_metas[b]['stage1_pred_delta_trans'] = pred_delta_trans[b].detach()
+            batch_input_metas[b]['stage1_active_cam_indices'] = active_cam_indices.detach()
+
+            # ✅ metric이 찾는 alias도 같이
+            batch_input_metas[b]['pred_delta_rot_1st'] = batch_input_metas[b]['stage1_pred_delta_rot']
+            batch_input_metas[b]['pred_delta_trans_1st'] = batch_input_metas[b]['stage1_pred_delta_trans']
+
+            # ✅ data_sample.metainfo "덮어쓰기" 금지: 기존 metainfo 보존 + update
+            mi = dict(batch_data_samples[b].metainfo)  # 기존 메타 복사 (gt_delta_* 유지됨)
+
+            mi.update({
+                'stage1_pred_delta_rot': batch_input_metas[b]['stage1_pred_delta_rot'],
+                'stage1_pred_delta_trans': batch_input_metas[b]['stage1_pred_delta_trans'],
+                'stage1_active_cam_indices': batch_input_metas[b]['stage1_active_cam_indices'],
+                'pred_delta_rot_1st': batch_input_metas[b]['pred_delta_rot_1st'],
+                'pred_delta_trans_1st': batch_input_metas[b]['pred_delta_trans_1st'],
+            })
+
+            batch_data_samples[b].set_metainfo(mi)
+
         # ===================== END: LOGIC ALIGNMENT WITH LOSS FUNCTION =====================
 
         # --- 5. Correct Calibration Matrices (Now safe to run) ---
@@ -2410,9 +2470,73 @@ class BEVFusion(Base3DDetector):
             corrected_calib=corrected_calib_dict,
             precomputed_img_feats=img_feats)
         
+        # # --- ⏱️ Stage-2 (RRRF) 순수 오버헤드 측정 시작 ---
+        # s2_start = torch.cuda.Event(enable_timing=True)
+        # s2_end = torch.cuda.Event(enable_timing=True)
+
+        # torch.cuda.synchronize() # 이전 연산 완료 보장
+        # s2_start.record()
+        
         results_list_3d = self.bbox_head.predict(
             feats, det_xyz_proc, det_feat_proc, batch_input_metas)
         
         results = self.add_pred_to_datasample(batch_data_samples,
                                             results_list_3d)
+        
+        # s2_end.record()
+        # torch.cuda.synchronize() # Stage-2 연산 완료 대기
+        
+        # t2_ms = s2_start.elapsed_time(s2_end)
+        # # --- ⏱️ Stage-2 (RRRF) 측정 종료 ---
+
+        # print(f"✅ [Stage-2: RRRF Latency]: {t2_ms:.2f} ms")
+        
+        # # 3. 측정 종료 및 동기화
+        # end_event.record()
+        # torch.cuda.synchronize()
+
+        # # 4. 시간 계산 (단위: ms)
+        # elapsed_time_ms = start_event.elapsed_time(end_event)
+        
+        # # 결과 출력 (터미널에서 바로 확인 가능)
+        # print(f"\n🚀 [Ours Network Inference Time]: {elapsed_time_ms:.2f} ms | FPS: {1000.0 / elapsed_time_ms:.1f}")
+        
+        # ==========================================================
+        # [CRITICAL] metric이 보는 "최종 results(DataSample)"에 stage1 pred delta를 주입
+        #  - Tensor 그대로 넣으면 metric의 `or` 체인에서 bool(tensor) 이슈가 날 수 있으니
+        #    안전하게 list 로 저장 (또는 numpy)
+        # ==========================================================
+        stage1_rot_cpu = pred_delta_rot.detach().to('cpu')        # (B, N_cam, 3)
+        stage1_trans_cpu = pred_delta_trans.detach().to('cpu')    # (B, N_cam, 3)
+
+        if torch.is_tensor(active_cam_indices):
+            active_cam_indices_cpu = active_cam_indices.detach().to('cpu')
+        else:
+            active_cam_indices_cpu = active_cam_indices
+
+        for b, ds in enumerate(results):
+            mi = dict(ds.metainfo)  # 기존 gt_delta_* 등 보존
+
+            mi.update({
+                # stage1 canonical
+                'stage1_pred_delta_rot': stage1_rot_cpu[b].tolist(),
+                'stage1_pred_delta_trans': stage1_trans_cpu[b].tolist(),
+                'stage1_active_cam_indices': active_cam_indices_cpu.tolist()
+                    if torch.is_tensor(active_cam_indices_cpu) else active_cam_indices_cpu,
+
+                # metric alias (stage1)
+                'pred_delta_rot_1st': stage1_rot_cpu[b].tolist(),
+                'pred_delta_trans_1st': stage1_trans_cpu[b].tolist(),
+            })
+
+            ds.set_metainfo(mi)
+        
+        if self.test_cfg is not None and self.test_cfg.get('visualize_ours', False):
+            visualize_ours_fusion_result(
+                batch_inputs_dict=batch_inputs_dict,
+                results=results,
+                corrected_calib=corrected_calib_dict,  # LGPC에서 보정된 행렬 사용 
+                save_path=f'work_dirs/vis/ours_step_{self.training_step}.png'
+            )
+        
         return results
