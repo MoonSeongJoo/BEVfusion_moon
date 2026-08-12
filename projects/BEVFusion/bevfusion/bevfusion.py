@@ -108,6 +108,7 @@ class BEVFusion(Base3DDetector):
         enable_selective_freezing,
         class_names: List[str],
         data_preprocessor: OptConfigType = None,
+        calibration_mode: str = 'pcc_full',
         pts_voxel_encoder: Optional[dict] = None,
         pts_middle_encoder: Optional[dict] = None,
         fusion_layer: Optional[dict] = None,
@@ -153,6 +154,23 @@ class BEVFusion(Base3DDetector):
         self.init_weights()
 
         # modified by sjmoon
+        self.calibration_mode = calibration_mode
+
+        valid_calibration_modes = {
+            'clean',
+            'broken',
+            'oracle',
+            'pcc_calib_only',
+            'pcc_full',
+            'lccnet',
+        }
+
+        if self.calibration_mode not in valid_calibration_modes:
+            raise ValueError(
+                f'Unsupported calibration_mode: '
+                f'{self.calibration_mode}'
+            )
+        
         self.bbox_head = MODELS.build(bbox_head)
         self.img_bbox_head = MODELS.build(img_bbox_head)
         self.corr = MODELS.build(corr)
@@ -1649,6 +1667,440 @@ class BEVFusion(Base3DDetector):
         
         return x_neck
     
+    def _build_calib_dict_from_cam2lidar(
+        self,
+        camera2lidar,
+        camera_intrinsics,
+    ):
+
+        # Camera -> LiDAR
+        #       inverse
+        # LiDAR -> Camera
+        lidar2camera = torch.linalg.inv(
+            camera2lidar
+        )
+
+        K = camera_intrinsics[
+            ..., :3, :3
+        ]
+
+        lidar2img_3x4 = (
+            K
+            @ lidar2camera[..., :3, :]
+        )
+
+        B, N = camera2lidar.shape[:2]
+
+        bottom = torch.zeros(
+            B,
+            N,
+            1,
+            4,
+            device=camera2lidar.device,
+            dtype=camera2lidar.dtype,
+        )
+
+        bottom[..., 0, 3] = 1.0
+
+        lidar2img = torch.cat(
+            [
+                lidar2img_3x4,
+                bottom,
+            ],
+            dim=-2
+        )
+
+        return {
+            'lidar2img': lidar2img,
+            'cam2img': camera_intrinsics,
+            'cam2lidar': camera2lidar,
+        }
+    
+    def _make_delta_matrix(
+        self,
+        delta_rot,
+        delta_trans,
+    ):
+
+        R = axis_angle_to_matrix(
+            delta_rot
+        )
+
+        B, N = delta_rot.shape[:2]
+
+        T = torch.eye(
+            4,
+            device=delta_rot.device,
+            dtype=delta_rot.dtype,
+        )
+
+        T = T.view(
+            1, 1, 4, 4
+        ).repeat(
+            B, N, 1, 1
+        )
+
+        T[..., :3, :3] = R
+        T[..., :3, 3] = delta_trans
+
+        return T
+        
+    def _stack_sample_tensor(
+        self,
+        batch_data_samples,
+        key,
+        device,
+    ):
+        values = []
+
+        for sample in batch_data_samples:
+
+            value = getattr(
+                sample,
+                key,
+                None
+            )
+
+            if value is None:
+
+                value = sample.metainfo.get(
+                    key,
+                    None
+                )
+
+            if value is None:
+                raise KeyError(
+                    f"Missing '{key}' "
+                    f"in Det3DDataSample."
+                )
+
+            if torch.is_tensor(value):
+
+                value = value.to(
+                    device=device,
+                    dtype=torch.float32
+                )
+
+            else:
+
+                value = torch.tensor(
+                    value,
+                    device=device,
+                    dtype=torch.float32
+                )
+
+            values.append(value)
+
+        return torch.stack(
+            values,
+            dim=0
+        )
+
+    def _predict_bevfusion_with_calib(
+        self,
+        batch_inputs_dict,
+        batch_data_samples,
+        calib_dict,
+        img_feats=None,
+    ):
+
+        batch_input_metas = [
+            item.metainfo
+            for item in batch_data_samples
+        ]
+
+        if img_feats is None:
+
+            img_feats = (
+                self.extract_multiscale_img_feats(
+                    batch_inputs_dict
+                )
+            )
+
+        feats = self.extract_feat(
+            batch_inputs_dict=
+                batch_inputs_dict,
+
+            batch_input_metas=
+                batch_input_metas,
+
+            corrected_calib=
+                calib_dict,
+
+            precomputed_img_feats=
+                img_feats,
+        )
+
+        # --------------------------------------------------
+        # 매우 중요:
+        #
+        # PCC camera proposal은 사용하지 않는다.
+        # 순수 BEVFusion detection
+        # --------------------------------------------------
+
+        results_list_3d = (
+            self.bbox_head.predict(
+                feats,
+                None,
+                None,
+                batch_input_metas,
+            )
+        )
+
+        return self.add_pred_to_datasample(
+            batch_data_samples,
+            results_list_3d,
+        )
+
+    def _predict_calibration_baseline(
+        self,
+        batch_inputs_dict,
+        batch_data_samples,
+        mode,
+    ):
+
+        device = batch_inputs_dict[
+            'imgs'
+        ].device
+
+        clean_c2l = (
+            self._stack_sample_tensor(
+                batch_data_samples,
+                'camera2lidar',
+                device,
+            )
+        )
+
+        broken_c2l = (
+            self._stack_sample_tensor(
+                batch_data_samples,
+                'broken_camera2lidar',
+                device,
+            )
+        )
+
+        intrinsics = (
+            self._stack_sample_tensor(
+                batch_data_samples,
+                'broken_camera_intrinsics',
+                device,
+            )
+        )
+
+        # ==============================================
+        # CLEAN
+        # ==============================================
+
+        if mode == 'clean':
+
+            selected_c2l = clean_c2l
+
+        # ==============================================
+        # BROKEN
+        # ==============================================
+
+        elif mode == 'broken':
+
+            selected_c2l = broken_c2l
+
+
+        # ==============================================
+        # ORACLE
+        # ==============================================
+
+        elif mode == 'oracle':
+
+            gt_delta_rot = (
+                self._stack_sample_tensor(
+                    batch_data_samples,
+                    'gt_delta_rot',
+                    device,
+                )
+            )
+
+            gt_delta_trans = (
+                self._stack_sample_tensor(
+                    batch_data_samples,
+                    'gt_delta_trans',
+                    device,
+                )
+            )
+
+            delta_T_gt = (
+                self._make_delta_matrix(
+                    gt_delta_rot,
+                    gt_delta_trans,
+                )
+            )
+
+            # ------------------------------------------
+            # Gate A:
+            #
+            # broken = Delta_GT @ clean
+            # ------------------------------------------
+
+            broken_reconstructed = (
+                delta_T_gt
+                @ clean_c2l
+            )
+
+            delta_definition_error = (
+                broken_reconstructed
+                - broken_c2l
+            ).abs().max()
+
+            if delta_definition_error > 1e-4:
+
+                raise RuntimeError(
+                    "Delta convention mismatch: "
+                    f"{delta_definition_error.item():.8e}"
+                )
+
+            # ------------------------------------------
+            # Oracle
+            #
+            # clean =
+            # inv(Delta_GT) @ broken
+            # ------------------------------------------
+
+            selected_c2l = (
+                torch.linalg.inv(
+                    delta_T_gt
+                )
+                @ broken_c2l
+            )
+
+            restore_error = (
+                selected_c2l
+                - clean_c2l
+            ).abs().max()
+
+            if restore_error > 1e-4:
+
+                raise RuntimeError(
+                    "Oracle restoration failed: "
+                    f"{restore_error.item():.8e}"
+                )
+            
+            # print(
+            #     "[ORACLE CHECK] "
+            #     f"broken reconstruction = "
+            #     f"{delta_definition_error.item():.8e}, "
+            #     f"GT restore = "
+            #     f"{restore_error.item():.8e}"
+            # )
+
+        else:
+
+            raise ValueError(
+                f'Unsupported mode: {mode}'
+            )
+
+
+        calib_dict = (
+            self._build_calib_dict_from_cam2lidar(
+                selected_c2l,
+                intrinsics,
+            )
+        )
+
+        clean_calib = (
+            self._build_calib_dict_from_cam2lidar(
+                clean_c2l,
+                intrinsics,
+            )
+        )
+
+        oracle_calib = (
+            self._build_calib_dict_from_cam2lidar(
+                selected_c2l,
+                intrinsics,
+            )
+        )
+
+        # projection_error = (
+        #     clean_calib['lidar2img']
+        #     - oracle_calib['lidar2img']
+        # ).abs().max()
+
+        # print(
+        #     "[ORACLE PROJECTION CHECK]",
+        #     projection_error.item()
+        # )
+
+        # # ======================================================
+        # # CLEAN vs ORIGINAL BEVFusion METADATA CHECK
+        # # ======================================================
+
+        # meta_lidar2img = torch.stack([
+        #     torch.as_tensor(
+        #         s.metainfo['lidar2img'],
+        #         device=device,
+        #         dtype=torch.float32
+        #     )
+        #     for s in batch_data_samples
+        # ])
+
+        # meta_cam2img = torch.stack([
+        #     torch.as_tensor(
+        #         s.metainfo['cam2img'],
+        #         device=device,
+        #         dtype=torch.float32
+        #     )
+        #     for s in batch_data_samples
+        # ])
+
+        # meta_cam2lidar = torch.stack([
+        #     torch.as_tensor(
+        #         s.metainfo['cam2lidar'],
+        #         device=device,
+        #         dtype=torch.float32
+        #     )
+        #     for s in batch_data_samples
+        # ])
+
+
+        # err_c2l = (
+        #     clean_c2l
+        #     - meta_cam2lidar
+        # ).abs().max()
+
+        # err_K = (
+        #     intrinsics
+        #     - meta_cam2img
+        # ).abs().max()
+
+        # err_l2i = (
+        #     calib_dict['lidar2img']
+        #     - meta_lidar2img
+        # ).abs().max()
+
+
+        # print(
+        #     "\n[CLEAN vs ORIGINAL META]"
+        # )
+
+        # print(
+        #     "cam2lidar error =",
+        #     err_c2l.item()
+        # )
+
+        # print(
+        #     "cam2img error   =",
+        #     err_K.item()
+        # )
+
+        # print(
+        #     "lidar2img error =",
+        #     err_l2i.item()
+        # )
+
+        return self._predict_bevfusion_with_calib(
+            batch_inputs_dict,
+            batch_data_samples,
+            calib_dict,
+        )    
+        
     # ########## old code (이력관리- 나중에 까먹지 않기 !!) ############
     # def _get_corrected_calib_from_prediction(
     #     self,
@@ -2254,6 +2706,35 @@ class BEVFusion(Base3DDetector):
     def predict(self, batch_inputs_dict: Dict[str, Tensor],
                 batch_data_samples: List[Det3DDataSample],
                 **kwargs) -> List[Det3DDataSample]:
+        
+        # ======================================================
+        # Calibration baseline routing
+        # ======================================================
+
+        if self.calibration_mode in {
+            'clean',
+            'broken',
+            'oracle',
+        }:
+
+            return self._predict_calibration_baseline(
+                batch_inputs_dict,
+                batch_data_samples,
+                self.calibration_mode,
+            )
+
+
+        if self.calibration_mode not in {
+            'pcc_calib_only',
+            'pcc_full',
+            'lccnet',
+        }:
+
+            raise ValueError(
+                f'Unknown calibration_mode: '
+                f'{self.calibration_mode}'
+            )
+        
         """
         (Function description remains the same)
         """
@@ -2445,6 +2926,24 @@ class BEVFusion(Base3DDetector):
             broken_camera_intrinsics
         )
 
+        if self.calibration_mode == 'pcc_calib_only':
+
+            results = (
+                self._predict_bevfusion_with_calib(
+                    batch_inputs_dict,
+                    batch_data_samples,
+                    corrected_calib_dict,
+                    img_feats=img_feats,
+                )
+            )
+
+            return self._attach_calib_prediction_meta(
+                results,
+                pred_delta_rot,
+                pred_delta_trans,
+                active_cam_indices,
+            )
+
         det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
 
         # --- ✨ START: Logic copied from loss function ---
@@ -2539,4 +3038,68 @@ class BEVFusion(Base3DDetector):
                 save_path=f'work_dirs/vis/ours_step_{self.training_step}.png'
             )
         
+        return results
+    
+    def _attach_calib_prediction_meta(
+        self,
+        results,
+        pred_delta_rot,
+        pred_delta_trans,
+        active_cam_indices,
+    ):
+
+        rot_cpu = (
+            pred_delta_rot
+            .detach()
+            .cpu()
+        )
+
+        trans_cpu = (
+            pred_delta_trans
+            .detach()
+            .cpu()
+        )
+
+        if torch.is_tensor(
+            active_cam_indices
+        ):
+
+            active_cpu = (
+                active_cam_indices
+                .detach()
+                .cpu()
+                .tolist()
+            )
+
+        else:
+
+            active_cpu = (
+                active_cam_indices
+            )
+
+        for b, ds in enumerate(results):
+
+            mi = dict(
+                ds.metainfo
+            )
+
+            mi.update({
+                'stage1_pred_delta_rot':
+                    rot_cpu[b].tolist(),
+
+                'stage1_pred_delta_trans':
+                    trans_cpu[b].tolist(),
+
+                'stage1_active_cam_indices':
+                    active_cpu,
+
+                'pred_delta_rot_1st':
+                    rot_cpu[b].tolist(),
+
+                'pred_delta_trans_1st':
+                    trans_cpu[b].tolist(),
+            })
+
+            ds.set_metainfo(mi)
+
         return results

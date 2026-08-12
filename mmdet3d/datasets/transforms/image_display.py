@@ -292,12 +292,12 @@ def add_calibration_adv2 (extrinsic, intrinsic, points_lidar) :
     points_img = torch.cat([points_img[:, :2] / points_img[:, 2:3], points_img[:, 2:3]], 1)
     return points_img , KT
 
-def add_mis_calibration_adv(lidar2img ,extrinsic, homo_intrinsic, points_lidar, max_r=1.0, max_t=0.1):
+def add_mis_calibration_adv(lidar2img ,extrinsic, homo_intrinsic, points_lidar, max_r=1.0, max_t=0.1,generator=None,):
     device = extrinsic.device
     dtype = extrinsic.dtype
     intrinsic = homo_intrinsic[:3,:3] 
     # # 회전 각도 생성 (random)
-    angles = torch.rand(3, device=device, dtype=dtype) * 2 * max_r - max_r
+    angles = torch.rand(3, device=device, dtype=dtype,generator=generator,) * 2 * max_r - max_r
     angles = angles * (torch.pi / 180.0)
     # # 회전 각도 생성 (고정 for test)
     # angles = torch.tensor([0.0, 0.0, 0.0], device=device, dtype=dtype) * (torch.pi / 180.0)  # 10도 → 라디안
@@ -319,7 +319,7 @@ def add_mis_calibration_adv(lidar2img ,extrinsic, homo_intrinsic, points_lidar, 
     # R_perturb = Rx @ Ry @ Rz
 
     # 2. 이동 벡터 생성 (delta_t)
-    delta_t = (torch.rand(3, device=device, dtype=dtype) * 2 * max_t - max_t)
+    delta_t = (torch.rand(3, device=device, dtype=dtype,generator=generator,) * 2 * max_t - max_t)
     # 이동량 고정 (7.5cm)
     # delta_t = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)  # x,y,z 축 각각 7.5cm
 

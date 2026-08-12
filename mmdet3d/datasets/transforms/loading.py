@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import hashlib
 from typing import List, Optional, Union
 
 import mmcv
@@ -1367,11 +1368,36 @@ class CopyImageToKey(BaseTransform):  # <-- 2. BaseTransform 상속
 
 @TRANSFORMS.register_module()
 class PointToMultiViewDepth(object):
-    def __init__(self, grid_config, downsample=1, resize_img=False):
+    def __init__(
+        self,
+        grid_config,
+        downsample=1,
+        resize_img=False,
+        max_r=10.0,
+        max_t=0.75,
+        deterministic_perturb=False,
+        perturb_seed=20260811,
+        debug_calib_consistency=False,
+    ):
         self.downsample = downsample
         self.grid_config = grid_config
         self.num_points = 900
         self.grid_size = 30
+        
+        # =====================================================
+        # Mis-calibration perturbation settings
+        # =====================================================
+        self.max_r = max_r
+        self.max_t = max_t
+
+        self.deterministic_perturb = deterministic_perturb
+        self.perturb_seed = perturb_seed
+
+        # =====================================================
+        # STEP-0 debug
+        # =====================================================
+        self._calib_consistency_checked = debug_calib_consistency
+
 
     def __call__(self, results: dict) -> dict:
         # --- 1. 초기 데이터 준비 ---
@@ -1445,8 +1471,30 @@ class PointToMultiViewDepth(object):
             img_height, img_width, _ = raw_img_np.shape
 
             points2img = add_calibration(lidar2img,points_lidar)
-            miscalibrated_points2img ,perturbed_points, extrinsic_perturb, lidar2img_original ,lidar2img_mis = add_mis_calibration_adv(
-                                                                                    lidar2img,lidar2cam,cam2img, points_lidar, max_r=10.0,max_t=0.75)
+            
+            if self.deterministic_perturb:
+
+                generator = (
+                    self._get_perturb_generator(
+                        results,
+                        cid,
+                        lidar2cam.device,
+                    )
+                )
+
+            else:
+                generator = None
+
+
+            miscalibrated_points2img, perturbed_points, extrinsic_perturb,lidar2img_original, lidar2img_mis = add_mis_calibration_adv(
+                                                                                                            lidar2img,
+                                                                                                            lidar2cam,
+                                                                                                            cam2img,
+                                                                                                            points_lidar,
+                                                                                                            max_r=self.max_r,
+                                                                                                            max_t=self.max_t,
+                                                                                                            generator=generator,
+                                                                                                        )
             
             # # --- ✨ CORRECTED LOGIC V2: 올바른 행렬 곱셈 적용 ---
             # # 1. 'broken_camera2lidar' 계산
@@ -1462,6 +1510,301 @@ class PointToMultiViewDepth(object):
             # 🛑 [수정] inv 행렬이 아니라, T_perturb (extrinsic_perturb) 행렬 자체를 곱해야 합니다.
             # T_{Cam->MisL} = T_{L->MisL} @ T_{Cam->L}
             broken_camera2lidar = extrinsic_perturb @ original_camera2lidar
+
+            # ============================================================
+            # STEP-0 : Calibration Convention Consistency Check
+            # ============================================================
+            #
+            # Definitions
+            #
+            #   T_gt_c2l     = original_camera2lidar
+            #   T_gt_l2c     = lidar2cam
+            #   Delta        = extrinsic_perturb
+            #
+            # Current IROS-final definition:
+            #
+            #   T_broken_c2l = Delta @ T_gt_c2l
+            #
+            # Therefore mathematically:
+            #
+            #   T_broken_l2c
+            #       = inv(T_broken_c2l)
+            #       = T_gt_l2c @ inv(Delta)
+            #
+            # However image_display.py currently generates:
+            #
+            #   RT_mis = T_gt_l2c @ Delta
+            #
+            # The following audit checks these relationships numerically.
+            # ============================================================
+
+            if (
+                not self._calib_consistency_checked
+                and cid == 0
+            ):
+
+                with torch.no_grad():
+
+                    # ----------------------------------------------------
+                    # Intrinsic K
+                    # ----------------------------------------------------
+                    K = cam2img[:3, :3]
+
+                    # ----------------------------------------------------
+                    # [A] image_display.py에서 실제 생성된 mis projection
+                    #
+                    # lidar2img_mis =
+                    #     K @ (lidar2cam @ Delta)
+                    #
+                    # shape : [3, 4]
+                    # ----------------------------------------------------
+                    P_mis_actual = lidar2img_mis
+
+
+                    # ----------------------------------------------------
+                    # [B] 현재 image_display.py 수식을 직접 재계산
+                    #
+                    # RT_mis = lidar2cam @ Delta
+                    # ----------------------------------------------------
+                    RT_mis_active = (
+                        lidar2cam
+                        @ extrinsic_perturb
+                    )
+
+                    P_mis_active = (
+                        K
+                        @ RT_mis_active[:3, :]
+                    )
+
+
+                    # ----------------------------------------------------
+                    # [C] broken_camera2lidar를 실제 broken extrinsic으로
+                    #     간주하여 inverse한 projection
+                    #
+                    # broken_c2l = Delta @ original_c2l
+                    #
+                    # broken_l2c =
+                    #     inv(broken_c2l)
+                    # ----------------------------------------------------
+                    broken_lidar2cam = torch.linalg.inv(
+                        broken_camera2lidar
+                    )
+
+                    P_from_broken = (
+                        K
+                        @ broken_lidar2cam[:3, :]
+                    )
+
+
+                    # ----------------------------------------------------
+                    # [D] 위 식을 algebra로 직접 계산
+                    #
+                    # inv(Delta @ C2L)
+                    #
+                    # = inv(C2L) @ inv(Delta)
+                    #
+                    # = L2C @ inv(Delta)
+                    # ----------------------------------------------------
+                    RT_mis_frame = (
+                        lidar2cam
+                        @ extrinsic_perturb_inv
+                    )
+
+                    P_mis_frame = (
+                        K
+                        @ RT_mis_frame[:3, :]
+                    )
+
+
+                    # ====================================================
+                    # Error #1
+                    #
+                    # image_display.py 구현 자체가 맞게 계산되는지
+                    #
+                    # 예상:
+                    #   거의 0
+                    # ====================================================
+                    err_actual_vs_active = (
+                        P_mis_actual
+                        - P_mis_active
+                    ).abs().max()
+
+
+                    # ====================================================
+                    # Error #2
+                    #
+                    # lidar_depth_mis 생성에 사용한 projection과
+                    # broken_camera2lidar가 표현하는 projection 비교
+                    #
+                    # 이것이 Step-0의 핵심 값
+                    # ====================================================
+                    err_actual_vs_broken = (
+                        P_mis_actual
+                        - P_from_broken
+                    ).abs().max()
+
+
+                    # ====================================================
+                    # Error #3
+                    #
+                    # broken_camera2lidar의 inverse가
+                    #
+                    # lidar2cam @ inv(Delta)
+                    #
+                    # 와 같은지 확인
+                    #
+                    # 예상:
+                    #   거의 0
+                    # ====================================================
+                    err_broken_vs_frame = (
+                        P_from_broken
+                        - P_mis_frame
+                    ).abs().max()
+
+
+                    # ====================================================
+                    # Error #4
+                    #
+                    # broken 정의 자체 확인
+                    #
+                    # broken_c2l
+                    # ==
+                    # Delta @ GT_c2l
+                    #
+                    # 예상:
+                    #   정확히 0
+                    # ====================================================
+                    broken_reconstructed = (
+                        extrinsic_perturb
+                        @ original_camera2lidar
+                    )
+
+                    err_broken_definition = (
+                        broken_camera2lidar
+                        - broken_reconstructed
+                    ).abs().max()
+
+
+                    # ====================================================
+                    # 추가 inverse consistency
+                    #
+                    # C2L × L2C = Identity
+                    # ====================================================
+                    I4 = torch.eye(
+                        4,
+                        dtype=broken_camera2lidar.dtype,
+                        device=broken_camera2lidar.device
+                    )
+
+                    err_inverse = (
+                        broken_camera2lidar
+                        @ broken_lidar2cam
+                        - I4
+                    ).abs().max()
+
+
+                    # ====================================================
+                    # PRINT
+                    # ====================================================
+
+                    print("\n")
+                    print("=" * 72)
+                    print(" STEP-0 CALIBRATION CONSISTENCY AUDIT")
+                    print("=" * 72)
+
+                    print("\n[Definition]")
+                    print(
+                        "GT C2L      : T_gt"
+                    )
+                    print(
+                        "Delta       : extrinsic_perturb"
+                    )
+                    print(
+                        "Broken C2L  : Delta @ T_gt"
+                    )
+
+                    print("\n[1] image_display.py internal check")
+                    print(
+                        "mis_KT vs K@(L2C@Delta)"
+                    )
+                    print(
+                        f"MAX ERROR = "
+                        f"{err_actual_vs_active.item():.8e}"
+                    )
+
+                    print("\n[2] IMPORTANT consistency check")
+                    print(
+                        "mis_KT vs K@inv(Broken_C2L)"
+                    )
+                    print(
+                        f"MAX ERROR = "
+                        f"{err_actual_vs_broken.item():.8e}"
+                    )
+
+                    print("\n[3] Broken inverse algebra check")
+                    print(
+                        "K@inv(Broken_C2L) "
+                        "vs K@(L2C@inv(Delta))"
+                    )
+                    print(
+                        f"MAX ERROR = "
+                        f"{err_broken_vs_frame.item():.8e}"
+                    )
+
+                    print("\n[4] Broken definition check")
+                    print(
+                        "Broken_C2L "
+                        "vs Delta@GT_C2L"
+                    )
+                    print(
+                        f"MAX ERROR = "
+                        f"{err_broken_definition.item():.8e}"
+                    )
+
+                    print("\n[5] Matrix inverse check")
+                    print(
+                        "Broken_C2L @ Broken_L2C "
+                        "vs Identity"
+                    )
+                    print(
+                        f"MAX ERROR = "
+                        f"{err_inverse.item():.8e}"
+                    )
+
+                    print("\n--------------------------------------------------------")
+                    print("extrinsic_perturb (Delta)")
+                    print("--------------------------------------------------------")
+                    print(extrinsic_perturb)
+
+                    print("\n--------------------------------------------------------")
+                    print("GT camera2lidar")
+                    print("--------------------------------------------------------")
+                    print(original_camera2lidar)
+
+                    print("\n--------------------------------------------------------")
+                    print("Broken camera2lidar")
+                    print("--------------------------------------------------------")
+                    print(broken_camera2lidar)
+
+                    print("\n--------------------------------------------------------")
+                    print("Actual mis_KT")
+                    print("= K @ (L2C @ Delta)")
+                    print("--------------------------------------------------------")
+                    print(P_mis_actual)
+
+                    print("\n--------------------------------------------------------")
+                    print("Projection from Broken C2L")
+                    print("= K @ inv(Broken_C2L)")
+                    print("--------------------------------------------------------")
+                    print(P_from_broken)
+
+                    print("\n" + "=" * 72)
+                    print(" END STEP-0 AUDIT")
+                    print("=" * 72)
+                    print("\n")
+
+                # 한 번만 출력
+                self._calib_consistency_checked = True
             
             # 2. 'gt_delta_trans' 와 'gt_delta_rot' 추출 (이전과 동일)
             gt_delta_trans = extrinsic_perturb[:3, 3]
@@ -1647,3 +1990,42 @@ class PointToMultiViewDepth(object):
         results['gt_delta_trans'] = torch.stack(list_gt_delta_trans)
         
         return results
+    
+    def _get_perturb_generator(
+        self,
+        results,
+        cid,
+        device,
+    ):
+        sample_key = str(
+            results.get(
+                'sample_idx',
+                results.get(
+                    'token',
+                    'unknown_sample'
+                )
+            )
+        )
+
+        seed_string = (
+            f"{sample_key}:"
+            f"{cid}:"
+            f"{self.perturb_seed}"
+        )
+
+        digest = hashlib.sha1(
+            seed_string.encode('utf-8')
+        ).hexdigest()
+
+        seed = int(
+            digest[:8],
+            16
+        )
+
+        generator = torch.Generator(
+            device=device
+        )
+
+        generator.manual_seed(seed)
+
+        return generator
