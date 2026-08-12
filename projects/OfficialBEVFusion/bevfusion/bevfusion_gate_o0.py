@@ -29,14 +29,12 @@ class BEVFusion(Base3DDetector):
         bbox_head: Optional[dict] = None,
         init_cfg: OptMultiConfig = None,
         seg_head: Optional[dict] = None,
-        calibration_mode='official',
         **kwargs,
     ) -> None:
         voxelize_cfg = data_preprocessor.pop('voxelize_cfg')
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.calibration_mode = calibration_mode
         self.voxelize_reduce = voxelize_cfg.pop('voxelize_reduce')
         self.pts_voxel_layer = Voxelization(**voxelize_cfg)
 
@@ -182,17 +180,7 @@ class BEVFusion(Base3DDetector):
                 contains a tensor with shape (num_instances, 7).
         """
         batch_input_metas = [item.metainfo for item in batch_data_samples]
-        # feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
-        external_calib = kwargs.get(
-            'external_calib',
-            None
-        )
-
-        feats = self.extract_feat(
-            batch_inputs_dict,
-            batch_input_metas,
-            external_calib=external_calib,
-        )
+        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
 
         if self.with_bbox_head:
             outputs = self.bbox_head.predict(feats, batch_input_metas)
@@ -206,48 +194,6 @@ class BEVFusion(Base3DDetector):
 
         return res
 
-    # def extract_feat(
-    #     self,
-    #     batch_inputs_dict,
-    #     batch_input_metas,
-    #     **kwargs,
-    # ):
-    #     imgs = batch_inputs_dict.get('imgs', None)
-    #     points = batch_inputs_dict.get('points', None)
-
-    #     lidar2image, camera_intrinsics, camera2lidar = [], [], []
-    #     img_aug_matrix, lidar_aug_matrix = [], []
-    #     for i, meta in enumerate(batch_input_metas):
-    #         lidar2image.append(meta['lidar2img'])
-    #         camera_intrinsics.append(meta['cam2img'])
-    #         camera2lidar.append(meta['cam2lidar'])
-    #         img_aug_matrix.append(meta.get('img_aug_matrix', np.eye(4)))
-    #         lidar_aug_matrix.append(meta.get('lidar_aug_matrix', np.eye(4)))
-
-    #     lidar2image = imgs.new_tensor(np.asarray(lidar2image))
-    #     camera_intrinsics = imgs.new_tensor(np.array(camera_intrinsics))
-    #     camera2lidar = imgs.new_tensor(np.asarray(camera2lidar))
-    #     img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
-    #     lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
-    #     img_feature = self.extract_img_feat(imgs, points, lidar2image,
-    #                                         camera_intrinsics, camera2lidar,
-    #                                         img_aug_matrix, lidar_aug_matrix,
-    #                                         batch_input_metas)
-    #     pts_feature = self.extract_pts_feat(batch_inputs_dict)
-
-    #     features = [img_feature, pts_feature]
-
-    #     if self.fusion_layer is not None:
-    #         x = self.fusion_layer(features)
-    #     else:
-    #         assert len(features) == 1, features
-    #         x = features[0]
-
-    #     x = self.pts_backbone(x)
-    #     x = self.pts_neck(x)
-
-    #     return x
-
     def extract_feat(
         self,
         batch_inputs_dict,
@@ -257,140 +203,18 @@ class BEVFusion(Base3DDetector):
         imgs = batch_inputs_dict.get('imgs', None)
         points = batch_inputs_dict.get('points', None)
 
-        lidar2image_meta = []
-        camera_intrinsics = []
-        camera2lidar = []
-
-        img_aug_matrix = []
-        lidar_aug_matrix = []
-
+        lidar2image, camera_intrinsics, camera2lidar = [], [], []
+        img_aug_matrix, lidar_aug_matrix = [], []
         for i, meta in enumerate(batch_input_metas):
+            lidar2image.append(meta['lidar2img'])
+            camera_intrinsics.append(meta['cam2img'])
+            camera2lidar.append(meta['cam2lidar'])
+            img_aug_matrix.append(meta.get('img_aug_matrix', np.eye(4)))
+            lidar_aug_matrix.append(meta.get('lidar_aug_matrix', np.eye(4)))
 
-            # ------------------------------------------------------
-            # Original GT calibration from metadata
-            # ------------------------------------------------------
-            lidar2image_meta.append(
-                meta['lidar2img']
-            )
-
-            camera_intrinsics.append(
-                meta['cam2img']
-            )
-
-            camera2lidar.append(
-                meta['cam2lidar']
-            )
-
-            # ------------------------------------------------------
-            # Keep official augmentation matrices unchanged
-            # ------------------------------------------------------
-            img_aug_matrix.append(
-                meta.get(
-                    'img_aug_matrix',
-                    np.eye(4)
-                )
-            )
-
-            lidar_aug_matrix.append(
-                meta.get(
-                    'lidar_aug_matrix',
-                    np.eye(4)
-                )
-            )
-
-
-        # ==========================================================
-        # Convert metadata into tensors
-        # ==========================================================
-
-        lidar2image_meta = imgs.new_tensor(
-            np.asarray(lidar2image_meta)
-        )
-
-        camera_intrinsics = imgs.new_tensor(
-            np.asarray(camera_intrinsics)
-        )
-
-        camera2lidar = imgs.new_tensor(
-            np.asarray(camera2lidar)
-        )
-
-
-        # ==========================================================
-        # Calibration routing
-        # ==========================================================
-
-        if self.calibration_mode == 'gt_reinject':
-
-            # ------------------------------------------------------
-            # Gate O-2
-            #
-            # DO NOT use metadata lidar2img.
-            #
-            # Reconstruct lidar2img only from:
-            #     GT cam2lidar
-            #     GT cam2img
-            # ------------------------------------------------------
-
-            calib = self._build_calib_dict_from_cam2lidar(
-                camera2lidar,
-                camera_intrinsics,
-            )
-
-            lidar2image = calib['lidar2img']
-            camera_intrinsics = calib['cam2img']
-            camera2lidar = calib['cam2lidar']
-
-            # ======================================================
-            # Gate O-2 geometry audit
-            # ======================================================
-
-            if not hasattr(self, '_gate_o2_checked'):
-
-                err_lidar2img = (
-                    lidar2image
-                    - lidar2image_meta
-                ).abs().max().item()
-
-                print(
-                    "\n[GATE O-2]"
-                    "\nGT Calibration Re-injection"
-                )
-
-                print(
-                    "[GATE O-2] "
-                    "reconstructed lidar2img vs "
-                    "metadata lidar2img = "
-                    f"{err_lidar2img:.8e}"
-                )
-
-                print(
-                    "[GATE O-2] "
-                    "camera2lidar shape =",
-                    tuple(camera2lidar.shape)
-                )
-
-                print(
-                    "[GATE O-2] "
-                    "cam2img shape =",
-                    tuple(camera_intrinsics.shape)
-                )
-
-                assert err_lidar2img < 1e-3, (
-                "[GATE O-2 FAILED] "
-                f"lidar2img reconstruction error="
-                f"{err_lidar2img:.8e}"
-                )
-
-                self._gate_o2_checked = True
-
-        else:
-
-            # ------------------------------------------------------
-            # Original Gate O-0 path
-            # ------------------------------------------------------
-            lidar2image = lidar2image_meta
-        
+        lidar2image = imgs.new_tensor(np.asarray(lidar2image))
+        camera_intrinsics = imgs.new_tensor(np.array(camera_intrinsics))
+        camera2lidar = imgs.new_tensor(np.asarray(camera2lidar))
         img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
         lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
         img_feature = self.extract_img_feat(imgs, points, lidar2image,
@@ -416,46 +240,3 @@ class BEVFusion(Base3DDetector):
              batch_data_samples: List[Det3DDataSample],
              **kwargs) -> List[Det3DDataSample]:
         pass
-
-    def _build_calib_dict_from_cam2lidar(
-        self,
-        camera2lidar,
-        camera_intrinsics,
-    ):
-        """Rebuild BEVFusion calibration from Camera->LiDAR extrinsic.
-
-        Args:
-            camera2lidar:
-                Tensor [B, N, 4, 4]
-
-            camera_intrinsics:
-                Tensor [B, N, 4, 4]
-
-        Returns:
-            dict containing:
-                cam2lidar
-                cam2img
-                lidar2img
-        """
-
-        # Camera -> LiDAR
-        #       inverse
-        # LiDAR -> Camera
-        lidar2camera = torch.linalg.inv(
-            camera2lidar
-        )
-
-        # Camera intrinsic @ LiDAR->Camera
-        #
-        # Official v1.1.0 loader represents cam2img
-        # as homogeneous 4x4 matrix.
-        lidar2image = torch.matmul(
-            camera_intrinsics,
-            lidar2camera,
-        )
-
-        return {
-            'cam2lidar': camera2lidar,
-            'cam2img': camera_intrinsics,
-            'lidar2img': lidar2image,
-        }    
