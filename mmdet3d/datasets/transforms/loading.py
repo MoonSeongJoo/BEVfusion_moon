@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
 import hashlib
+import math
 from typing import List, Optional, Union
 
 import mmcv
@@ -1396,7 +1397,11 @@ class PointToMultiViewDepth(object):
         # =====================================================
         # STEP-0 debug
         # =====================================================
-        self._calib_consistency_checked = debug_calib_consistency
+        self.debug_calib_consistency = bool(
+            debug_calib_consistency
+        )
+
+        self._calib_consistency_checked = False
 
 
     def __call__(self, results: dict) -> dict:
@@ -1469,341 +1474,237 @@ class PointToMultiViewDepth(object):
                 original_camera2lidar = torch.eye(4, dtype=torch.float32, device=lidar2cam.device)
 
             img_height, img_width, _ = raw_img_np.shape
-
-            points2img = add_calibration(lidar2img,points_lidar)
             
-            if self.deterministic_perturb:
+            # ============================================================
+            # CLEAN projection
+            # ============================================================
 
-                generator = (
-                    self._get_perturb_generator(
-                        results,
-                        cid,
-                        lidar2cam.device,
-                    )
+            points2img = add_calibration(
+                lidar2img,
+                points_lidar,
+            )
+
+
+            # ============================================================
+            # Generate Delta
+            #
+            # Validation/test:
+            #     exact frozen O-3
+            #
+            # Training:
+            #     random perturbation
+            # ============================================================
+
+            (
+                extrinsic_perturb,
+                perturb_params,
+            ) = self._sample_calibration_delta(
+                results,
+                cid,
+                lidar2cam,
+            )
+
+
+            # ============================================================
+            # SINGLE SOURCE OF TRUTH
+            #
+            # T_broken_C2L = Delta @ T_GT_C2L
+            # ============================================================
+
+            broken_camera2lidar = (
+                extrinsic_perturb
+                @ original_camera2lidar
+            )
+
+
+            # ============================================================
+            # Derive BROKEN L2C ONLY from broken C2L
+            # ============================================================
+
+            broken_lidar2cam = (
+                torch.linalg.inv(
+                    broken_camera2lidar
                 )
+            )
 
-            else:
-                generator = None
-
-
-            miscalibrated_points2img, perturbed_points, extrinsic_perturb,lidar2img_original, lidar2img_mis = add_mis_calibration_adv(
-                                                                                                            lidar2img,
-                                                                                                            lidar2cam,
-                                                                                                            cam2img,
-                                                                                                            points_lidar,
-                                                                                                            max_r=self.max_r,
-                                                                                                            max_t=self.max_t,
-                                                                                                            generator=generator,
-                                                                                                        )
-            
-            # # --- ✨ CORRECTED LOGIC V2: 올바른 행렬 곱셈 적용 ---
-            # # 1. 'broken_camera2lidar' 계산
-            # ❗️ CRITICAL CHANGE: Perturbation의 '역행렬'을 구합니다.
-            try:
-                extrinsic_perturb_inv = torch.linalg.inv(extrinsic_perturb)
-            except torch.linalg.LinAlgError:
-                extrinsic_perturb_inv = torch.eye(4, dtype=torch.float32, device=extrinsic_perturb.device)
-
-            # # ❗️ CRITICAL CHANGE: T_c2l_broken = inv(T_perturb) @ T_c2l
-            # broken_camera2lidar = extrinsic_perturb_inv @ original_camera2lidar
-           
-            # 🛑 [수정] inv 행렬이 아니라, T_perturb (extrinsic_perturb) 행렬 자체를 곱해야 합니다.
-            # T_{Cam->MisL} = T_{L->MisL} @ T_{Cam->L}
-            broken_camera2lidar = extrinsic_perturb @ original_camera2lidar
 
             # ============================================================
-            # STEP-0 : Calibration Convention Consistency Check
+            # Derive BROKEN projection ONLY from broken L2C
+            #
+            # P_broken
+            # = K @ inv(T_broken_C2L)
             # ============================================================
+
+            lidar2img_mis = (
+                cam2img
+                @ broken_lidar2cam
+            )
+
+
+            # ============================================================
+            # Project ORIGINAL LiDAR points using broken projection.
             #
-            # Definitions
+            # DO NOT independently perturb LiDAR points.
+            # ============================================================
+
+            miscalibrated_points2img = (
+                add_calibration(
+                    lidar2img_mis,
+                    points_lidar,
+                )
+            )
+
+
+            # ============================================================
+            # Legacy fields
             #
-            #   T_gt_c2l     = original_camera2lidar
-            #   T_gt_l2c     = lidar2cam
-            #   Delta        = extrinsic_perturb
+            # perturbed_points was previously generated per-camera,
+            # even though six cameras have six different Deltas.
             #
-            # Current IROS-final definition:
-            #
-            #   T_broken_c2l = Delta @ T_gt_c2l
-            #
-            # Therefore mathematically:
-            #
-            #   T_broken_l2c
-            #       = inv(T_broken_c2l)
-            #       = T_gt_l2c @ inv(Delta)
-            #
-            # However image_display.py currently generates:
-            #
-            #   RT_mis = T_gt_l2c @ Delta
-            #
-            # The following audit checks these relationships numerically.
+            # It is NOT used by current LGPC computation.
+            # Keep shape compatibility only.
+            # ============================================================
+
+            perturbed_points = (
+                points_lidar.clone()
+            )
+
+            lidar2img_original = (
+                lidar2img.clone()
+            ) 
+
+            # ============================================================
+            # PHASE-A GEOMETRY GATE
             # ============================================================
 
             if (
-                not self._calib_consistency_checked
+                self.debug_calib_consistency
+                and not self._calib_consistency_checked
                 and cid == 0
             ):
 
                 with torch.no_grad():
 
                     # ----------------------------------------------------
-                    # Intrinsic K
-                    # ----------------------------------------------------
-                    K = cam2img[:3, :3]
-
-                    # ----------------------------------------------------
-                    # [A] image_display.py에서 실제 생성된 mis projection
+                    # 1. Recover Delta from Broken and GT
                     #
-                    # lidar2img_mis =
-                    #     K @ (lidar2cam @ Delta)
-                    #
-                    # shape : [3, 4]
+                    # Delta_recovered
+                    # = Broken @ inv(GT)
                     # ----------------------------------------------------
-                    P_mis_actual = lidar2img_mis
 
-
-                    # ----------------------------------------------------
-                    # [B] 현재 image_display.py 수식을 직접 재계산
-                    #
-                    # RT_mis = lidar2cam @ Delta
-                    # ----------------------------------------------------
-                    RT_mis_active = (
-                        lidar2cam
-                        @ extrinsic_perturb
-                    )
-
-                    P_mis_active = (
-                        K
-                        @ RT_mis_active[:3, :]
-                    )
-
-
-                    # ----------------------------------------------------
-                    # [C] broken_camera2lidar를 실제 broken extrinsic으로
-                    #     간주하여 inverse한 projection
-                    #
-                    # broken_c2l = Delta @ original_c2l
-                    #
-                    # broken_l2c =
-                    #     inv(broken_c2l)
-                    # ----------------------------------------------------
-                    broken_lidar2cam = torch.linalg.inv(
+                    delta_recovered = (
                         broken_camera2lidar
+                        @ torch.linalg.inv(
+                            original_camera2lidar
+                        )
                     )
 
-                    P_from_broken = (
-                        K
-                        @ broken_lidar2cam[:3, :]
-                    )
+                    err_delta = (
+                        delta_recovered
+                        - extrinsic_perturb
+                    ).abs().max().item()
 
 
                     # ----------------------------------------------------
-                    # [D] 위 식을 algebra로 직접 계산
+                    # 2. Oracle recovery
                     #
-                    # inv(Delta @ C2L)
-                    #
-                    # = inv(C2L) @ inv(Delta)
-                    #
-                    # = L2C @ inv(Delta)
+                    # inv(Delta) @ Broken = GT
                     # ----------------------------------------------------
-                    RT_mis_frame = (
-                        lidar2cam
-                        @ extrinsic_perturb_inv
+
+                    oracle_camera2lidar = (
+                        torch.linalg.inv(
+                            extrinsic_perturb
+                        )
+                        @ broken_camera2lidar
                     )
 
-                    P_mis_frame = (
-                        K
-                        @ RT_mis_frame[:3, :]
-                    )
+                    err_oracle = (
+                        oracle_camera2lidar
+                        - original_camera2lidar
+                    ).abs().max().item()
 
 
-                    # ====================================================
-                    # Error #1
+                    # ----------------------------------------------------
+                    # 3. Projection consistency
                     #
-                    # image_display.py 구현 자체가 맞게 계산되는지
-                    #
-                    # 예상:
-                    #   거의 0
-                    # ====================================================
-                    err_actual_vs_active = (
-                        P_mis_actual
-                        - P_mis_active
-                    ).abs().max()
-
-
-                    # ====================================================
-                    # Error #2
-                    #
-                    # lidar_depth_mis 생성에 사용한 projection과
-                    # broken_camera2lidar가 표현하는 projection 비교
-                    #
-                    # 이것이 Step-0의 핵심 값
-                    # ====================================================
-                    err_actual_vs_broken = (
-                        P_mis_actual
-                        - P_from_broken
-                    ).abs().max()
-
-
-                    # ====================================================
-                    # Error #3
-                    #
-                    # broken_camera2lidar의 inverse가
-                    #
-                    # lidar2cam @ inv(Delta)
-                    #
-                    # 와 같은지 확인
-                    #
-                    # 예상:
-                    #   거의 0
-                    # ====================================================
-                    err_broken_vs_frame = (
-                        P_from_broken
-                        - P_mis_frame
-                    ).abs().max()
-
-
-                    # ====================================================
-                    # Error #4
-                    #
-                    # broken 정의 자체 확인
-                    #
-                    # broken_c2l
+                    # lidar2img_mis
                     # ==
-                    # Delta @ GT_c2l
-                    #
-                    # 예상:
-                    #   정확히 0
-                    # ====================================================
-                    broken_reconstructed = (
-                        extrinsic_perturb
-                        @ original_camera2lidar
+                    # K @ inv(Broken_C2L)
+                    # ----------------------------------------------------
+
+                    projection_from_broken = (
+                        cam2img
+                        @ torch.linalg.inv(
+                            broken_camera2lidar
+                        )
                     )
 
-                    err_broken_definition = (
-                        broken_camera2lidar
-                        - broken_reconstructed
-                    ).abs().max()
+                    err_projection = (
+                        lidar2img_mis
+                        - projection_from_broken
+                    ).abs().max().item()
 
 
-                    # ====================================================
-                    # 추가 inverse consistency
-                    #
-                    # C2L × L2C = Identity
-                    # ====================================================
+                    # ----------------------------------------------------
+                    # 4. Inverse consistency
+                    # ----------------------------------------------------
+
                     I4 = torch.eye(
                         4,
                         dtype=broken_camera2lidar.dtype,
-                        device=broken_camera2lidar.device
+                        device=broken_camera2lidar.device,
                     )
 
                     err_inverse = (
                         broken_camera2lidar
                         @ broken_lidar2cam
                         - I4
-                    ).abs().max()
+                    ).abs().max().item()
 
 
-                    # ====================================================
-                    # PRINT
-                    # ====================================================
-
-                    print("\n")
-                    print("=" * 72)
-                    print(" STEP-0 CALIBRATION CONSISTENCY AUDIT")
-                    print("=" * 72)
-
-                    print("\n[Definition]")
                     print(
-                        "GT C2L      : T_gt"
-                    )
-                    print(
-                        "Delta       : extrinsic_perturb"
-                    )
-                    print(
-                        "Broken C2L  : Delta @ T_gt"
-                    )
-
-                    print("\n[1] image_display.py internal check")
-                    print(
-                        "mis_KT vs K@(L2C@Delta)"
-                    )
-                    print(
-                        f"MAX ERROR = "
-                        f"{err_actual_vs_active.item():.8e}"
+                        '\n'
+                        '====================================================\n'
+                        '[PHASE-A GEOMETRY GATE]\n'
+                        f'perturb = {perturb_params}\n'
+                        '\n'
+                        f'Delta recovery error = '
+                        f'{err_delta:.8e}\n'
+                        '\n'
+                        f'Oracle restore error = '
+                        f'{err_oracle:.8e}\n'
+                        '\n'
+                        f'Broken projection error = '
+                        f'{err_projection:.8e}\n'
+                        '\n'
+                        f'C2L/L2C inverse error = '
+                        f'{err_inverse:.8e}\n'
+                        '===================================================='
                     )
 
-                    print("\n[2] IMPORTANT consistency check")
-                    print(
-                        "mis_KT vs K@inv(Broken_C2L)"
-                    )
-                    print(
-                        f"MAX ERROR = "
-                        f"{err_actual_vs_broken.item():.8e}"
+
+                    assert err_delta < 1e-5, (
+                        'Phase-A FAILED: '
+                        'Broken C2L does not match Delta @ GT.'
                     )
 
-                    print("\n[3] Broken inverse algebra check")
-                    print(
-                        "K@inv(Broken_C2L) "
-                        "vs K@(L2C@inv(Delta))"
-                    )
-                    print(
-                        f"MAX ERROR = "
-                        f"{err_broken_vs_frame.item():.8e}"
+                    assert err_oracle < 1e-5, (
+                        'Phase-A FAILED: '
+                        'inv(Delta) @ Broken does not recover GT.'
                     )
 
-                    print("\n[4] Broken definition check")
-                    print(
-                        "Broken_C2L "
-                        "vs Delta@GT_C2L"
-                    )
-                    print(
-                        f"MAX ERROR = "
-                        f"{err_broken_definition.item():.8e}"
+                    assert err_projection < 1e-5, (
+                        'Phase-A FAILED: '
+                        'Broken depth projection is inconsistent '
+                        'with Broken C2L.'
                     )
 
-                    print("\n[5] Matrix inverse check")
-                    print(
-                        "Broken_C2L @ Broken_L2C "
-                        "vs Identity"
-                    )
-                    print(
-                        f"MAX ERROR = "
-                        f"{err_inverse.item():.8e}"
+                    assert err_inverse < 1e-5, (
+                        'Phase-A FAILED: '
+                        'Broken C2L/L2C inverse inconsistency.'
                     )
 
-                    print("\n--------------------------------------------------------")
-                    print("extrinsic_perturb (Delta)")
-                    print("--------------------------------------------------------")
-                    print(extrinsic_perturb)
 
-                    print("\n--------------------------------------------------------")
-                    print("GT camera2lidar")
-                    print("--------------------------------------------------------")
-                    print(original_camera2lidar)
-
-                    print("\n--------------------------------------------------------")
-                    print("Broken camera2lidar")
-                    print("--------------------------------------------------------")
-                    print(broken_camera2lidar)
-
-                    print("\n--------------------------------------------------------")
-                    print("Actual mis_KT")
-                    print("= K @ (L2C @ Delta)")
-                    print("--------------------------------------------------------")
-                    print(P_mis_actual)
-
-                    print("\n--------------------------------------------------------")
-                    print("Projection from Broken C2L")
-                    print("= K @ inv(Broken_C2L)")
-                    print("--------------------------------------------------------")
-                    print(P_from_broken)
-
-                    print("\n" + "=" * 72)
-                    print(" END STEP-0 AUDIT")
-                    print("=" * 72)
-                    print("\n")
-
-                # 한 번만 출력
                 self._calib_consistency_checked = True
             
             # 2. 'gt_delta_trans' 와 'gt_delta_rot' 추출 (이전과 동일)
@@ -1991,41 +1892,241 @@ class PointToMultiViewDepth(object):
         
         return results
     
-    def _get_perturb_generator(
+    def _sample_calibration_delta(
         self,
         results,
-        cid,
-        device,
+        cam_idx,
+        like_tensor,
     ):
-        sample_key = str(
-            results.get(
+        """Generate calibration perturbation.
+
+        Validation/test:
+            EXACT same frozen O-3 generator used by
+            OfficialBEVFusion/LCCNet.
+
+        Training:
+            random samples from the same uniform range.
+        """
+
+        # =========================================================
+        # 1. Generate six normalized random values
+        # =========================================================
+
+        if self.deterministic_perturb:
+
+            sample_key = results.get(
                 'sample_idx',
                 results.get(
                     'token',
                     'unknown_sample'
                 )
             )
+
+            if (
+                self.deterministic_perturb
+                and cam_idx == 0
+                and not hasattr(
+                    self,
+                    '_sample_key_debug_done'
+                )
+            ):
+                print(
+                    '\n'
+                    '========================================\n'
+                    '[O-3 SAMPLE KEY DEBUG]\n'
+                    f'token      = {results.get("token", None)}\n'
+                    f'sample_idx = {results.get("sample_idx", None)}\n'
+                    f'sample_key = {sample_key}\n'
+                    f'cam_idx    = {cam_idx}\n'
+                    '========================================'
+                )
+
+                self._sample_key_debug_done = True
+
+            sample_key = str(
+                sample_key
+            )
+
+            key = (
+                f"{self.perturb_seed}:"
+                f"{sample_key}:"
+                f"{cam_idx}"
+            )
+
+            digest = hashlib.sha1(
+                key.encode('utf-8')
+            ).digest()
+
+            seed = int.from_bytes(
+                digest[:8],
+                byteorder='little',
+                signed=False,
+            )
+
+            seed = seed % (
+                2**63 - 1
+            )
+
+            generator = torch.Generator(
+                device='cpu'
+            )
+
+            generator.manual_seed(
+                seed
+            )
+
+            rnd = torch.rand(
+                6,
+                generator=generator,
+                dtype=torch.float64,
+            )
+
+        else:
+
+            # Training:
+            # random sampling from the same distribution.
+            rnd = torch.rand(
+                6,
+                dtype=torch.float64,
+            )
+
+
+        # =========================================================
+        # 2. Rotation / translation
+        # =========================================================
+
+        rot_deg = (
+            2.0 * rnd[:3] - 1.0
+        ) * self.max_r
+
+        trans_m = (
+            2.0 * rnd[3:] - 1.0
+        ) * self.max_t
+
+
+        rx_deg = float(
+            rot_deg[0]
         )
 
-        seed_string = (
-            f"{sample_key}:"
-            f"{cid}:"
-            f"{self.perturb_seed}"
+        ry_deg = float(
+            rot_deg[1]
         )
 
-        digest = hashlib.sha1(
-            seed_string.encode('utf-8')
-        ).hexdigest()
-
-        seed = int(
-            digest[:8],
-            16
+        rz_deg = float(
+            rot_deg[2]
         )
 
-        generator = torch.Generator(
-            device=device
+        tx = float(
+            trans_m[0]
         )
 
-        generator.manual_seed(seed)
+        ty = float(
+            trans_m[1]
+        )
 
-        return generator
+        tz = float(
+            trans_m[2]
+        )
+
+
+        # =========================================================
+        # 3. Euler convention
+        #
+        # R = Rz @ Ry @ Rx
+        # =========================================================
+
+        rx = math.radians(
+            rx_deg
+        )
+
+        ry = math.radians(
+            ry_deg
+        )
+
+        rz = math.radians(
+            rz_deg
+        )
+
+        cx, sx = (
+            math.cos(rx),
+            math.sin(rx),
+        )
+
+        cy, sy = (
+            math.cos(ry),
+            math.sin(ry),
+        )
+
+        cz, sz = (
+            math.cos(rz),
+            math.sin(rz),
+        )
+
+
+        Rx = like_tensor.new_tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cx, -sx],
+                [0.0, sx,  cx],
+            ]
+        )
+
+        Ry = like_tensor.new_tensor(
+            [
+                [cy, 0.0, sy],
+                [0.0, 1.0, 0.0],
+                [-sy, 0.0, cy],
+            ]
+        )
+
+        Rz = like_tensor.new_tensor(
+            [
+                [cz, -sz, 0.0],
+                [sz,  cz, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+        R = (
+            Rz
+            @ Ry
+            @ Rx
+        )
+
+
+        # =========================================================
+        # 4. Build Delta
+        # =========================================================
+
+        delta = torch.eye(
+            4,
+            device=like_tensor.device,
+            dtype=like_tensor.dtype,
+        )
+
+        delta[:3, :3] = R
+
+        delta[:3, 3] = (
+            like_tensor.new_tensor(
+                [
+                    tx,
+                    ty,
+                    tz,
+                ]
+            )
+        )
+
+
+        params = {
+            'rx_deg': rx_deg,
+            'ry_deg': ry_deg,
+            'rz_deg': rz_deg,
+            'tx_m': tx,
+            'ty_m': ty,
+            'tz_m': tz,
+        }
+
+        return (
+            delta,
+            params,
+        )

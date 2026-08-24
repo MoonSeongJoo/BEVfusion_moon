@@ -209,10 +209,27 @@ class BEVFusion(Base3DDetector):
         # =====================================================================
         # ✨ END: Code added for selective module freezing
         # =====================================================================
+        corr_total_params = sum(
+            p.numel()
+            for p in self.corr.parameters()
+        )
+
+        corr_trainable_params = sum(
+            p.numel()
+            for p in self.corr.parameters()
+            if p.requires_grad
+        )
+
+        print(
+            '[PHASE-A] CorrNet trainable params = '
+            f'{corr_trainable_params} / '
+            f'{corr_total_params}'
+        )
 
         self.vis_step_counter = 0
         self.training_step = 0
-        self.pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        # self.pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        self.pc_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
     
     def _freeze_modules(self):
             """
@@ -2302,7 +2319,12 @@ class BEVFusion(Base3DDetector):
             correction_matrix = torch.eye(4, dtype=dtype, device=device).expand(B, N, -1, -1)
             
         # 2.2 Broken T_c2l 에 correction_matrix 를 곱하여 최종 보정
-        # T_Cam->Lidar_Corrected = T_MisLidar->Lidar_Correction @ T_Cam->Lidar_Broken
+        """
+        Predicted error Delta_pred is inverted and left-multiplied:
+
+            T_corrected
+                = inv(Delta_pred) @ T_broken
+        """
         corrected_camera2lidar = torch.matmul(correction_matrix,broken_camera2lidar)
         
         # --- 3. 행렬 추출 및 역변환 ---
@@ -2489,23 +2511,57 @@ class BEVFusion(Base3DDetector):
                 u_coords_flat = uv_orig_flat_active[:, 0].round().long().clamp(0, W_gt - 1)
                 v_coords_flat = uv_orig_flat_active[:, 1].round().long().clamp(0, H_gt - 1)
 
-                # "진짜" GT 깊이 값 [NumActive * Q]
-                z_lidar_sparse_gt_TRUE_flat = depth_map_active_TRUE[cam_ids_active_flat, v_coords_flat, u_coords_flat]
-                
-                # [NumActive, Q] 형태로 복원
-                z_lidar_sparse_gt_TRUE_active = z_lidar_sparse_gt_TRUE_flat.view(num_active, Q)
-                
-                # 6. Z-Estimator 손실 계산 (예측 vs "진짜" 정답)
-                valid_mask_active = (z_lidar_sparse_gt_TRUE_active > 0) # "진짜" 정답이 있는 곳만
+                # ============================================================
+                # PHASE-A FIX:
+                # Z supervision must follow the BROKEN correspondence.
+                #
+                # P3D = (u', v', z')
+                #
+                # Therefore target z' is the broken-depth value at
+                # the predicted broken pixel (u', v'), NOT clean-depth
+                # at the same pixel.
+                # ============================================================
 
-                if valid_mask_active.any():
-                    loss_z_estimation = F.smooth_l1_loss(  # <-- L1을 Smooth L1로 변경
-                                        z_estimated_active.squeeze(-1)[valid_mask_active], # 예측
-                                        z_lidar_sparse_gt_TRUE_active[valid_mask_active],  # "진짜" 정답
-                                        reduction='mean',
-                                        beta=1.0  # beta=1.0이 표준입니다 (오차 1.0 기준 L1/L2 전환)
-                                    )
-                    losses['loss_z_estimation'] = loss_z_estimation * 1
+                z_target_broken = (
+                    esitmated_z_active[
+                        'z_lidar_real'
+                    ]
+                    .detach()
+                    .squeeze(-1)
+                )
+
+
+                z_prediction = (
+                    z_estimated_active
+                    .squeeze(-1)
+                )
+
+
+                valid_z_mask = (
+                    z_target_broken > 0
+                )
+
+
+                if valid_z_mask.any():
+
+                    loss_z_estimation = (
+                        F.smooth_l1_loss(
+                            z_prediction[
+                                valid_z_mask
+                            ],
+                            z_target_broken[
+                                valid_z_mask
+                            ],
+                            reduction='mean',
+                            beta=1.0,
+                        )
+                    )
+
+                    losses[
+                        'loss_z_estimation'
+                    ] = (
+                        loss_z_estimation
+                    )
                 
                 # --- ✨ 1. [신규] Z-Estimator의 예측(z')을 Corr 예측(u', v')과 결합 ---
                 # raw_corrs_active: (NumActive, Q, 2)
@@ -2540,9 +2596,9 @@ class BEVFusion(Base3DDetector):
                 # 🛑 [NEW] 1. Translation 예측의 강제 보수화 (Zero Regularization Loss)
                 # pred_trans_filtered (예측된 이동 델타)가 0에서 멀어지는 것을 처벌합니다.
                 # L2 정규화 (torch.sum(x**2))는 L2 Loss와 동일한 역할을 합니다.
-                loss_trans_regularization = torch.sum(pred_trans_filtered**2).mean()
-                # 💡 가중치 10.0을 적용하여 강한 보수성을 부여 (요청하신 대로)
-                losses['loss_reg_trans'] = loss_trans_regularization * 1.0
+                # loss_trans_regularization = torch.sum(pred_trans_filtered**2).mean()
+                # # 💡 가중치 10.0을 적용하여 강한 보수성을 부여 (요청하신 대로)
+                # losses['loss_reg_trans'] = loss_trans_regularization * 1.0
                 losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 100.0
                 losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 50.0
             # --- if/else 블록 끝 ---
