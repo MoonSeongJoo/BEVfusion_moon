@@ -163,6 +163,11 @@ class BEVFusion(Base3DDetector):
             'pcc_calib_only',
             'pcc_full',
             'lccnet',
+            # NEW:
+            # Broken geometry + RRRF feature refinement
+            # Stage-1 SE(3) correction is NOT applied.
+            'pcc_broken_refine',
+            'pcc_clean_refine',
         }
 
         if self.calibration_mode not in valid_calibration_modes:
@@ -170,6 +175,11 @@ class BEVFusion(Base3DDetector):
                 f'Unsupported calibration_mode: '
                 f'{self.calibration_mode}'
             )
+        
+        print(
+            f'[BEVFusion] calibration_mode = '
+            f'{self.calibration_mode}'
+        )
         
         self.bbox_head = MODELS.build(bbox_head)
         self.img_bbox_head = MODELS.build(img_bbox_head)
@@ -516,7 +526,8 @@ class BEVFusion(Base3DDetector):
         # ✨ 보정된 Calibration 딕셔너리를 선택적으로 받음
         corrected_calib: Optional[Dict[str, torch.Tensor]] = None,
         # ✨ 미리 계산된 이미지 백본 특징을 선택적으로 받음
-        precomputed_img_feats: Optional[tuple] = None
+        precomputed_img_feats: Optional[tuple] = None,
+        return_lidar_query_feat=False,
     ) -> tuple:
         """
         이미지와 포인트 클라우드 특징을 추출하고 융합합니다.
@@ -585,6 +596,28 @@ class BEVFusion(Base3DDetector):
         
         # 포인트 클라우드 특징 추출 (카메라와 무관)
         pts_feature = self.extract_pts_feat(batch_inputs_dict)
+
+        # ============================================================
+        # NEW: LiDAR-only feature for query feasibility test
+        #
+        # IMPORTANT:
+        # - no camera feature
+        # - no ConvFuser
+        # - reuse existing SECOND + SECONDFPN
+        # - test/inference feasibility only
+        # ============================================================
+
+        lidar_query_feat = None
+
+        if return_lidar_query_feat:
+
+            lidar_query_feat = self.pts_backbone(
+                pts_feature
+            )
+
+            lidar_query_feat = self.pts_neck(
+                lidar_query_feat
+            )
         
         # --- 3. 특징 융합 및 3D 후처리 ---
         features = [img_bev_feature, pts_feature]
@@ -599,6 +632,10 @@ class BEVFusion(Base3DDetector):
         x = self.pts_neck(x)
 
         # --- 4. 결과 반환 ---
+
+        if return_lidar_query_feat:
+            return x, lidar_query_feat
+        
         return x
 
     # def extract_feat(
@@ -652,6 +689,7 @@ class BEVFusion(Base3DDetector):
         batch_inputs_dict,
         batch_input_metas,
         visualize=False,
+        depth_mode='broken',
         **kwargs,
     ):
         imgs = batch_inputs_dict.get('img_original', None)
@@ -667,13 +705,63 @@ class BEVFusion(Base3DDetector):
             lidar_depth_mis = imgs.new_tensor(np.asarray(lidar_depth_mis))
             lidar_depth_gt = imgs.new_tensor(np.asarray(lidar_depth_gt))
 
-            dense_depth_map_mis = dense_map_from_depth_batch_v2(lidar_depth_mis,grid=3,iterations=3)
-            dense_depth_img_mis = dense_depth_map_mis.to(dtype=torch.uint8)
-            dense_depth_img_color_mis = batch_colormap(dense_depth_img_mis)
+            # dense_depth_map_mis = dense_map_from_depth_batch_v2(lidar_depth_mis,grid=3,iterations=3)
+            # dense_depth_img_mis = dense_depth_map_mis.to(dtype=torch.uint8)
+            # dense_depth_img_color_mis = batch_colormap(dense_depth_img_mis)
+            # dense_depth_map = dense_map_from_depth_batch_v2(lidar_depth_gt,grid=3,iterations=3)
+            # # dense_depth_img = dense_depth_map.to(dtype=torch.uint8)
+            # # dense_depth_img_color = batch_colormap(dense_depth_img)
 
-            dense_depth_map = dense_map_from_depth_batch_v2(lidar_depth_gt,grid=3,iterations=3)
-            # dense_depth_img = dense_depth_map.to(dtype=torch.uint8)
-            # dense_depth_img_color = batch_colormap(dense_depth_img)
+            # ============================================================
+            # Build both BROKEN and CLEAN depth maps
+            # ============================================================
+            dense_depth_map_mis = dense_map_from_depth_batch_v2(
+                lidar_depth_mis,
+                grid=3,
+                iterations=3
+            )
+
+            dense_depth_map_gt = dense_map_from_depth_batch_v2(
+                lidar_depth_gt,
+                grid=3,
+                iterations=3
+            )
+            # ============================================================
+            # Select depth actually given to CorrNet / Z-estimator
+            # ============================================================
+
+            if depth_mode == 'clean':
+
+                dense_depth_map_selected = (
+                    dense_depth_map_gt
+                )
+
+            elif depth_mode == 'broken':
+
+                dense_depth_map_selected = (
+                    dense_depth_map_mis
+                )
+
+            else:
+
+                raise ValueError(
+                    f'Unknown depth_mode: {depth_mode}'
+                )
+
+
+            dense_depth_img_selected = (
+                dense_depth_map_selected.to(
+                    dtype=torch.uint8
+                )
+            )
+
+            dense_depth_img_color_selected = (
+                batch_colormap(
+                    dense_depth_img_selected
+                )
+            )
+
+
 
             # 픽셀 값을 0.0 ~ 1.0 범위로 정규화하여 imshow가 올바르게 표시하도록 함
             img_min, img_max = imgs.min(), imgs.max()
@@ -681,7 +769,7 @@ class BEVFusion(Base3DDetector):
 
             N, V, C, H, W = imgs.shape
             imgs_reshaped = imgs.view(N * V, C, H, W)
-            depth_reshaped_mis = dense_depth_img_color_mis.view(N * V, C, H, W)
+            depth_reshaped_mis = dense_depth_img_color_selected.view(N * V, C, H, W)
 
             img_resized = F.interpolate(imgs_reshaped, size=[192, 640], mode="bilinear")
             lidar_depth_mis_resized = F.interpolate(depth_reshaped_mis, size=[192, 640], mode="bilinear")
@@ -693,10 +781,10 @@ class BEVFusion(Base3DDetector):
 
             # ############## input display ##########################
             if visualize and sbs_img is not None:
-                display_depth_maps(imgs,dense_depth_img_color_mis,sbs_img)
+                display_depth_maps(imgs,dense_depth_img_color_selected,sbs_img)
                 print("input dispaly end")
         
-        return sbs_img, points ,dense_depth_map_mis,dense_depth_map
+        return sbs_img, points ,dense_depth_map_selected,dense_depth_map_gt # CorrNet/Z가 실제 사용할 depth # GT clean depth는 diagnostic용
     
     def box_iou(self, bboxes1, bboxes2):
         """
@@ -2313,7 +2401,26 @@ class BEVFusion(Base3DDetector):
             else:
                 query_input = torch.stack([q_x, q_y], dim=-1)
 
-            sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
+            # sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(batch_inputs_dict, batch_input_metas,visualize=False)
+           
+            # ============================================================
+            # Select CorrNet / Z-estimator input condition
+            # ============================================================
+            if self.calibration_mode == 'pcc_clean_refine':
+                depth_mode = 'clean'
+            else:
+                depth_mode = 'broken'
+
+
+            sbs_img, pertubed_points, dense_depth_map, dense_depth_map_gt = \
+                self.extract_sbs_img(
+                    batch_inputs_dict,
+                    batch_input_metas,
+                    visualize=False,
+                    # NEW
+                    depth_mode=depth_mode,
+                )
+           
             B,N,C,H,W = sbs_img.shape
             d_model = 312
             feat_h, feat_w = 12, 64
@@ -2728,6 +2835,10 @@ class BEVFusion(Base3DDetector):
             'pcc_calib_only',
             'pcc_full',
             'lccnet',
+            # NEW
+            'pcc_broken_refine',
+            'pcc_clean_refine',
+
         }:
 
             raise ValueError(
@@ -2755,6 +2866,14 @@ class BEVFusion(Base3DDetector):
 
         broken_camera2lidar = torch.stack([s.broken_camera2lidar for s in batch_data_samples]).to(target_device)
         broken_camera_intrinsics = torch.stack([s.broken_camera_intrinsics for s in batch_data_samples]).to(target_device)
+        # ============================================================
+        # NEW: clean physical calibration
+        # ============================================================
+
+        clean_camera2lidar = torch.stack([
+            s.camera2lidar
+            for s in batch_data_samples
+        ]).to(target_device)
         
         img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
         reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
@@ -2903,6 +3022,14 @@ class BEVFusion(Base3DDetector):
             batch_input_metas[b]['pred_delta_rot_1st'] = batch_input_metas[b]['stage1_pred_delta_rot']
             batch_input_metas[b]['pred_delta_trans_1st'] = batch_input_metas[b]['stage1_pred_delta_trans']
 
+            # =========================================================
+            # NEW
+            # 실제 어떤 calibration mode를 적용하는 실험인지 기록
+            # =========================================================
+            batch_input_metas[b]['calibration_mode'] = (
+                self.calibration_mode
+            )
+
             # ✅ data_sample.metainfo "덮어쓰기" 금지: 기존 metainfo 보존 + update
             mi = dict(batch_data_samples[b].metainfo)  # 기존 메타 복사 (gt_delta_* 유지됨)
 
@@ -2912,6 +3039,7 @@ class BEVFusion(Base3DDetector):
                 'stage1_active_cam_indices': batch_input_metas[b]['stage1_active_cam_indices'],
                 'pred_delta_rot_1st': batch_input_metas[b]['pred_delta_rot_1st'],
                 'pred_delta_trans_1st': batch_input_metas[b]['pred_delta_trans_1st'],
+                'calibration_mode': self.calibration_mode,
             })
 
             batch_data_samples[b].set_metainfo(mi)
@@ -2925,6 +3053,87 @@ class BEVFusion(Base3DDetector):
             broken_camera2lidar,
             broken_camera_intrinsics
         )
+
+        # ============================================================
+        # Build BROKEN calibration dictionary
+        # ============================================================
+
+        broken_calib_dict = (
+            self._build_calib_dict_from_cam2lidar(
+                broken_camera2lidar,
+                broken_camera_intrinsics,
+            )
+        )
+
+        # ============================================================
+        # NEW: CLEAN calibration dictionary
+        # ============================================================
+
+        clean_calib_dict = (
+            self._build_calib_dict_from_cam2lidar(
+                clean_camera2lidar,
+                broken_camera_intrinsics,
+            )
+        )
+
+        # ============================================================
+        # Calibration actually used by BEVFusion and RRRF
+        # ============================================================
+
+        if self.calibration_mode == 'pcc_broken_refine':
+
+            # Broken geometry + FeatureRefine
+            active_calib_dict = (
+                broken_calib_dict
+            )
+
+
+        elif self.calibration_mode == 'pcc_clean_refine':
+
+            # Clean geometry + FeatureRefine
+            # No LGPC physical correction needed.
+            active_calib_dict = (
+                clean_calib_dict
+            )
+
+        else:
+
+            # pcc_full etc.
+            active_calib_dict = (
+                corrected_calib_dict
+            )
+
+        # ============================================================
+        # DEBUG: verify which physical calibration is actually active
+        # ============================================================
+        if (
+            self.calibration_mode == 'pcc_clean_refine'
+            and not hasattr(self, '_clean_refine_debug_done')
+        ):
+
+            active_c2l = active_calib_dict['cam2lidar']
+
+            err_to_clean = (
+                active_c2l
+                - clean_camera2lidar
+            ).abs().max().item()
+
+            err_to_broken = (
+                active_c2l
+                - broken_camera2lidar
+            ).abs().max().item()
+
+            print(
+                '\n'
+                '=========================================\n'
+                '[CLEAN REFINE SANITY]\n'
+                f'mode={self.calibration_mode}\n'
+                f'active_vs_clean_maxerr  = {err_to_clean:.8e}\n'
+                f'active_vs_broken_maxerr = {err_to_broken:.8e}\n'
+                '=========================================\n'
+            )
+
+            self._clean_refine_debug_done = True
 
         if self.calibration_mode == 'pcc_calib_only':
 
@@ -2944,7 +3153,7 @@ class BEVFusion(Base3DDetector):
                 active_cam_indices,
             )
 
-        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, corrected_calib_dict['lidar2img'])
+        det_xyz = self.uvz_to_lidar_xyz(esitmated_uvz, active_calib_dict['lidar2img'])
 
         # --- ✨ START: Logic copied from loss function ---
         # loss 함수와 동일하게 좌표를 pc_range로 정규화 및 클램핑합니다.
@@ -2963,11 +3172,61 @@ class BEVFusion(Base3DDetector):
             det_xyz_ref_clamped, det_feat_sampled, B=B, N_cam=N)
 
         # --- 7. & 8. Final 3D Detection and Formatting (Same as before) ---
-        feats = self.extract_feat(
-            batch_inputs_dict=batch_inputs_dict,
-            batch_input_metas=batch_input_metas,
-            corrected_calib=corrected_calib_dict,
-            precomputed_img_feats=img_feats)
+        # feats = self.extract_feat(
+        #     batch_inputs_dict=batch_inputs_dict,
+        #     batch_input_metas=batch_input_metas,
+        #     corrected_calib=active_calib_dict,
+        #     precomputed_img_feats=img_feats)
+
+        use_lidar_query = (
+            getattr(
+                self.bbox_head,
+                'query_source',
+                'fused'
+            )
+            == 'lidar'
+        )
+
+
+        if use_lidar_query:
+
+            (
+                feats,
+                lidar_query_feats
+            ) = self.extract_feat(
+                batch_inputs_dict=
+                    batch_inputs_dict,
+
+                batch_input_metas=
+                    batch_input_metas,
+
+                corrected_calib=
+                    active_calib_dict,
+
+                precomputed_img_feats=
+                    img_feats,
+
+                return_lidar_query_feat=
+                    True,
+            )
+
+        else:
+
+            feats = self.extract_feat(
+                batch_inputs_dict=
+                    batch_inputs_dict,
+
+                batch_input_metas=
+                    batch_input_metas,
+
+                corrected_calib=
+                    active_calib_dict,
+
+                precomputed_img_feats=
+                    img_feats,
+            )
+
+            lidar_query_feats = None
         
         # # --- ⏱️ Stage-2 (RRRF) 순수 오버헤드 측정 시작 ---
         # s2_start = torch.cuda.Event(enable_timing=True)
@@ -2976,8 +3235,18 @@ class BEVFusion(Base3DDetector):
         # torch.cuda.synchronize() # 이전 연산 완료 보장
         # s2_start.record()
         
+        # results_list_3d = self.bbox_head.predict(
+        #     feats, det_xyz_proc, det_feat_proc, batch_input_metas)
+        
         results_list_3d = self.bbox_head.predict(
-            feats, det_xyz_proc, det_feat_proc, batch_input_metas)
+            feats,
+            det_xyz_proc,
+            det_feat_proc,
+            batch_input_metas,
+
+            lidar_query_feats=
+                lidar_query_feats,
+        )
         
         results = self.add_pred_to_datasample(batch_data_samples,
                                             results_list_3d)
@@ -3026,6 +3295,13 @@ class BEVFusion(Base3DDetector):
                 # metric alias (stage1)
                 'pred_delta_rot_1st': stage1_rot_cpu[b].tolist(),
                 'pred_delta_trans_1st': stage1_trans_cpu[b].tolist(),
+
+                # =====================================================
+                # NEW
+                # evaluator에게 실제 calibration application mode 전달
+                # =====================================================
+                'calibration_mode':
+                    self.calibration_mode,
             })
 
             ds.set_metainfo(mi)
@@ -3034,7 +3310,7 @@ class BEVFusion(Base3DDetector):
             visualize_ours_fusion_result(
                 batch_inputs_dict=batch_inputs_dict,
                 results=results,
-                corrected_calib=corrected_calib_dict,  # LGPC에서 보정된 행렬 사용 
+                corrected_calib=active_calib_dict,  # mode에 따라 실제 적용된 calibration
                 save_path=f'work_dirs/vis/ours_step_{self.training_step}.png'
             )
         
@@ -3098,6 +3374,10 @@ class BEVFusion(Base3DDetector):
 
                 'pred_delta_trans_1st':
                     trans_cpu[b].tolist(),
+
+                # NEW
+                'calibration_mode':
+                    self.calibration_mode,
             })
 
             ds.set_metainfo(mi)

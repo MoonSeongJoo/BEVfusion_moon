@@ -342,6 +342,1342 @@ class CalibRecoveryMetric(BaseMetric):
             out[k] = float(np.nanmean(vals))
         return out
 
+# ============================================================
+# LCCNet-compatible physical calibration metric
+# ============================================================
+
+NUSC_CAMERA_NAMES_METRIC = [
+    'CAM_FRONT',
+    'CAM_FRONT_RIGHT',
+    'CAM_FRONT_LEFT',
+    'CAM_BACK',
+    'CAM_BACK_LEFT',
+    'CAM_BACK_RIGHT',
+]
+
+
+def _to_cam3_no_mean(x, device=None):
+    """
+    Convert calibration parameter to [Ncam, 3].
+
+    IMPORTANT:
+    Unlike old CalibRecoveryMetric,
+    NEVER average cameras here.
+    """
+
+    if x is None:
+        return None
+
+    if torch.is_tensor(x):
+        t = x.to(device) if device is not None else x
+    else:
+        try:
+            t = torch.as_tensor(
+                x,
+                device=device,
+                dtype=torch.float32
+            )
+        except Exception:
+            return None
+
+    t = t.float()
+
+    # [1, Ncam, 3] -> [Ncam, 3]
+    if t.dim() == 3 and t.shape[0] == 1:
+        t = t[0]
+
+    # [3] -> [1,3]
+    if t.dim() == 1:
+        if t.numel() != 3:
+            return None
+        t = t.reshape(1, 3)
+
+    if t.shape[-1] != 3:
+        return None
+
+    return t.reshape(-1, 3)
+
+
+def _to_cam44(x, device=None):
+    """
+    Convert extrinsic matrices to [Ncam, 4, 4].
+
+    Supported:
+        [4,4]
+        [Ncam,4,4]
+        [1,Ncam,4,4]
+        [Ncam,3,4]
+    """
+
+    if x is None:
+        return None
+
+    if torch.is_tensor(x):
+        t = x.to(device) if device is not None else x
+    else:
+        try:
+            t = torch.as_tensor(
+                x,
+                device=device,
+                dtype=torch.float32
+            )
+        except Exception:
+            return None
+
+    t = t.float()
+
+    # [1,N,4,4] -> [N,4,4]
+    if t.dim() == 4 and t.shape[0] == 1:
+        t = t[0]
+
+    # [4,4] -> [1,4,4]
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+
+    # [N,3,4] -> [N,4,4]
+    if t.dim() == 3 and t.shape[-2:] == (3, 4):
+
+        n = t.shape[0]
+
+        bottom = torch.zeros(
+            n, 1, 4,
+            dtype=t.dtype,
+            device=t.device
+        )
+
+        bottom[:, 0, 3] = 1.0
+
+        t = torch.cat(
+            [t, bottom],
+            dim=1
+        )
+
+    if (
+        t.dim() != 3
+        or t.shape[-2:] != (4, 4)
+    ):
+        return None
+
+    return t
+
+def _build_delta_matrix(rot_aa, trans):
+    """
+    PCC prediction:
+        rot_aa : [N,3] axis-angle
+        trans  : [N,3]
+
+    Returns:
+        Delta_pred : [N,4,4]
+    """
+
+    R = axis_angle_to_matrix(
+        rot_aa
+    )
+
+    n = R.shape[0]
+
+    T = torch.eye(
+        4,
+        dtype=R.dtype,
+        device=R.device
+    ).unsqueeze(0).repeat(
+        n, 1, 1
+    )
+
+    T[:, :3, :3] = R
+    T[:, :3, 3] = trans
+
+    return T
+
+def _compute_lccnet_physical_residual(
+    correction,
+    broken_c2l,
+    gt_c2l,
+):
+    """
+    EXACT same physical residual definition
+    used by current LCCNet validation.
+
+    corrected_c2l =
+        correction @ broken_c2l
+
+    residual =
+        corrected_c2l @ inv(gt_c2l)
+
+    Perfect correction:
+        residual == Identity
+
+    Returns:
+        rot_deg : [N]
+        trans_m : [N]
+    """
+
+    corrected_c2l = (
+        correction
+        @ broken_c2l
+    )
+
+    residual = (
+        corrected_c2l
+        @ torch.linalg.inv(
+            gt_c2l
+        )
+    )
+
+    # --------------------------------------------------------
+    # Translation residual
+    # --------------------------------------------------------
+    trans_m = torch.linalg.norm(
+        residual[..., :3, 3],
+        dim=-1
+    )
+
+    # --------------------------------------------------------
+    # Rotation geodesic residual
+    # Same implementation as LCCNet validation.
+    # --------------------------------------------------------
+    R = residual[..., :3, :3]
+
+    trace = (
+        R[..., 0, 0]
+        + R[..., 1, 1]
+        + R[..., 2, 2]
+    )
+
+    cosine = (
+        trace - 1.0
+    ) / 2.0
+
+    cosine = torch.clamp(
+        cosine,
+        -1.0,
+        1.0
+    )
+
+    rot_deg = torch.rad2deg(
+        torch.acos(
+            cosine
+        )
+    )
+
+    return rot_deg, trans_m
+
+def _extract_camera_names_metric(
+    gt_sample,
+    num_cams,
+):
+    meta = _get_metainfo(
+        gt_sample
+    )
+
+    img_paths = meta.get(
+        'img_path',
+        None
+    )
+
+    if isinstance(
+        img_paths,
+        str
+    ):
+        img_paths = [img_paths]
+
+    if not isinstance(
+        img_paths,
+        (list, tuple)
+    ):
+        return [
+            f'CAMERA_INDEX_{i}'
+            for i in range(num_cams)
+        ]
+
+    output = []
+
+    for i in range(num_cams):
+
+        if i >= len(img_paths):
+            output.append(
+                f'CAMERA_INDEX_{i}'
+            )
+            continue
+
+        text = str(
+            img_paths[i]
+        ).replace(
+            '\\',
+            '/'
+        )
+
+        detected = None
+
+        for name in (
+            NUSC_CAMERA_NAMES_METRIC
+        ):
+
+            if f'/{name}/' in text:
+                detected = name
+                break
+
+        if detected is None:
+            detected = (
+                f'CAMERA_INDEX_{i}'
+            )
+
+        output.append(
+            detected
+        )
+
+    return output
+
+@METRICS.register_module()
+class CalibLCCNetMetric(BaseMetric):
+    """
+    PCC calibration metric using EXACTLY the same
+    physical residual definition as the current
+    LCCNet validation.
+
+    Primary use:
+        Apples-to-apples PCC vs LCCNet comparison.
+
+    PCC convention
+    --------------
+
+        T_broken =
+            Delta_GT @ T_GT
+
+    Stage1 LGPC predicts:
+        Delta1_pred
+
+    Therefore correction:
+        C1 =
+            inv(Delta1_pred)
+
+    Corrected calibration:
+        T_corr_s1 =
+            C1 @ T_broken
+
+    LCCNet-compatible residual:
+        E =
+            T_corr_s1 @ inv(T_GT)
+
+    Metrics:
+        rotation = SO(3) geodesic angle [deg]
+        translation = norm(E[:3,3]) [m]
+
+    Camera handling:
+        ERROR FIRST -> THEN aggregate.
+
+    Never:
+        mean camera parameters -> error.
+    """
+
+    def __init__(
+        self,
+        collect_device='cpu',
+        prefix='calib_lccnet',
+        debug=False,
+        debug_n=3,
+    ):
+        super().__init__(
+            collect_device=collect_device,
+            prefix=prefix
+        )
+
+        self.debug = debug
+        self.debug_n = debug_n
+        self._dbg_printed = 0
+
+    # ========================================================
+    # Geometry
+    # ========================================================
+    def _get_geometry(
+        self,
+        gt_sample,
+    ):
+
+        meta = _get_metainfo(
+            gt_sample
+        )
+
+        gt_c2l = _pick(
+            meta,
+            'camera2lidar',
+            'clean_camera2lidar',
+            'cam2lidar_clean',
+        )
+
+        broken_c2l = _pick(
+            meta,
+            'broken_camera2lidar',
+            'cam2lidar_broken',
+        )
+
+        gt_c2l = _to_cam44(
+            gt_c2l
+        )
+
+        broken_c2l = _to_cam44(
+            broken_c2l
+        )
+
+        return (
+            gt_c2l,
+            broken_c2l
+        )
+
+    # ========================================================
+    # Stage1 LGPC
+    # ========================================================
+    def _get_stage1(
+        self,
+        pred_sample,
+    ):
+
+        meta = _get_metainfo(
+            pred_sample
+        )
+
+        rot = _pick(
+            meta,
+            'pred_delta_rot_1st',
+            'stage1_pred_delta_rot',
+            'stage1_pred_delta_rot_mean',
+        )
+
+        trans = _pick(
+            meta,
+            'pred_delta_trans_1st',
+            'stage1_pred_delta_trans',
+            'stage1_pred_delta_trans_mean',
+        )
+
+        rot = _to_cam3_no_mean(
+            rot
+        )
+
+        trans = _to_cam3_no_mean(
+            trans
+        )
+
+        return rot, trans
+
+    # ========================================================
+    # Optional Stage2 residual SE(3)
+    # ========================================================
+    def _get_stage2(
+        self,
+        pred_sample,
+    ):
+
+        meta = _get_metainfo(
+            pred_sample
+        )
+
+        rot = _pick(
+            meta,
+            'pred_delta_rot_2nd',
+            'stage2_pred_delta_rot',
+            'pred_delta_rot',
+        )
+
+        trans = _pick(
+            meta,
+            'pred_delta_trans_2nd',
+            'stage2_pred_delta_trans',
+            'pred_delta_trans',
+        )
+
+        rot = _to_cam3_no_mean(
+            rot
+        )
+
+        trans = _to_cam3_no_mean(
+            trans
+        )
+
+        return rot, trans
+
+    # ========================================================
+    # Broadcast Stage2 global prediction if necessary
+    # ========================================================
+    def _match_camera_count(
+        self,
+        x,
+        ncam,
+    ):
+
+        if x is None:
+            return None
+
+        # Stage2 current RRRF:
+        # [1,3] global scene-level prediction.
+        if (
+            x.shape[0] == 1
+            and ncam > 1
+        ):
+            x = x.repeat(
+                ncam,
+                1
+            )
+
+        if x.shape[0] != ncam:
+            return None
+
+        return x
+
+    # ========================================================
+    # Process
+    # ========================================================
+    def process(
+        self,
+        data_batch,
+        data_samples,
+    ):
+
+        logger = (
+            MMLogger.get_current_instance()
+        )
+
+        if (
+            not isinstance(
+                data_batch,
+                dict
+            )
+            or 'data_samples'
+            not in data_batch
+        ):
+            return
+
+        gt_list = data_batch[
+            'data_samples'
+        ]
+
+        for gt_s, pred_s in zip(
+            gt_list,
+            data_samples
+        ):
+            
+            # ========================================================
+            # NEW:
+            # Which calibration was ACTUALLY applied by BEVFusion?
+            # ========================================================
+
+            pred_meta = _get_metainfo(
+                pred_s
+            )
+
+            gt_meta = _get_metainfo(
+                gt_s
+            )
+
+            calibration_mode = pred_meta.get(
+                'calibration_mode',
+                None
+            )
+
+            if calibration_mode is None:
+                calibration_mode = gt_meta.get(
+                    'calibration_mode',
+                    None
+                )
+
+            # 기존 checkpoint / 예전 test와 호환
+            if calibration_mode is None:
+                calibration_mode = 'pcc_full'
+
+            # ------------------------------------------------
+            # GT + Broken C2L
+            # ------------------------------------------------
+            (
+                gt_c2l,
+                broken_c2l
+            ) = self._get_geometry(
+                gt_s
+            )
+
+            if (
+                gt_c2l is None
+                or broken_c2l is None
+            ):
+                continue
+
+            if (
+                gt_c2l.shape[0]
+                != broken_c2l.shape[0]
+            ):
+                continue
+
+            ncam = gt_c2l.shape[0]
+
+            # ------------------------------------------------
+            # Stage1 prediction
+            # ------------------------------------------------
+            rot1, trans1 = (
+                self._get_stage1(
+                    pred_s
+                )
+            )
+
+            rot1 = (
+                self._match_camera_count(
+                    rot1,
+                    ncam
+                )
+            )
+
+            trans1 = (
+                self._match_camera_count(
+                    trans1,
+                    ncam
+                )
+            )
+
+            if (
+                rot1 is None
+                or trans1 is None
+            ):
+                continue
+
+            device = rot1.device
+
+            gt_c2l = gt_c2l.to(
+                device
+            )
+
+            broken_c2l = (
+                broken_c2l.to(
+                    device
+                )
+            )
+
+            trans1 = trans1.to(
+                device
+            )
+
+            # ------------------------------------------------
+            # BROKEN metric
+            #
+            # LCCNet uses identity correction here.
+            # ------------------------------------------------
+            identity = torch.eye(
+                4,
+                dtype=gt_c2l.dtype,
+                device=device
+            ).unsqueeze(0).repeat(
+                ncam,
+                1,
+                1
+            )
+
+            (
+                broken_rot,
+                broken_trans
+            ) = (
+                _compute_lccnet_physical_residual(
+                    identity,
+                    broken_c2l,
+                    gt_c2l,
+                )
+            )
+
+            # ------------------------------------------------
+            # PCC Stage1:
+            #
+            # PCC predicts ERROR Delta1,
+            # unlike LCCNet which predicts correction.
+            #
+            # Therefore:
+            #
+            #     C1 = inv(Delta1_pred)
+            # ------------------------------------------------
+            Delta1_pred = (
+                _build_delta_matrix(
+                    rot1,
+                    trans1
+                )
+            )
+
+            correction1 = (
+                torch.linalg.inv(
+                    Delta1_pred
+                )
+            )
+
+            (
+                s1_rot,
+                s1_trans
+            ) = (
+                _compute_lccnet_physical_residual(
+                    correction1,
+                    broken_c2l,
+                    gt_c2l,
+                )
+            )
+
+            # ------------------------------------------------
+            # Optional Stage2
+            # ------------------------------------------------
+            rot2, trans2 = (
+                self._get_stage2(
+                    pred_s
+                )
+            )
+
+            has_s2 = (
+                rot2 is not None
+                and trans2 is not None
+            )
+
+            if has_s2:
+
+                rot2 = (
+                    self._match_camera_count(
+                        rot2,
+                        ncam
+                    )
+                )
+
+                trans2 = (
+                    self._match_camera_count(
+                        trans2,
+                        ncam
+                    )
+                )
+
+                has_s2 = (
+                    rot2 is not None
+                    and trans2 is not None
+                )
+
+            if has_s2:
+
+                rot2 = rot2.to(
+                    device
+                )
+
+                trans2 = trans2.to(
+                    device
+                )
+
+                Delta2_pred = (
+                    _build_delta_matrix(
+                        rot2,
+                        trans2
+                    )
+                )
+
+                correction2 = (
+                    torch.linalg.inv(
+                        Delta2_pred
+                    )
+                )
+
+            #     # --------------------------------------------
+            #     # Exact geometric composition:
+            #     #
+            #     # T_final =
+            #     # C2 @ C1 @ T_broken
+            #     #
+            #     # We can pass C2@C1 directly into the
+            #     # LCCNet residual helper.
+            #     # --------------------------------------------
+            #     correction_final = (
+            #         correction2
+            #         @ correction1
+            #     )
+
+            # else:
+
+            #     # feature_refine / lgpc_only:
+            #     # no additional physical calibration.
+            #     correction_final = (
+            #         correction1
+            #     )
+
+            # ============================================================
+            # FINAL = correction ACTUALLY applied to downstream perception
+            # ============================================================
+
+            if calibration_mode == 'pcc_broken_refine':
+
+                # --------------------------------------------------------
+                # LGPC prediction exists,
+                # but it was NOT applied to physical calibration.
+                #
+                # Therefore actual final extrinsic remains BROKEN.
+                # --------------------------------------------------------
+                correction_final = identity
+
+
+            elif calibration_mode == 'broken':
+
+                # Pure Broken BEVFusion baseline
+                correction_final = identity
+
+
+            elif calibration_mode in {
+                'clean',
+                'oracle',
+                'pcc_clean_refine',
+            }:
+
+                # --------------------------------------------------------
+                # corrected_c2l should be GT/clean.
+                #
+                # We need C such that:
+                #
+                # C @ T_broken = T_gt
+                #
+                # therefore:
+                #
+                # C = T_gt @ inv(T_broken)
+                # --------------------------------------------------------
+                correction_final = (
+                    gt_c2l
+                    @ torch.linalg.inv(
+                        broken_c2l
+                    )
+                )
+
+
+            elif calibration_mode in {
+                'pcc_calib_only',
+                'pcc_full',
+            }:
+
+                # PCC Stage1 physically applied
+
+                if has_s2:
+
+                    correction_final = (
+                        correction2
+                        @ correction1
+                    )
+
+                else:
+
+                    correction_final = (
+                        correction1
+                    )
+
+
+            else:
+
+                # 기존 behavior fallback
+                if has_s2:
+
+                    correction_final = (
+                        correction2
+                        @ correction1
+                    )
+
+                else:
+
+                    correction_final = (
+                        correction1
+                    )
+
+            (
+                final_rot,
+                final_trans
+            ) = (
+                _compute_lccnet_physical_residual(
+                    correction_final,
+                    broken_c2l,
+                    gt_c2l,
+                )
+            )
+
+            # ------------------------------------------------
+            # Camera names
+            # ------------------------------------------------
+            camera_names = (
+                _extract_camera_names_metric(
+                    gt_s,
+                    ncam
+                )
+            )
+
+            # ------------------------------------------------
+            # Store EACH CAMERA independently
+            # ------------------------------------------------
+            for cam_idx in range(
+                ncam
+            ):
+
+                self.results.append(
+                    dict(
+                        camera_name=(
+                            camera_names[
+                                cam_idx
+                            ]
+                        ),
+
+                        has_s2=float(
+                            has_s2
+                        ),
+
+                        broken_rot_deg=float(
+                            broken_rot[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                        broken_trans_m=float(
+                            broken_trans[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                        s1_rot_deg=float(
+                            s1_rot[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                        s1_trans_m=float(
+                            s1_trans[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                        final_rot_deg=float(
+                            final_rot[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                        final_trans_m=float(
+                            final_trans[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+                    )
+                )
+
+            # ------------------------------------------------
+            # Debug
+            # ------------------------------------------------
+            if (
+                self.debug
+                and is_main_process()
+                and self._dbg_printed
+                < self.debug_n
+            ):
+
+                meta = _get_metainfo(
+                    gt_s
+                )
+
+                logger.info(
+                    "[CalibLCCNetMetric] "
+                    f"sample={meta.get('sample_idx', None)} "
+                    f"mode={calibration_mode} "
+                    f"ncam={ncam} "
+                    f"has_s2={has_s2} | "
+                    f"BROKEN "
+                    f"Rot={broken_rot.mean().item():.4f}deg "
+                    f"Trans={broken_trans.mean().item():.4f}m | "
+                    f"S1 "
+                    f"Rot={s1_rot.mean().item():.4f}deg "
+                    f"Trans={s1_trans.mean().item():.4f}m | "
+                    f"FINAL "
+                    f"Rot={final_rot.mean().item():.4f}deg "
+                    f"Trans={final_trans.mean().item():.4f}m"
+                )
+
+                self._dbg_printed += 1
+
+    # ========================================================
+    # Aggregate
+    # ========================================================
+    def compute_metrics(
+        self,
+        results,
+    ):
+
+        logger = (
+            MMLogger.get_current_instance()
+        )
+
+        if len(results) == 0:
+            return {}
+
+        # ----------------------------------------------------
+        # Helper
+        # ----------------------------------------------------
+        def values(key, rows=results):
+
+            return np.asarray(
+                [
+                    float(r[key])
+                    for r in rows
+                ],
+                dtype=np.float64
+            )
+
+        def summary(x):
+
+            return dict(
+                mean=float(
+                    np.mean(x)
+                ),
+                median=float(
+                    np.median(x)
+                ),
+                p90=float(
+                    np.quantile(
+                        x,
+                        0.90
+                    )
+                ),
+                max=float(
+                    np.max(x)
+                ),
+            )
+
+        broken_rot = values(
+            'broken_rot_deg'
+        )
+
+        broken_trans = values(
+            'broken_trans_m'
+        )
+
+        s1_rot = values(
+            's1_rot_deg'
+        )
+
+        s1_trans = values(
+            's1_trans_m'
+        )
+
+        final_rot = values(
+            'final_rot_deg'
+        )
+
+        final_trans = values(
+            'final_trans_m'
+        )
+
+        br = summary(
+            broken_rot
+        )
+
+        bt = summary(
+            broken_trans
+        )
+
+        sr = summary(
+            s1_rot
+        )
+
+        st = summary(
+            s1_trans
+        )
+
+        fr = summary(
+            final_rot
+        )
+
+        ft = summary(
+            final_trans
+        )
+
+        # ----------------------------------------------------
+        # EXACT same recovery definition as LCCNet.
+        # ----------------------------------------------------
+        s1_rot_recovery = (
+            100.0
+            * (
+                1.0
+                - sr['mean']
+                / max(
+                    br['mean'],
+                    1e-12
+                )
+            )
+        )
+
+        s1_trans_recovery = (
+            100.0
+            * (
+                1.0
+                - st['mean']
+                / max(
+                    bt['mean'],
+                    1e-12
+                )
+            )
+        )
+
+        final_rot_recovery = (
+            100.0
+            * (
+                1.0
+                - fr['mean']
+                / max(
+                    br['mean'],
+                    1e-12
+                )
+            )
+        )
+
+        final_trans_recovery = (
+            100.0
+            * (
+                1.0
+                - ft['mean']
+                / max(
+                    bt['mean'],
+                    1e-12
+                )
+            )
+        )
+
+        # Same LCCNet joint score:
+        # smaller = better.
+        s1_joint_score = (
+            sr['mean']
+            / max(
+                br['mean'],
+                1e-12
+            )
+            +
+            st['mean']
+            / max(
+                bt['mean'],
+                1e-12
+            )
+        )
+
+        final_joint_score = (
+            fr['mean']
+            / max(
+                br['mean'],
+                1e-12
+            )
+            +
+            ft['mean']
+            / max(
+                bt['mean'],
+                1e-12
+            )
+        )
+
+        # ====================================================
+        # Per-camera summaries
+        # ====================================================
+        per_camera = {}
+
+        camera_names = (
+            NUSC_CAMERA_NAMES_METRIC
+        )
+
+        for cam_name in camera_names:
+
+            rows = [
+                r
+                for r in results
+                if r.get(
+                    'camera_name',
+                    ''
+                ) == cam_name
+            ]
+
+            if len(rows) == 0:
+                continue
+
+            per_camera[
+                cam_name
+            ] = dict(
+                broken_rot=float(
+                    np.mean(
+                        values(
+                            'broken_rot_deg',
+                            rows
+                        )
+                    )
+                ),
+
+                s1_rot=float(
+                    np.mean(
+                        values(
+                            's1_rot_deg',
+                            rows
+                        )
+                    )
+                ),
+
+                final_rot=float(
+                    np.mean(
+                        values(
+                            'final_rot_deg',
+                            rows
+                        )
+                    )
+                ),
+
+                broken_trans=float(
+                    np.mean(
+                        values(
+                            'broken_trans_m',
+                            rows
+                        )
+                    )
+                ),
+
+                s1_trans=float(
+                    np.mean(
+                        values(
+                            's1_trans_m',
+                            rows
+                        )
+                    )
+                ),
+
+                final_trans=float(
+                    np.mean(
+                        values(
+                            'final_trans_m',
+                            rows
+                        )
+                    )
+                ),
+            )
+
+        # ====================================================
+        # LCCNet-style console print
+        # ====================================================
+        if is_main_process():
+
+            logger.info(
+                "\n"
+                "============================================================\n"
+                "[PCC LCCNET-COMPATIBLE CALIBRATION METRIC]\n"
+                "\n"
+                "[BROKEN]\n"
+                f"Rot   mean={br['mean']:.6f} deg   "
+                f"median={br['median']:.6f} deg   "
+                f"P90={br['p90']:.6f} deg\n"
+                f"Trans mean={bt['mean']:.6f} m     "
+                f"median={bt['median']:.6f} m     "
+                f"P90={bt['p90']:.6f} m\n"
+                "\n"
+                "[PCC LGPC Stage1]\n"
+                f"Rot   mean={sr['mean']:.6f} deg   "
+                f"median={sr['median']:.6f} deg   "
+                f"P90={sr['p90']:.6f} deg\n"
+                f"Trans mean={st['mean']:.6f} m     "
+                f"median={st['median']:.6f} m     "
+                f"P90={st['p90']:.6f} m\n"
+                "\n"
+                f"Rotation recovery    = "
+                f"{s1_rot_recovery:.2f}%\n"
+                f"Translation recovery = "
+                f"{s1_trans_recovery:.2f}%\n"
+                f"Joint score          = "
+                f"{s1_joint_score:.6f}\n"
+                "\n"
+                "[PCC FINAL]\n"
+                f"Rot   mean={fr['mean']:.6f} deg   "
+                f"median={fr['median']:.6f} deg   "
+                f"P90={fr['p90']:.6f} deg\n"
+                f"Trans mean={ft['mean']:.6f} m     "
+                f"median={ft['median']:.6f} m     "
+                f"P90={ft['p90']:.6f} m\n"
+                "\n"
+                f"Final rotation recovery    = "
+                f"{final_rot_recovery:.2f}%\n"
+                f"Final translation recovery = "
+                f"{final_trans_recovery:.2f}%\n"
+                f"Final joint score          = "
+                f"{final_joint_score:.6f}\n"
+                "\n"
+                "[PER CAMERA]"
+            )
+
+            for (
+                cam_name,
+                x
+            ) in per_camera.items():
+
+                logger.info(
+                    f"{cam_name:<16s} "
+                    f"Rot "
+                    f"{x['broken_rot']:.3f} "
+                    f"-> {x['s1_rot']:.3f} "
+                    f"-> {x['final_rot']:.3f} deg   "
+                    f"Trans "
+                    f"{x['broken_trans']:.3f} "
+                    f"-> {x['s1_trans']:.3f} "
+                    f"-> {x['final_trans']:.3f} m"
+                )
+
+            logger.info(
+                "============================================================"
+            )
+
+        # ====================================================
+        # MMEngine output
+        # ====================================================
+        return dict(
+            broken_rot_mean_deg=br['mean'],
+            broken_rot_median_deg=br['median'],
+            broken_rot_p90_deg=br['p90'],
+
+            broken_trans_mean_m=bt['mean'],
+            broken_trans_median_m=bt['median'],
+            broken_trans_p90_m=bt['p90'],
+
+            s1_rot_mean_deg=sr['mean'],
+            s1_rot_median_deg=sr['median'],
+            s1_rot_p90_deg=sr['p90'],
+
+            s1_trans_mean_m=st['mean'],
+            s1_trans_median_m=st['median'],
+            s1_trans_p90_m=st['p90'],
+
+            s1_rotation_recovery_pct=(
+                s1_rot_recovery
+            ),
+
+            s1_translation_recovery_pct=(
+                s1_trans_recovery
+            ),
+
+            s1_joint_score=(
+                s1_joint_score
+            ),
+
+            final_rot_mean_deg=fr['mean'],
+            final_rot_median_deg=fr['median'],
+            final_rot_p90_deg=fr['p90'],
+
+            final_trans_mean_m=ft['mean'],
+            final_trans_median_m=ft['median'],
+            final_trans_p90_m=ft['p90'],
+
+            final_rotation_recovery_pct=(
+                final_rot_recovery
+            ),
+
+            final_translation_recovery_pct=(
+                final_trans_recovery
+            ),
+
+            final_joint_score=(
+                final_joint_score
+            ),
+
+            has_s2_ratio=float(
+                np.mean(
+                    values(
+                        'has_s2'
+                    )
+                )
+            ),
+        )
+
 @MODELS.register_module()
 class ConvFuser(nn.Sequential):
 
@@ -369,23 +1705,34 @@ class TransFusionHead(nn.Module):
         in_channels=128 * 3,
         hidden_channel=128,
         num_classes=4,
-        # config for Transformer
         num_decoder_layers=3,
         decoder_layer=dict(),
         num_heads=8,
         nms_kernel_size=1,
         bn_momentum=0.1,
-        # config for FFN
         common_heads=dict(),
         num_heatmap_convs=2,
         conv_cfg=dict(type='Conv1d'),
         norm_cfg=dict(type='BN1d'),
         bias='auto',
-        # loss
-        loss_cls=dict(type='mmdet.GaussianFocalLoss', reduction='mean'),
-        loss_bbox=dict(type='mmdet.L1Loss', reduction='mean'),
-        loss_heatmap=dict(type='mmdet.GaussianFocalLoss', reduction='mean'),
-        # others
+
+        loss_cls=dict(
+            type='mmdet.GaussianFocalLoss',
+            reduction='mean'
+        ),
+        loss_bbox=dict(
+            type='mmdet.L1Loss',
+            reduction='mean'
+        ),
+        loss_heatmap=dict(
+            type='mmdet.GaussianFocalLoss',
+            reduction='mean'
+        ),
+
+        # NEW
+        rrrf_mode='residual_se3',
+        query_source='fused',
+
         train_cfg=None,
         test_cfg=None,
         bbox_coder=None,
@@ -402,6 +1749,30 @@ class TransFusionHead(nn.Module):
         self.nms_kernel_size = nms_kernel_size
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+        self.rrrf_mode = rrrf_mode
+
+        assert self.rrrf_mode in [
+            'residual_se3',
+            'feature_refine',
+            'lgpc_only'
+        ], f'Unknown RRRF mode: {self.rrrf_mode}'
+
+        print(f'[RRRF] mode = {self.rrrf_mode}')
+
+        self.query_source = query_source
+
+        assert self.query_source in [
+            'fused',
+            'lidar',
+        ], (
+            f'Unknown query_source: '
+            f'{self.query_source}'
+        )
+
+        print(
+            f'[RRRF] query_source = '
+            f'{self.query_source}'
+        )
 
         self.use_sigmoid_cls = loss_cls.get('use_sigmoid', False)
         if not self.use_sigmoid_cls:
@@ -503,6 +1874,11 @@ class TransFusionHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(calibration_hidden_dim, 6),  # (rot 3 + trans 3)
         )
+
+        # Stage-2 SE(3) regressor is not trained in feature_refine/lgpc_only mode.
+        if self.rrrf_mode != 'residual_se3':
+            for param in self.calibration_predictor.parameters():
+                param.requires_grad = False
 
         # # 🛑 1. 특징 추출기 (SHARED HEAD) - Input -> Hidden
         # self.calib_shared_fc = nn.Sequential(
@@ -627,7 +2003,7 @@ class TransFusionHead(nn.Module):
                 build_assigner(res) for res in self.train_cfg.assigner
             ]
 
-    def forward_single(self, inputs,det_xyz, det_feats, metas,batch_gt_instances_3d):
+    def forward_single(self, inputs,det_xyz, det_feats, metas,batch_gt_instances_3d,lidar_query_inputs=None,):
         """Forward function for CenterPoint.
         Args:
             inputs (torch.Tensor): Input feature map with the shape of
@@ -638,16 +2014,125 @@ class TransFusionHead(nn.Module):
         Returns:
             list[dict]: Output results for tasks.
         """
+
+        # ============================================================
+        # 1. Original fused BEV feature
+        # ============================================================
+
+        # batch_size는 fusion_feat에 의존하지 않고
+        # 입력 tensor에서 직접 얻는다.
         batch_size = inputs.shape[0]
+
+        # Original fused BEV -> TransFusion shared conv
         fusion_feat = self.shared_conv(inputs)
 
-        #################################
-        # image to BEV
-        #################################
-        fusion_feat_flatten = fusion_feat.view(batch_size,
-                                               fusion_feat.shape[1],
-                                               -1)  # [BS, C, H*W]
-        bev_pos = self.bev_pos.repeat(batch_size, 1, 1).to(fusion_feat.device)
+        # BEV positional coordinates
+        bev_pos = self.bev_pos.repeat(
+            batch_size,
+            1,
+            1
+        ).to(fusion_feat.device)
+
+        # Flattened fused BEV:
+        # IMPORTANT: still used as Decoder memory.
+        fusion_feat_flatten = fusion_feat.view(
+            batch_size,
+            fusion_feat.shape[1],
+            -1,
+        )
+
+        # ============================================================
+        # 2. Select feature source used ONLY for initial query content
+        #
+        # Default:
+        #   fused BEV
+        #
+        # LiDAR feasibility:
+        #   LiDAR-only BEV
+        # ============================================================
+
+        # IMPORTANT:
+        # Always initialize first.
+        # This prevents query_source_feat from being undefined.
+        query_source_feat = fusion_feat
+
+
+        if self.query_source == 'lidar':
+
+            if lidar_query_inputs is None:
+                raise RuntimeError(
+                    '[LiDAR Query] query_source="lidar", '
+                    'but lidar_query_inputs is None.'
+                )
+
+            # lidar_query_inputs:
+            # LiDAR-only SECOND + FPN output
+            #
+            # Apply the same shared_conv used by the original
+            # TransFusion query path.
+            lidar_query_feat = self.shared_conv(
+                lidar_query_inputs
+            )
+
+            if lidar_query_feat.shape != fusion_feat.shape:
+                raise RuntimeError(
+                    '[LiDAR Query] feature shape mismatch: '
+                    f'lidar={tuple(lidar_query_feat.shape)}, '
+                    f'fused={tuple(fusion_feat.shape)}'
+                )
+
+            query_source_feat = lidar_query_feat
+
+
+        elif self.query_source == 'fused':
+
+            # Original behavior
+            query_source_feat = fusion_feat
+
+
+        else:
+
+            raise RuntimeError(
+                f'Unknown query_source="{self.query_source}". '
+                'Expected "fused" or "lidar".'
+            )
+
+
+        # ============================================================
+        # 3. SANITY CHECK
+        #    MUST come AFTER query_source_feat has been assigned.
+        # ============================================================
+
+        if not hasattr(self, '_query_source_debug_done'):
+
+            mean_abs_diff = (
+                query_source_feat - fusion_feat
+            ).abs().mean().item()
+
+            print(
+                "\n"
+                "=========================================\n"
+                "[QUERY SOURCE SANITY]\n"
+                f"query_source={self.query_source}\n"
+                f"inputs={tuple(inputs.shape)}\n"
+                f"fusion_feat={tuple(fusion_feat.shape)}\n"
+                f"query_source_feat={tuple(query_source_feat.shape)}\n"
+                f"mean_abs_diff={mean_abs_diff:.6f}\n"
+                "=========================================\n"
+            )
+
+            self._query_source_debug_done = True
+
+
+        # ============================================================
+        # 4. Flatten query source
+        # ============================================================
+
+        query_source_flatten = query_source_feat.view(
+            batch_size,
+            query_source_feat.shape[1],
+            -1,
+        )
 
         #################################
         # query initialization
@@ -682,9 +2167,17 @@ class TransFusionHead(nn.Module):
             dim=-1, descending=True)[..., :self.num_proposals]
         top_proposals_class = top_proposals // heatmap.shape[-1]
         top_proposals_index = top_proposals % heatmap.shape[-1]
-        query_feat = fusion_feat_flatten.gather(
+        # query_feat = fusion_feat_flatten.gather(
+        #     index=top_proposals_index[:, None, :].expand(
+        #         -1, fusion_feat_flatten.shape[1], -1),
+        #     dim=-1,
+        # )
+        query_feat = query_source_flatten.gather(
             index=top_proposals_index[:, None, :].expand(
-                -1, fusion_feat_flatten.shape[1], -1),
+                -1,
+                query_source_flatten.shape[1],
+                -1,
+            ),
             dim=-1,
         )
         self.query_labels = top_proposals_class
@@ -731,59 +2224,193 @@ class TransFusionHead(nn.Module):
             # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
             coarse_fused_query_feat_for_vis = coarse_fused_query_feat
 
-            # --- 2b. 캘리브레이션 오차 예측 ---
-            # LGPC Only 모드여도 오차 예측은 수행해야 함 (Rotation Loss 계산 및 검증을 위해)
-            pooled_coarse_feat = coarse_fused_query_feat.mean(dim=-1) # [B, C]
+            # # --- 2b. 캘리브레이션 오차 예측 ---
+            # # LGPC Only 모드여도 오차 예측은 수행해야 함 (Rotation Loss 계산 및 검증을 위해)
+            # pooled_coarse_feat = coarse_fused_query_feat.mean(dim=-1) # [B, C]
             
-            ########### old calibration network ##################
-            pred_delta_6dof = self.calibration_predictor(pooled_coarse_feat)  # [B, 6]
+            # ########### old calibration network ##################
+            # pred_delta_6dof = self.calibration_predictor(pooled_coarse_feat)  # [B, 6]
            
-            ######### new calibration network ####################
-            # x = pooled_coarse_feat # [B*N, calibration_input_dim]
-            # x_shared = self.calib_shared_fc(x)
-            # pred_rot = self.calib_rot_predictor(x_shared)
-            # pred_trans = self.calib_trans_predictor(x_shared)
-            # pred_delta_6dof = torch.cat([pred_rot, pred_trans], dim=-1) # [B*N, 6]
+            # ######### new calibration network ####################
+            # # x = pooled_coarse_feat # [B*N, calibration_input_dim]
+            # # x_shared = self.calib_shared_fc(x)
+            # # pred_rot = self.calib_rot_predictor(x_shared)
+            # # pred_trans = self.calib_trans_predictor(x_shared)
+            # # pred_delta_6dof = torch.cat([pred_rot, pred_trans], dim=-1) # [B*N, 6]
 
-            pred_delta_rot = pred_delta_6dof[..., :3]
-            pred_delta_trans = pred_delta_6dof[..., 3:]
+            # pred_delta_rot = pred_delta_6dof[..., :3]
+            # pred_delta_trans = pred_delta_6dof[..., 3:]
 
-            # ==========================================================
-            # 🚀 비교 실험 분기점 (Ablation Strategy)
-            # ==========================================================
-            ablation_mode='full'
-            # --- 2c. 카메라 제안 보정 ---
-            if ablation_mode == 'full':
-                # [Full Model]: 보정된 위치를 사용하여 2단계 정제(Refinement) 수행
-                pc_range_tensor = torch.tensor(self.train_cfg['point_cloud_range'], device=det_xyz.device)
-                # 보정 시에는 그래디언트 흐름 차단 가능 (오차 예측 학습에만 집중)
-                det_xyz_corrected_norm = correct_camera_proposals(
-                    det_xyz, pred_delta_rot.detach(), pred_delta_trans.detach(), pc_range_tensor
+            # # ==========================================================
+            # # 🚀 비교 실험 분기점 (Ablation Strategy)
+            # # ==========================================================
+            # ablation_mode='full'
+            # # --- 2c. 카메라 제안 보정 ---
+            # if ablation_mode == 'full':
+            #     # [Full Model]: 보정된 위치를 사용하여 2단계 정제(Refinement) 수행
+            #     pc_range_tensor = torch.tensor(self.train_cfg['point_cloud_range'], device=det_xyz.device)
+            #     # 보정 시에는 그래디언트 흐름 차단 가능 (오차 예측 학습에만 집중)
+            #     det_xyz_corrected_norm = correct_camera_proposals(
+            #         det_xyz, pred_delta_rot.detach(), pred_delta_trans.detach(), pc_range_tensor
+            #     )
+            #     cam_proposal_pos_embed_corrected = self.camera_proposal_pos_embedding(det_xyz_corrected_norm)
+
+            #     # --- 2d. 2단계: 정제된 퓨전 ---
+            #     refined_bev_query_feat = coarse_fused_query_feat.permute(0, 2, 1) # 1단계 결과 재사용
+            #     refined_fused_feat = self.refined_attention(
+            #         query=refined_bev_query_feat +  bev_query_pos_embed,
+            #         key=cam_proposal_feat +  cam_proposal_pos_embed_corrected, # 보정된 위치 사용
+            #         value=cam_proposal_feat
+            #     )[0]
+            #     refined_bev_query_feat = self.refined_norm1(refined_bev_query_feat +  refined_fused_feat)
+            #     refined_bev_query_feat = self.refined_norm2(refined_bev_query_feat +  self.refined_ffn(refined_bev_query_feat))
+            #     # 최종 출력: 정제된 특징
+            #     refined_query_feat = refined_bev_query_feat.permute(0, 2, 1).contiguous() # [B, C, Nq]
+            
+            # elif ablation_mode == 'lgpc_only':
+            #     # [LGPC Only]: 오차는 예측했으나(위에서 수행함), 정제(Refinement) 과정 생략
+            #     # 논리: "LGPC가 오차를 알아냈다 하더라도, 이를 반영하여 
+            #     #       특징맵을 다시 퓨전하지 않으면 성능 향상은 없다"는 것을 증명
+                
+            #     # 최종 출력: 1단계 거친 특징 (보정 전 특징)
+            #     refined_query_feat = coarse_fused_query_feat
+                
+            # else:
+            #     raise ValueError(f"Unknown ablation mode: {ablation_mode}")
+
+            # ============================================================
+            # RRRF Stage-2 strategy
+            #
+            # residual_se3:
+            #   Original IROS RRRF
+            #   coarse feature -> residual 6DoF -> geometry correction
+            #   -> refined attention
+            #
+            # feature_refine:
+            #   New RRRF-v0
+            #   No Stage-2 6DoF prediction.
+            #   Reuse Stage-1 LGPC-corrected proposal geometry and perform
+            #   feature refinement directly.
+            #
+            # lgpc_only:
+            #   No Stage-2 refinement.
+            # ============================================================
+
+            if self.rrrf_mode == 'residual_se3':
+
+                # --------------------------------------------------------
+                # Original Stage-2 residual SE(3) prediction
+                # --------------------------------------------------------
+                pooled_coarse_feat = coarse_fused_query_feat.mean(dim=-1)
+
+                pred_delta_6dof = self.calibration_predictor(
+                    pooled_coarse_feat
                 )
-                cam_proposal_pos_embed_corrected = self.camera_proposal_pos_embedding(det_xyz_corrected_norm)
 
-                # --- 2d. 2단계: 정제된 퓨전 ---
-                refined_bev_query_feat = coarse_fused_query_feat.permute(0, 2, 1) # 1단계 결과 재사용
+                pred_delta_rot = pred_delta_6dof[..., :3]
+                pred_delta_trans = pred_delta_6dof[..., 3:]
+
+                # Stage-2 geometric correction
+                pc_range_tensor = torch.tensor(
+                    self.train_cfg['point_cloud_range'],
+                    device=det_xyz.device
+                )
+
+                det_xyz_corrected_norm = correct_camera_proposals(
+                    det_xyz,
+                    pred_delta_rot.detach(),
+                    pred_delta_trans.detach(),
+                    pc_range_tensor
+                )
+
+                cam_proposal_pos_embed_refined = \
+                    self.camera_proposal_pos_embedding(
+                        det_xyz_corrected_norm
+                    )
+
+
+            elif self.rrrf_mode == 'feature_refine':
+
+                # --------------------------------------------------------
+                # NEW RRRF-v0
+                #
+                # IMPORTANT:
+                # det_xyz has already been geometrically corrected
+                # by Stage-1 LGPC before entering TransFusionHead.
+                #
+                # Therefore:
+                #   - no residual 6DoF prediction
+                #   - no correct_camera_proposals()
+                #   - reuse Stage-1 corrected proposal position
+                # --------------------------------------------------------
+
+                cam_proposal_pos_embed_refined = \
+                    cam_proposal_pos_embed
+
+
+            elif self.rrrf_mode == 'lgpc_only':
+
+                # No Stage-2 refinement
+                refined_query_feat = coarse_fused_query_feat
+
+
+            else:
+
+                raise ValueError(
+                    f'Unknown RRRF mode: {self.rrrf_mode}'
+                )
+
+
+            # ------------------------------------------------------------
+            # Stage-2 refined feature fusion
+            #
+            # Used by:
+            #   residual_se3
+            #   feature_refine
+            #
+            # Not used by:
+            #   lgpc_only
+            # ------------------------------------------------------------
+            if self.rrrf_mode in [
+                'residual_se3',
+                'feature_refine'
+            ]:
+
+                refined_bev_query_feat = \
+                    coarse_fused_query_feat.permute(
+                        0, 2, 1
+                    )
+
                 refined_fused_feat = self.refined_attention(
-                    query=refined_bev_query_feat +  bev_query_pos_embed,
-                    key=cam_proposal_feat +  cam_proposal_pos_embed_corrected, # 보정된 위치 사용
+                    query=(
+                        refined_bev_query_feat
+                        + bev_query_pos_embed
+                    ),
+
+                    key=(
+                        cam_proposal_feat
+                        + cam_proposal_pos_embed_refined
+                    ),
+
                     value=cam_proposal_feat
                 )[0]
-                refined_bev_query_feat = self.refined_norm1(refined_bev_query_feat +  refined_fused_feat)
-                refined_bev_query_feat = self.refined_norm2(refined_bev_query_feat +  self.refined_ffn(refined_bev_query_feat))
-                # 최종 출력: 정제된 특징
-                refined_query_feat = refined_bev_query_feat.permute(0, 2, 1).contiguous() # [B, C, Nq]
-            
-            elif ablation_mode == 'lgpc_only':
-                # [LGPC Only]: 오차는 예측했으나(위에서 수행함), 정제(Refinement) 과정 생략
-                # 논리: "LGPC가 오차를 알아냈다 하더라도, 이를 반영하여 
-                #       특징맵을 다시 퓨전하지 않으면 성능 향상은 없다"는 것을 증명
-                
-                # 최종 출력: 1단계 거친 특징 (보정 전 특징)
-                refined_query_feat = coarse_fused_query_feat
-                
-            else:
-                raise ValueError(f"Unknown ablation mode: {ablation_mode}")
+
+                refined_bev_query_feat = self.refined_norm1(
+                    refined_bev_query_feat
+                    + refined_fused_feat
+                )
+
+                refined_bev_query_feat = self.refined_norm2(
+                    refined_bev_query_feat
+                    + self.refined_ffn(
+                        refined_bev_query_feat
+                    )
+                )
+
+                refined_query_feat = \
+                    refined_bev_query_feat.permute(
+                        0, 2, 1
+                    ).contiguous()
             
         
         # --- 시각화용: 중간 퓨전 결과 저장 ---
@@ -888,11 +2515,35 @@ class TransFusionHead(nn.Module):
     #     assert len(res) == 1, 'only support one level features.'
     #     return res
     
-    def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None):
+    def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None,lidar_query_feats=None,):
         if isinstance(feats, torch.Tensor):
             feats = [feats]
+
+        if lidar_query_feats is None:
+
+            lidar_query_feats = [
+                None
+                for _ in range(len(feats))
+            ]
+
+        elif isinstance(
+            lidar_query_feats,
+            torch.Tensor
+        ):
+
+            lidar_query_feats = [
+                lidar_query_feats
+            ]
+
+        else:
+
+            lidar_query_feats = list(
+                lidar_query_feats
+            )
+
+        assert len(lidar_query_feats) == len(feats)
         # multi_apply 호출 시에도 순서만 맞춰주면 됩니다.
-        res = multi_apply(self.forward_single, feats, [det_xyz], [det_feats], [metas],[batch_gt_instances_3d])
+        res = multi_apply(self.forward_single, feats, [det_xyz], [det_feats], [metas],[batch_gt_instances_3d],lidar_query_feats,)
         
         assert len(res) == 1, 'only support one level features.'
         # return res
@@ -903,9 +2554,9 @@ class TransFusionHead(nn.Module):
     #     res = self.predict_by_feat(preds_dicts, batch_input_metas)
     #     return res
 
-    def predict(self, batch_feats, det_xyz, det_feats, batch_input_metas):
+    def predict(self, batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=None,):
         # self()는 forward를 호출. 이제 모든 인자를 올바르게 전달합니다.
-        preds_dicts = self(batch_feats, det_xyz, det_feats, batch_input_metas)
+        preds_dicts = self(batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=lidar_query_feats)
         res = self.predict_by_feat(preds_dicts, batch_input_metas)
         return res
 
@@ -1065,8 +2716,23 @@ class TransFusionHead(nn.Module):
                 # active = metas[i].get('stage1_active_cam_indices', None)
                 # # ================================================================================
 
-                pred_rot = preds_dict[0].get('pred_delta_rot', None)
-                pred_trans = preds_dict[0].get('pred_delta_trans', None)
+                if self.rrrf_mode == 'residual_se3':
+
+                    pred_rot = preds_dict[0].get(
+                        'pred_delta_rot',
+                        None
+                    )
+
+                    pred_trans = preds_dict[0].get(
+                        'pred_delta_trans',
+                        None
+                    )
+
+                else:
+
+                    # No explicit Stage-2 calibration prediction
+                    pred_rot = None
+                    pred_trans = None
                 # ===================== [NEW] 캘리브레이션 예측값도 같이 저장 =====================
                 # preds_dict[0]는 dict, batch 차원은 i
                 # 수정 (OK): metainfo로 저장 (길이 체크 없음)
@@ -1484,38 +3150,113 @@ class TransFusionHead(nn.Module):
         preds_dict = preds_dicts[0][0]
         loss_dict = dict()
 
-        # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
-        # forward_single에서 반환된 예측값 사용
-        pred_delta_rot_2nd = preds_dict['pred_delta_rot']
-        pred_delta_trans_2nd = preds_dict['pred_delta_trans']
+        # # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
+        # # forward_single에서 반환된 예측값 사용
+        # pred_delta_rot_2nd = preds_dict['pred_delta_rot']
+        # pred_delta_trans_2nd = preds_dict['pred_delta_trans']
 
-        # 1단계 예측값 (detach()로 그래디언트 차단)
-        pred_delta_rot_1st_per_cam = pred_delta_rot.detach()
-        pred_delta_trans_1st_per_cam = pred_delta_trans.detach()
+        # # 1단계 예측값 (detach()로 그래디언트 차단)
+        # pred_delta_rot_1st_per_cam = pred_delta_rot.detach()
+        # pred_delta_trans_1st_per_cam = pred_delta_trans.detach()
 
-        # [수정] 1단계 예측값도 6개 카메라에 대해 평균을 냅니다.
-        pred_delta_rot_1st_mean = pred_delta_rot_1st_per_cam.mean(dim=1) # Shape [1, 3]
-        pred_delta_trans_1st_mean = pred_delta_trans_1st_per_cam.mean(dim=1) # Shape [1, 3]
+        # # [수정] 1단계 예측값도 6개 카메라에 대해 평균을 냅니다.
+        # pred_delta_rot_1st_mean = pred_delta_rot_1st_per_cam.mean(dim=1) # Shape [1, 3]
+        # pred_delta_trans_1st_mean = pred_delta_trans_1st_per_cam.mean(dim=1) # Shape [1, 3]
 
-        # 전체 GT
-        gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
-        gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
+        # # 전체 GT
+        # gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
+        # gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
         
-        # Loss 계산 (배치 전체에 대해 mean)
-        R_pred_1st = axis_angle_to_matrix(pred_delta_rot_1st_mean)
-        R_gt_total = axis_angle_to_matrix(gt_delta_rot_mean)
-        R_gt_residual = R_gt_total @ R_pred_1st.transpose(1, 2)
-        # T_gt_residual = T_gt_total - T_pred_1st
-        T_gt_residual = gt_delta_trans_mean - pred_delta_trans_1st_mean
+        # # Loss 계산 (배치 전체에 대해 mean)
+        # R_pred_1st = axis_angle_to_matrix(pred_delta_rot_1st_mean)
+        # R_gt_total = axis_angle_to_matrix(gt_delta_rot_mean)
+        # R_gt_residual = R_gt_total @ R_pred_1st.transpose(1, 2)
+        # # T_gt_residual = T_gt_total - T_pred_1st
+        # T_gt_residual = gt_delta_trans_mean - pred_delta_trans_1st_mean
 
-        R_pred_2nd = axis_angle_to_matrix(pred_delta_rot_2nd)
+        # R_pred_2nd = axis_angle_to_matrix(pred_delta_rot_2nd)
 
-        loss_calib_rot_pred= identity_matrix_loss(R_pred_2nd, R_gt_residual)
-        loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans_2nd, T_gt_residual, reduction='mean')
+        # loss_calib_rot_pred= identity_matrix_loss(R_pred_2nd, R_gt_residual)
+        # loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans_2nd, T_gt_residual, reduction='mean')
 
-        loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 100.0 # 가중치
-        loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 50.0 # 가중치
+        # loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 100.0 # 가중치
+        # loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 50.0 # 가중치
         # ----------------------------------------------------
+
+        # ============================================================
+        # Stage-2 residual SE(3) supervision
+        # ============================================================
+
+        if self.rrrf_mode == 'residual_se3':
+
+            pred_delta_rot_2nd = \
+                preds_dict['pred_delta_rot']
+
+            pred_delta_trans_2nd = \
+                preds_dict['pred_delta_trans']
+
+            # Stage-1 LGPC prediction
+            pred_delta_rot_1st_per_cam = \
+                pred_delta_rot.detach()
+
+            pred_delta_trans_1st_per_cam = \
+                pred_delta_trans.detach()
+
+            pred_delta_rot_1st_mean = \
+                pred_delta_rot_1st_per_cam.mean(dim=1)
+
+            pred_delta_trans_1st_mean = \
+                pred_delta_trans_1st_per_cam.mean(dim=1)
+
+            # GT
+            gt_delta_rot_mean = \
+                gt_delta_rot.mean(dim=1)
+
+            gt_delta_trans_mean = \
+                gt_delta_trans.mean(dim=1)
+
+            # Residual rotation target
+            R_pred_1st = axis_angle_to_matrix(
+                pred_delta_rot_1st_mean
+            )
+
+            R_gt_total = axis_angle_to_matrix(
+                gt_delta_rot_mean
+            )
+
+            R_gt_residual = (
+                R_gt_total
+                @ R_pred_1st.transpose(1, 2)
+            )
+
+            # Residual translation target
+            T_gt_residual = (
+                gt_delta_trans_mean
+                - pred_delta_trans_1st_mean
+            )
+
+            R_pred_2nd = axis_angle_to_matrix(
+                pred_delta_rot_2nd
+            )
+
+            loss_calib_rot_pred = \
+                identity_matrix_loss(
+                    R_pred_2nd,
+                    R_gt_residual
+                )
+
+            loss_calib_trans_pred = \
+                F.smooth_l1_loss(
+                    pred_delta_trans_2nd,
+                    T_gt_residual,
+                    reduction='mean'
+                )
+
+            loss_dict['loss_calib_rot_pred'] = \
+                loss_calib_rot_pred * 100.0
+
+            loss_dict['loss_calib_trans_pred'] = \
+                loss_calib_trans_pred * 50.0
 
         # compute heatmap loss
         loss_heatmap = self.loss_heatmap(
