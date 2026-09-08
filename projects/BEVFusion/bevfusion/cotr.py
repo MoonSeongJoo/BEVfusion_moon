@@ -1,6 +1,7 @@
 import easydict
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from .COTR.COTR_models.cotr_model_moon_Ver12_0 import build
 from mmdet3d.registry import MODELS
 from mmengine.model import BaseModule 
@@ -24,11 +25,16 @@ class COTR(BaseModule):
                  dec_layers=6,
                  position_embedding='lin_sine',
                  load_weights_freeze=False, # cfg에서 받을 수 있도록 추가
+                 enable_cycle=False,
                 #  frozen=False,  # <--- ✨ 1. frozen 인자를 추가합니다 (기본값 False).
                  init_cfg=None): # mmdet3d의 표준 가중치 초기화를 위해 init_cfg를 받습니다.
         # super() 호출 시 init_cfg를 전달해야 Pretrained 가중치 로딩이 동작합니다.
         super(COTR, self).__init__(init_cfg)
         self.num_kp = num_kp
+
+        self.enable_cycle = (
+            enable_cycle
+        )
 
         # __init__ 함수 내에서 build 함수에 전달할 설정 딕셔너리를 동적으로 생성합니다.
         cotr_config = {
@@ -82,48 +88,208 @@ class COTR(BaseModule):
     #     for param in self.parameters():
     #         param.requires_grad = False
     
-    def forward(self, sbs_img , query_input):
+    # def forward(self, sbs_img , query_input):
 
-        for i in range(6) :
-            # multi camera batch cotr 필요
-            corrs_pred , enc_out = self.corr(sbs_img, query_input)
+    #     for i in range(6) :
+    #         # multi camera batch cotr 필요
+    #         corrs_pred , enc_out = self.corr(sbs_img, query_input)
 
-            # # 최종 출력 직전 배치 정규화 적용 (3D → 2D 변환)
-            # B, N, C = corrs_pred.shape
-            # corrs_pred = self.final_bn(
-            #     corrs_pred.view(-1, C)  # (B*N, C) 형태로 평탄화
-            # ).view(B, N, C)  # 원래 차원 복원
+    #         # # 최종 출력 직전 배치 정규화 적용 (3D → 2D 변환)
+    #         # B, N, C = corrs_pred.shape
+    #         # corrs_pred = self.final_bn(
+    #         #     corrs_pred.view(-1, C)  # (B*N, C) 형태로 평탄화
+    #         # ).view(B, N, C)  # 원래 차원 복원
 
-            img_reverse_input = torch.cat([sbs_img[..., 640:], sbs_img[..., :640]], axis=-1)
-            ##cyclic loss pre-processing
-            query_reverse = corrs_pred
-            query_reverse[..., 0] = query_reverse[..., 0] - 0.5
-            cycle,_ = self.corr(img_reverse_input, query_reverse)
-            cycle[..., 0] = cycle[..., 0] - 0.5
-            mask = torch.norm(cycle - query_input, dim=-1) < 30 / 640 # 40 pixel 거리에서는 마스크 
+    #         img_reverse_input = torch.cat([sbs_img[..., 640:], sbs_img[..., :640]], axis=-1)
+    #         ##cyclic loss pre-processing
+    #         query_reverse = corrs_pred.clone()
+    #         query_reverse[..., 0] = query_reverse[..., 0] - 0.5
+    #         cycle,_ = self.corr(img_reverse_input, query_reverse)
+    #         cycle[..., 0] = cycle[..., 0] - 0.5
+    #         mask = torch.norm(cycle - query_input, dim=-1) < 30 / 640 # 40 pixel 거리에서는 마스크 
 
-        return corrs_pred , cycle , mask , enc_out
+    #     return corrs_pred , cycle , mask , enc_out
 
+    def forward(self, sbs_img, query_input):
+
+        corrs_pred, enc_out = self.corr(
+            sbs_img,
+            query_input
+        )
+        # ============================================================
+        # Direct correspondence only
+        #
+        # When cycle is disabled, avoid the SECOND Transformer forward.
+        # ============================================================
+
+        if not self.enable_cycle:
+
+            cycle = torch.zeros_like(
+                query_input
+            )
+
+            mask = torch.zeros(
+                query_input.shape[:-1],
+                dtype=torch.bool,
+                device=query_input.device,
+            )
+
+            return (
+                corrs_pred,
+                cycle,
+                mask,
+                enc_out,
+            )
+
+        img_reverse_input = torch.cat(
+            [
+                sbs_img[..., 640:],
+                sbs_img[..., :640]
+            ],
+            dim=-1
+        )
+
+        query_reverse = corrs_pred.clone()
+        query_reverse[..., 0] -= 0.5
+
+        cycle, _ = self.corr(
+            img_reverse_input,
+            query_reverse
+        )
+
+        # Do not modify network output in-place.
+        cycle_aligned = cycle.clone()
+        cycle_aligned[..., 0] -= 0.5
+
+        mask = (
+            torch.norm(
+                cycle_aligned - query_input,
+                dim=-1
+            )
+            < 30 / 640
+        )
+
+        return (
+            corrs_pred,
+            cycle_aligned,
+            mask,
+            enc_out
+        )
+
+# @MODELS.register_module()
+# class CorrelationCycleLoss(nn.Module):
+#     def __init__(self, corr_weight=1.0 , cycle_weight=1.0):
+#         super().__init__()
+#         self.corr_weight = corr_weight
+#         self.cycle_weight= cycle_weight
+
+#     def forward(self, corr_pred, corr_target, cycle, queries, mask):
+#         # corr_loss = torch.nn.functional.mse_loss(corr_pred, corr_target)
+#         # Smooth L1 Loss 사용
+#         corr_loss = torch.nn.functional.smooth_l1_loss(corr_pred, corr_target)
+#         cycle_loss = torch.tensor(0.0, device=corr_loss.device)
+        
+#         if mask.sum() > 0:
+#             # cycle_loss = torch.nn.functional.mse_loss(cycle[mask], queries[mask])
+#             cycle_loss = torch.nn.functional.smooth_l1_loss(cycle[mask], queries[mask])
+#             corr_loss += cycle_loss 
+
+#         # return self.loss_weight * corr_loss
+#         return self.corr_weight * corr_loss + self.cycle_weight * cycle_loss
+    
 @MODELS.register_module()
 class CorrelationCycleLoss(nn.Module):
-    def __init__(self, corr_weight=1.0 , cycle_weight=1.0):
+
+    def __init__(
+        self,
+        corr_weight=1.0,
+        cycle_weight=0.1,
+    ):
         super().__init__()
+
         self.corr_weight = corr_weight
-        self.cycle_weight= cycle_weight
+        self.cycle_weight = cycle_weight
 
-    def forward(self, corr_pred, corr_target, cycle, queries, mask):
-        # corr_loss = torch.nn.functional.mse_loss(corr_pred, corr_target)
-        # Smooth L1 Loss 사용
-        corr_loss = torch.nn.functional.smooth_l1_loss(corr_pred, corr_target)
-        cycle_loss = torch.tensor(0.0, device=corr_loss.device)
-        
-        if mask.sum() > 0:
-            # cycle_loss = torch.nn.functional.mse_loss(cycle[mask], queries[mask])
-            cycle_loss = torch.nn.functional.smooth_l1_loss(cycle[mask], queries[mask])
-            corr_loss += cycle_loss 
 
-        # return self.loss_weight * corr_loss
-        return self.corr_weight * corr_loss + self.cycle_weight * cycle_loss
+    def forward(
+        self,
+        corr_pred,
+        corr_target,
+        cycle,
+        queries,
+        cycle_mask,
+        corr_valid_mask=None,
+    ):
+
+        # ---------------------------------------------------------
+        # Direct correspondence loss
+        # ---------------------------------------------------------
+
+        if corr_valid_mask is None:
+
+            corr_valid_mask = torch.ones(
+                corr_pred.shape[:-1],
+                dtype=torch.bool,
+                device=corr_pred.device,
+            )
+
+
+        if corr_valid_mask.any():
+
+            corr_match_loss = F.smooth_l1_loss(
+                corr_pred[corr_valid_mask],
+                corr_target[corr_valid_mask],
+                reduction='mean',
+            )
+
+        else:
+
+            # Keep a valid autograd graph.
+            corr_match_loss = (
+                corr_pred.sum() * 0.0
+            )
+
+
+        # ---------------------------------------------------------
+        # Cycle consistency loss
+        # ---------------------------------------------------------
+
+        valid_cycle_mask = (
+            cycle_mask
+            & corr_valid_mask
+        )
+
+
+        if valid_cycle_mask.any():
+
+            cycle_loss = F.smooth_l1_loss(
+                cycle[valid_cycle_mask],
+                queries[valid_cycle_mask],
+                reduction='mean',
+            )
+
+        else:
+
+            cycle_loss = (
+                cycle.sum() * 0.0
+            )
+
+
+        total_loss = (
+            self.corr_weight
+            * corr_match_loss
+            +
+            self.cycle_weight
+            * cycle_loss
+        )
+
+
+        # diagnostics are detached so they are not counted twice
+        return (
+            total_loss,
+            corr_match_loss.detach(),
+            cycle_loss.detach(),
+        )
 
 class PointDistanceLoss(nn.Module):
     def __init__(self, distance_weight=1.0):

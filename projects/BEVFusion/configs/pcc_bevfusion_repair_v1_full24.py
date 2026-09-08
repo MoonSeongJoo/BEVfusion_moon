@@ -25,10 +25,35 @@ _base_ = [
 # ============================================================
 
 model = dict(
+
     enable_selective_freezing=False,
+    lgpc_train_stage='corr',
 
     bbox_head=dict(
         rrrf_mode='lgpc_only',
+    ),
+
+    corr=dict(
+        init_cfg=None,
+        enable_cycle=False,
+    ),
+    
+    corr_loss=dict(
+        type='CorrelationCycleLoss',
+
+        corr_weight=1.0,
+
+        # Cycle is auxiliary.
+        # Start conservatively.
+        cycle_weight=0.1,
+    ),
+
+    z_estimator=dict(
+        init_cfg=None,
+    ),
+
+    calib_head=dict(
+        init_cfg=None,
     ),
 )
 
@@ -58,16 +83,19 @@ model_wrapper_cfg = dict(
 # ============================================================
 
 train_cfg = dict(
+    _delete_=True,
     type='EpochBasedTrainLoop',
     max_epochs=24,
     val_interval=6,
 )
 
 val_cfg = dict(
+    _delete_=True,
     type='ValLoop',
 )
 
 test_cfg = dict(
+    _delete_=True,
     type='TestLoop',
 )
 
@@ -107,6 +135,7 @@ default_hooks = dict(
     ),
 
     checkpoint=dict(
+        _delete_=True,
         type='CheckpointHook',
         interval=2,
         by_epoch=True,
@@ -115,7 +144,15 @@ default_hooks = dict(
     ),
 
     visualization=dict(
+        _delete_=True,
         type='Det3DVisualizationHook',
         draw=False,
     ),
 )
+
+load_from = (
+    'data/weights/'
+    'bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth'
+)
+
+resume = False

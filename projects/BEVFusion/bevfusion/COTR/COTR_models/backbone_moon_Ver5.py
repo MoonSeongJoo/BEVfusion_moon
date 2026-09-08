@@ -83,8 +83,8 @@ class BackboneBase(nn.Module):
         # assert tensor_list.tensors.shape[-2:] == (256, 512)
 #         print("tensor_list_left_shape" ,tensor_list.tensors[..., 0:constants.MAX_SIZE].shape)
 #         print("tensor_list_right_shape" ,tensor_list.tensors[..., constants.MAX_SIZE: 2*constants.MAX_SIZE].shape)
-        left = self.body(tensor_list.tensors[..., 0:512])
-        right = self.body(tensor_list.tensors[..., 512: 1024])
+        left = self.body(tensor_list.tensors[..., :640])
+        right = self.body(tensor_list.tensors[..., 640:])
         # left = self.body(tensor_list.tensors[..., 0:256])
         # right = self.body(tensor_list.tensors[..., 256: 512])
         xs = {}

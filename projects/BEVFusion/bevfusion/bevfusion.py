@@ -119,7 +119,9 @@ class BEVFusion(Base3DDetector):
         pts_neck: Optional[dict] = None,
         bbox_head: Optional[dict] = None,
         img_bbox_head: Optional[dict] = None,
+        lgpc_train_stage: str = 'joint',
         corr: Optional[dict] = None,
+        corr_loss: Optional[dict] = None,
         z_estimator: Optional[dict] = None,
         calib_head: Optional[dict] = None,
         init_cfg: OptMultiConfig = None,
@@ -184,8 +186,79 @@ class BEVFusion(Base3DDetector):
         self.bbox_head = MODELS.build(bbox_head)
         self.img_bbox_head = MODELS.build(img_bbox_head)
         self.corr = MODELS.build(corr)
+        self.corr_loss = (
+            MODELS.build(corr_loss)
+            if corr_loss is not None
+            else None
+        )
         self.z_estimator = MODELS.build(z_estimator)
         self.calib_head = MODELS.build(calib_head)
+
+        self._lgpc_base_trainability = {
+
+            'corr': {
+                name: p.requires_grad
+                for name, p
+                in self.corr.named_parameters()
+            },
+
+            'z_estimator': {
+                name: p.requires_grad
+                for name, p
+                in self.z_estimator.named_parameters()
+            },
+
+            'calib_head': {
+                name: p.requires_grad
+                for name, p
+                in self.calib_head.named_parameters()
+            },
+        }
+
+        self.is_lgpc_stage1 = (
+            getattr(
+                self.bbox_head,
+                'rrrf_mode',
+                None,
+            )
+            == 'lgpc_only'
+        )
+
+        # ============================================================
+        # LGPC internal training stage
+        #
+        # corr  : CorrNet only
+        # z     : ZEstimator only
+        # calib : CalibHead only
+        # joint : Corr + Z + Calib end-to-end
+        # ============================================================
+
+        self.lgpc_train_stage = lgpc_train_stage
+
+        valid_lgpc_train_stages = {
+            'corr',
+            'z',
+            'calib',
+            'joint',
+        }
+
+        if self.lgpc_train_stage not in valid_lgpc_train_stages:
+
+            raise ValueError(
+                f'Unknown lgpc_train_stage='
+                f'{self.lgpc_train_stage}'
+            )
+
+
+        print(
+            '[BEVFusion] LGPC train stage = '
+            f'{self.lgpc_train_stage}'
+        )
+
+        print(
+            '[BEVFusion] LGPC Stage-1 standalone = '
+            f'{self.is_lgpc_stage1}'
+        )
         
         self.class_names = class_names
         self.name_to_idx = {name: i for i, name in enumerate(self.class_names)}
@@ -197,14 +270,33 @@ class BEVFusion(Base3DDetector):
         hidden_channel = bbox_head['hidden_channel'] # (128) 출력 차원은 TransFusionHead의 hidden_channel과 반드시 일치해야 합니다.
         self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
 
+        # ============================================================
+        # Configure LGPC Stage-1 after ALL modules are constructed.
+        # ============================================================
+
+        if self.is_lgpc_stage1:
+
+            if enable_selective_freezing:
+
+                raise RuntimeError(
+                    'LGPC Stage-1 must use '
+                    'enable_selective_freezing=False. '
+                    'Legacy _freeze_modules() freezes CorrNet.'
+                )
+
+            self._configure_lgpc_substage()
+
         # =====================================================================
         # ✨ START: Code added for selective module freezing
         # =====================================================================
         # Set this flag to True to freeze parts of the network during training.
         # The specific modules to be frozen are defined in the _freeze_modules() method.
         self.enable_selective_freezing = enable_selective_freezing
-        if self.enable_selective_freezing:
-            print("\n!!! WARNING: Selectively freezing parts of the network. !!!\n")
+        if (
+            self.enable_selective_freezing
+            and not self.is_lgpc_stage1
+        ):
+
             self._freeze_modules()
         # =====================================================================
         # ✨ END: Code added for selective module freezing
@@ -230,6 +322,392 @@ class BEVFusion(Base3DDetector):
         self.training_step = 0
         # self.pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
         self.pc_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+    
+    def _configure_lgpc_substage(self):
+
+        stage = self.lgpc_train_stage
+        # ============================================================
+        # 1. Always freeze fixed query generator
+        # ============================================================
+
+        self._freeze_stage1_2d_detector()
+
+
+        # ============================================================
+        # 2. Always freeze BEVFusion / RRRF
+        # ============================================================
+
+        self._freeze_stage1_unused_modules()
+
+
+        # ============================================================
+        # 3. LGPC sub-stage
+        # ============================================================
+
+        train_corr = (
+            stage in {
+                'corr',
+                'joint',
+            }
+        )
+
+        train_z = (
+            stage in {
+                'z',
+                'joint',
+            }
+        )
+
+        train_calib = (
+            stage in {
+                'calib',
+                'joint',
+            }
+        )
+
+
+        self._set_lgpc_module_trainable(
+            'corr',
+            train_corr,
+        )
+
+        self._set_lgpc_module_trainable(
+            'z_estimator',
+            train_z,
+        )
+
+        self._set_lgpc_module_trainable(
+            'calib_head',
+            train_calib,
+        )
+
+
+        print(
+            '\n'
+            '=========================================\n'
+            '[LGPC SUB-STAGE CONFIG]\n'
+            '========================================='
+        )
+
+        print(
+            f'stage       = {stage}'
+        )
+
+        print(
+            f'CorrNet     = '
+            f'{"TRAIN" if train_corr else "FROZEN"}'
+        )
+
+        print(
+            f'ZEstimator  = '
+            f'{"TRAIN" if train_z else "FROZEN"}'
+        )
+
+        print(
+            f'CalibHead   = '
+            f'{"TRAIN" if train_calib else "FROZEN"}'
+        )
+
+        print(
+            '=========================================\n'
+        )
+    
+    def _set_lgpc_module_trainable(
+        self,
+        module_name,
+        enabled,
+    ):
+
+        module = getattr(
+            self,
+            module_name
+        )
+
+        original_mask = (
+            self._lgpc_base_trainability[
+                module_name
+            ]
+        )
+
+
+        for name, p in module.named_parameters():
+
+            if enabled:
+
+                # Restore original intended trainability.
+                #
+                # Important for CorrNet:
+                # ImageNet ResNet remains frozen.
+                p.requires_grad = (
+                    original_mask[name]
+                )
+
+            else:
+
+                p.requires_grad = False
+
+
+        if enabled:
+
+            module.train()
+
+        else:
+
+            module.eval()
+    
+    def train(self, mode: bool = True):
+        """
+        Override nn.Module.train() so that LGPC staged training
+        preserves the intended train/eval state of each module.
+
+        Important:
+        MMEngine calls model.train() after __init__().
+        Without this override, modules frozen with module.eval()
+        during __init__ are recursively switched back to train mode.
+        """
+
+        # First let PyTorch/MMEngine set the normal global state.
+        super().train(mode)
+
+        # ------------------------------------------------------------
+        # Evaluation mode:
+        # super().train(False) already puts everything in eval mode.
+        # Nothing else is needed.
+        # ------------------------------------------------------------
+        if not mode:
+            return self
+
+        # ------------------------------------------------------------
+        # Non-LGPC Stage-1:
+        # keep normal full-model training behavior.
+        # ------------------------------------------------------------
+        if not getattr(
+            self,
+            'is_lgpc_stage1',
+            False,
+        ):
+            return self
+
+
+        stage = self.lgpc_train_stage
+
+
+        # ============================================================
+        # 1. Fixed pretrained 2D detector
+        #
+        # Always frozen/eval during LGPC Stage-1.
+        # ============================================================
+
+        for module in [
+            self.img_backbone,
+            self.img_neck,
+            self.img_bbox_head,
+        ]:
+
+            if module is not None:
+                module.eval()
+
+
+        # ============================================================
+        # 2. Unused BEVFusion / RRRF modules
+        #
+        # Always frozen/eval during LGPC Stage-1.
+        # ============================================================
+
+        for module in [
+            self.pts_voxel_encoder,
+            self.pts_middle_encoder,
+            self.pts_backbone,
+            self.pts_neck,
+            self.view_transform,
+            self.fusion_layer,
+            self.bbox_head,
+            self.feat_projector,
+        ]:
+
+            if module is not None:
+                module.eval()
+
+
+        # ============================================================
+        # 3. LGPC sub-stage modes
+        # ============================================================
+
+        if stage == 'corr':
+
+            # CorrNet is being optimized.
+            self.corr.train()
+
+            # Not used / frozen.
+            self.z_estimator.eval()
+            self.calib_head.eval()
+
+
+        elif stage == 'z':
+
+            # CorrNet must be deterministic feature provider.
+            self.corr.eval()
+
+            # Only ZEstimator is optimized.
+            self.z_estimator.train()
+
+            # Not used / frozen.
+            self.calib_head.eval()
+
+
+        elif stage == 'calib':
+
+            # Frozen deterministic feature providers.
+            self.corr.eval()
+            self.z_estimator.eval()
+
+            # Only CalibHead is optimized.
+            self.calib_head.train()
+
+
+        elif stage == 'joint':
+
+            # Full LGPC end-to-end fine tuning.
+            self.corr.train()
+            self.z_estimator.train()
+            self.calib_head.train()
+
+
+        else:
+
+            raise RuntimeError(
+                f'Unknown LGPC train stage: {stage}'
+            )
+
+
+        return self
+    
+    def _freeze_stage1_2d_detector(self):
+        """
+        Stage-1 LGPC training:
+
+        pretrained 2D detector is used only as a fixed
+        object-center query generator.
+        """
+
+        modules = {
+            'img_backbone': self.img_backbone,
+            'img_neck': self.img_neck,
+            'img_bbox_head': self.img_bbox_head,
+        }
+
+        print(
+            '\n'
+            '=========================================\n'
+            '[LGPC STAGE1] Freeze 2D detector\n'
+            '========================================='
+        )
+
+        for name, module in modules.items():
+
+            if module is None:
+                continue
+
+            for param in module.parameters():
+                param.requires_grad = False
+
+            module.eval()
+
+            total = sum(
+                p.numel()
+                for p in module.parameters()
+            )
+
+            trainable = sum(
+                p.numel()
+                for p in module.parameters()
+                if p.requires_grad
+            )
+
+            print(
+                f'{name}: '
+                f'total={total:,}, '
+                f'trainable={trainable:,}'
+            )
+
+        print(
+            '=========================================\n'
+        )
+    
+    def _freeze_stage1_unused_modules(self):
+        """
+        Modules that are not used by LGPC Stage-1.
+
+        They remain part of the full PCC model,
+        but they must not participate in optimizer/DDP gradient work.
+        """
+
+        modules = {
+            # BEVFusion LiDAR path
+            'pts_voxel_encoder':
+                self.pts_voxel_encoder,
+
+            'pts_middle_encoder':
+                self.pts_middle_encoder,
+
+            'pts_backbone':
+                self.pts_backbone,
+
+            'pts_neck':
+                self.pts_neck,
+
+            # Camera -> BEV path
+            'view_transform':
+                self.view_transform,
+
+            'fusion_layer':
+                self.fusion_layer,
+
+            # Stage-2 / detection
+            'bbox_head':
+                self.bbox_head,
+
+            # Camera proposal feature projection
+            'feat_projector':
+                self.feat_projector,
+        }
+
+
+        print(
+            '\n'
+            '=========================================\n'
+            '[LGPC STAGE1] Freeze unused modules\n'
+            '========================================='
+        )
+
+
+        for name, module in modules.items():
+
+            if module is None:
+                continue
+
+            for p in module.parameters():
+
+                p.requires_grad = False
+
+            module.eval()
+
+
+            total = sum(
+                p.numel()
+                for p in module.parameters()
+            )
+
+            print(
+                f'{name:<22}'
+                f'total={total:>12,d} '
+                f'trainable=0'
+            )
+
+
+        print(
+            '=========================================\n'
+        )
     
     def _freeze_modules(self):
             """
@@ -1105,7 +1583,7 @@ class BEVFusion(Base3DDetector):
             # 3. 설정에 따라 Ground Truth로 2D 탐지 결과를 보강
             # if self.train_cfg.get('complement_2d_gt', -1) > 0:
             # self.training 조건을 추가하여 학습 모드일 때만 이 블록이 실행되도록 합니다.
-            if self.training and self.train_cfg.get('complement_2d_gt', -1) > 0:
+            if self.training and not self.is_lgpc_stage1 and self.train_cfg.get('complement_2d_gt', -1) > 0:
                 gt_bboxes_list = [sample.gt_instances.bboxes for sample in reshaped_data_samples]
                 gt_labels_list = [sample.gt_instances.labels for sample in reshaped_data_samples]
                 
@@ -2280,6 +2758,300 @@ class BEVFusion(Base3DDetector):
         
     #     return corrected_calib_dict
 
+    def _build_corr_target_from_clean_depth(
+        self,
+        query_input_active,
+        active_cam_indices,
+        dense_depth_map_gt,
+        clean_camera2lidar,
+        broken_camera2lidar,
+        camera_intrinsics,
+    ):
+        """
+        Build GT CorrNet target for object-centric image queries.
+
+        query_input_active:
+            [A, Q, 2]
+            SBS-normalized coordinates.
+            RGB side occupies x=[0, 0.5].
+
+        Returns:
+            corr_target:
+                [A, Q, 2]
+                Target coordinates on BROKEN depth side.
+                SBS-normalized.
+
+            valid_mask:
+                [A, Q]
+
+            z_broken_gt:
+                [A, Q]
+                Depth of the SAME physical 3D point
+                under the broken camera geometry.
+        """
+
+        B, N = clean_camera2lidar.shape[:2]
+
+        # Current PCC training path is effectively B=1.
+        if B != 1:
+            raise RuntimeError(
+                "Corr target builder currently expects B=1. "
+                f"Got B={B}."
+            )
+
+
+        H_img = 900
+        W_img = 1600
+
+        A, Q, _ = query_input_active.shape
+
+
+        # ============================================================
+        # 1. SBS-normalized RGB query -> original image pixel
+        #
+        # q_x = (u / 1600) / 2
+        # q_y = v / 900
+        # ============================================================
+
+        u_clean = (
+            query_input_active[..., 0]
+            * 2.0
+            * W_img
+        )
+
+        v_clean = (
+            query_input_active[..., 1]
+            * H_img
+        )
+
+
+        # ============================================================
+        # 2. Sample CLEAN depth at object-center query
+        # ============================================================
+
+        clean_depth_all = (
+            dense_depth_map_gt
+            .view(
+                B * N,
+                H_img,
+                W_img,
+            )
+        )
+
+        clean_depth_active = (
+            clean_depth_all[
+                active_cam_indices
+            ]
+            .unsqueeze(1)
+        )
+        # [A,1,H,W]
+
+
+        grid_x = (
+            2.0
+            * u_clean
+            / (W_img - 1)
+            - 1.0
+        )
+
+        grid_y = (
+            2.0
+            * v_clean
+            / (H_img - 1)
+            - 1.0
+        )
+
+        sample_grid = torch.stack(
+            [
+                grid_x,
+                grid_y,
+            ],
+            dim=-1,
+        ).unsqueeze(2)
+        # [A,Q,1,2]
+
+
+        z_clean = F.grid_sample(
+            clean_depth_active,
+            sample_grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+
+        z_clean = (
+            z_clean
+            .squeeze(1)
+            .squeeze(-1)
+        )
+        # [A,Q]
+
+
+        # ============================================================
+        # 3. Build CLEAN and BROKEN projection matrices
+        # ============================================================
+
+        clean_calib = (
+            self._build_calib_dict_from_cam2lidar(
+                clean_camera2lidar,
+                camera_intrinsics,
+            )
+        )
+
+        broken_calib = (
+            self._build_calib_dict_from_cam2lidar(
+                broken_camera2lidar,
+                camera_intrinsics,
+            )
+        )
+
+
+        clean_l2i_active = (
+            clean_calib[
+                'lidar2img'
+            ][
+                0,
+                active_cam_indices,
+            ]
+        )
+
+        broken_l2i_active = (
+            broken_calib[
+                'lidar2img'
+            ][
+                0,
+                active_cam_indices,
+            ]
+        )
+        # [A,4,4]
+
+
+        # ============================================================
+        # 4. Clean (u,v,z) -> physical LiDAR XYZ
+        # ============================================================
+
+        clean_uvz = torch.stack(
+            [
+                u_clean,
+                v_clean,
+                z_clean,
+            ],
+            dim=-1,
+        )
+        # [A,Q,3]
+
+
+        xyz_lidar = self.uvz_to_lidar_xyz(
+            clean_uvz,
+            clean_l2i_active.unsqueeze(0),
+        )
+        # [A,Q,3]
+
+
+        # ============================================================
+        # 5. Same physical XYZ -> BROKEN image projection
+        # ============================================================
+
+        xyz_h = torch.cat(
+            [
+                xyz_lidar,
+                torch.ones_like(
+                    xyz_lidar[..., :1]
+                ),
+            ],
+            dim=-1,
+        )
+
+
+        proj_broken = torch.einsum(
+            'aij,aqj->aqi',
+            broken_l2i_active,
+            xyz_h,
+        )
+
+
+        z_broken = (
+            proj_broken[..., 2]
+        )
+
+
+        z_safe = torch.clamp(
+            z_broken,
+            min=1e-6,
+        )
+
+
+        u_broken = (
+            proj_broken[..., 0]
+            / z_safe
+        )
+
+        v_broken = (
+            proj_broken[..., 1]
+            / z_safe
+        )
+
+
+        # ============================================================
+        # 6. Valid correspondence
+        # ============================================================
+
+        valid_mask = (
+            (z_clean > 1e-3)
+            & (z_broken > 1e-3)
+
+            & torch.isfinite(
+                u_broken
+            )
+
+            & torch.isfinite(
+                v_broken
+            )
+
+            & (u_broken >= 0)
+            & (u_broken < W_img)
+
+            & (v_broken >= 0)
+            & (v_broken < H_img)
+        )
+
+
+        # ============================================================
+        # 7. BROKEN pixel -> SBS normalized target
+        #
+        # Depth image is the RIGHT half:
+        #
+        # x target = 0.5 + u / (2*1600)
+        # ============================================================
+
+        target_x = (
+            0.5
+            +
+            u_broken
+            / (2.0 * W_img)
+        )
+
+        target_y = (
+            v_broken
+            / H_img
+        )
+
+
+        corr_target = torch.stack(
+            [
+                target_x,
+                target_y,
+            ],
+            dim=-1,
+        )
+
+
+        return (
+            corr_target.detach(),
+            valid_mask.detach(),
+            z_broken.detach(),
+        )
+
     def _get_corrected_calib_from_prediction(
         self,
         pred_delta_rot: torch.Tensor, # (B, N, 3) - 예측된 오차 각도
@@ -2373,24 +3145,81 @@ class BEVFusion(Base3DDetector):
             gt_delta_rot = torch.stack([s.gt_delta_rot for s in batch_data_samples]).to(target_device)
             gt_delta_trans = torch.stack([s.gt_delta_trans for s in batch_data_samples]).to(target_device)
 
-            img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
+            # img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
+
+            # ============================================================
+            # Pretrained 2D query generator
+            #
+            # Stage-1:
+            #   no gradient through 2D detector
+            # ============================================================
+
+            if self.is_lgpc_stage1:
+
+                with torch.no_grad():
+
+                    img_feats = (
+                        self.extract_multiscale_img_feats(
+                            batch_inputs_dict
+                        )
+                    )
+
+            else:
+
+                img_feats = (
+                    self.extract_multiscale_img_feats(
+                        batch_inputs_dict
+                    )
+                )
 
             reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
                 img_feats, batch_data_samples)
             
+            # losses = dict()
+
+            # # ============================================================
+            # # LGPC Stage-1 standalone training
+            # # ============================================================
+            
+            # if self.with_bbox_head:
+            #     losses_2d = self.img_bbox_head.loss(reshaped_img_feats, reshaped_data_samples)
+            # else:
+            #     losses_2d = dict()
+            
+            # # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
+            # total_losses = dict()
+            # for k, v in losses_2d.items():
+            #     total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
+            
+            # # losses 딕셔너리를 total_losses로 초기화하여 2D loss를 먼저 담습니다.
+            # losses = total_losses
+
             losses = dict()
-            if self.with_bbox_head:
-                losses_2d = self.img_bbox_head.loss(reshaped_img_feats, reshaped_data_samples)
-            else:
-                losses_2d = dict()
-            
-            # 4. 계산된 2D 로스를 최종 로스 딕셔너리에 'img_' 접두사와 함께 추가
-            total_losses = dict()
-            for k, v in losses_2d.items():
-                total_losses[f'img_{k}'] = v # 예: 'loss_cls' -> 'img_loss_cls'
-            
-            # losses 딕셔너리를 total_losses로 초기화하여 2D loss를 먼저 담습니다.
-            losses = total_losses
+
+            # ============================================================
+            # 2D detector
+            #
+            # Stage-1 LGPC:
+            #   pretrained 2D detector is used ONLY to generate
+            #   object-center queries.
+            #
+            #   Do NOT optimize it.
+            # ============================================================
+
+            if not self.is_lgpc_stage1:
+
+                if self.img_bbox_head is not None:
+
+                    losses_2d = self.img_bbox_head.loss(
+                        reshaped_img_feats,
+                        reshaped_data_samples
+                    )
+
+                    for k, v in losses_2d.items():
+
+                        losses[
+                            f'img_{k}'
+                        ] = v
 
             detections_2d = self._generate_and_process_2d_dets(
                 reshaped_img_feats, 
@@ -2445,7 +3274,8 @@ class BEVFusion(Base3DDetector):
            
             B,N,C,H,W = sbs_img.shape
             d_model = 312
-            feat_h, feat_w = 12, 64
+            # feat_h, feat_w = 12, 64
+            feat_h, feat_w = 12, 80
 
             # --- ✨ FIX 1: 모든 텐서를 미리 0으로 초기화 (else 블록과 공유) ---
             raw_corrs_shape = (B * N, query_input.shape[1], query_input.shape[2])
@@ -2455,12 +3285,7 @@ class BEVFusion(Base3DDetector):
             raw_corrs = torch.zeros(raw_corrs_shape, device=query_input.device)
             enc_out = torch.zeros(enc_out_shape, device=query_input.device)
             esitmated_uvz = torch.zeros(esitmated_uvz_shape, device=query_input.device)
-            
-            losses['loss_z_estimation'] = torch.tensor(0.0, device=target_device)
-            
             pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
-            losses['loss_calib_rot'] = torch.tensor(0.0, device=target_device, requires_grad=True)
-            losses['loss_calib_trans'] = torch.tensor(0.0, device=target_device, requires_grad=True)
             
             # --- ✨ FIX 2: "안전장치" if 블록 유지 ---
             if len(active_cam_indices) > 0:
@@ -2470,66 +3295,684 @@ class BEVFusion(Base3DDetector):
                 num_active_cams = sbs_img_filtered.shape[1]
                 sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
                 
-                raw_corrs_active, cycle, corr_mask, enc_out_active_4d = self.corr(sbs_view, query_input_filtered)
+                # ============================================================
+                # LGPC internal training stage
+                #
+                # corr  : CorrNet only
+                # z     : ZEstimator only
+                # calib : CalibHead only
+                # joint : Corr + Z + Calib
+                #
+                # Non-Stage1 PCC always behaves as joint.
+                # ============================================================
 
-                b_act, c_f, h_f, w_f = enc_out_active_4d.shape
-                enc_out_active_3d = enc_out_active_4d.flatten(2).permute(0, 2, 1)
-            
-                # raw_corrs_active (Corr 정규화) -> uv_pixels_from_corr (Corr 픽셀)
-                # "predict" 함수의 (L1498-1500) 로직을 여기에 그대로 복사해야 합니다.
-                # (아래는 L1498을 기반으로 한 *추정*입니다. L1498 코드를 정확히 복사하세요)
-                r_x = (raw_corrs_active[..., 0] - 0.5) * 2 * 1600 
-                r_y = raw_corrs_active[..., 1] * 900
-                uv_pixels_from_corr = torch.stack([r_x, r_y], dim=-1) # (NumActive, Q, 2)
-                
-                # 🚨 1. "문제지" (BROKEN) 준비
-                depth_map_reshaped_BROKEN = dense_depth_map.view(B * N, 900, 1600)
-                depth_map_active_BROKEN = depth_map_reshaped_BROKEN[active_cam_indices]
+                if self.is_lgpc_stage1:
+                    stage = self.lgpc_train_stage
+                else:
+                    stage = 'joint'
 
-                # 2. ZEstimator 호출: "문제지"를 입력으로 줌
-                esitmated_z_active = self.z_estimator(
-                    uv_sbs_normalized=raw_corrs_active,      # (특징 좌표)
-                    uv_orig_pixels=uv_pixels_from_corr,   # ✨ (GT 샘플링용 좌표)
-                    depth_map=depth_map_active_BROKEN,
-                    enc_out=enc_out_active_4d
-                )
-
-                # 3. ZEstimator의 "예측"만 가져옴 - 학습시는 예측값만 사용 
-                z_estimated_active = esitmated_z_active['z_estimated_real'] # [NumActive, Q, 1]
-                z_estimated_hybrid = esitmated_z_active['depth']
-
-                # 4. 🚨 "정답지" (TRUE) 준비: Dilation 코드 모두 삭제 (롤백)
-                depth_map_reshaped_TRUE = dense_depth_map_gt.view(B * N, 900, 1600)
-                depth_map_active_TRUE = depth_map_reshaped_TRUE[active_cam_indices] # [NumActive, H, W]
-
-                num_active, Q, _ = uv_pixels_from_corr.shape # ✨ [수정]
-                H_gt, W_gt = 900, 1600
-                
-                uv_orig_flat_active = uv_pixels_from_corr.view(-1, 2) # ✨ [수정]
-                cam_ids_active_flat = torch.arange(num_active, device=target_device).unsqueeze(1).expand(num_active, Q).reshape(-1) 
-                
-                u_coords_flat = uv_orig_flat_active[:, 0].round().long().clamp(0, W_gt - 1)
-                v_coords_flat = uv_orig_flat_active[:, 1].round().long().clamp(0, H_gt - 1)
 
                 # ============================================================
-                # PHASE-A FIX:
-                # Z supervision must follow the BROKEN correspondence.
+                # 1. CorrNet Forward
                 #
-                # P3D = (u', v', z')
+                # corr / joint:
+                #     CorrNet needs gradient.
                 #
-                # Therefore target z' is the broken-depth value at
-                # the predicted broken pixel (u', v'), NOT clean-depth
-                # at the same pixel.
+                # z / calib:
+                #     CorrNet is only a frozen feature provider.
+                # ============================================================
+
+                if stage in {
+                    'corr',
+                    'joint',
+                }:
+
+                    (
+                        raw_corrs_active,
+                        cycle,
+                        corr_mask,
+                        enc_out_active_4d,
+                    ) = self.corr(
+                        sbs_view,
+                        query_input_filtered,
+                    )
+
+                else:
+
+                    with torch.no_grad():
+
+                        (
+                            raw_corrs_active,
+                            cycle,
+                            corr_mask,
+                            enc_out_active_4d,
+                        ) = self.corr(
+                            sbs_view,
+                            query_input_filtered,
+                        )
+
+
+                # ============================================================
+                # Runtime shape check
+                # ============================================================
+
+                b_act, c_f, h_f, w_f = (
+                    enc_out_active_4d.shape
+                )
+
+                if (
+                    c_f != 312
+                    or h_f != 12
+                    or w_f != 80
+                ):
+
+                    raise RuntimeError(
+                        '[CorrNet shape mismatch] '
+                        f'expected=(312,12,80), '
+                        f'actual=({c_f},{h_f},{w_f})'
+                    )
+
+
+                enc_out_active_3d = (
+                    enc_out_active_4d
+                    .flatten(2)
+                    .permute(0, 2, 1)
+                )
+
+
+                # ============================================================
+                # 2. Direct Correspondence Supervision
+                #
+                # IMPORTANT:
+                #
+                # Only Corr and Joint stages calculate L_corr.
+                #
+                # z/calib stages do NOT need corr_target generation.
+                # ============================================================
+
+                corr_target_active = None
+                corr_valid_mask = None
+                z_broken_geom_gt = None
+
+                if stage in {
+                    'corr',
+                    'z',
+                    'joint',
+                }:
+
+                    corr_target_active, corr_valid_mask,z_broken_geom_gt, = (
+                        self._build_corr_target_from_clean_depth(
+                            query_input_active=
+                                query_input_filtered,
+
+                            active_cam_indices=
+                                active_cam_indices,
+
+                            dense_depth_map_gt=
+                                dense_depth_map_gt,
+
+                            clean_camera2lidar=
+                                original_camera2lidar,
+
+                            broken_camera2lidar=
+                                broken_camera2lidar,
+
+                            camera_intrinsics=
+                                broken_camera_intrinsics,
+                        )
+                    )
+
+                    if stage in {
+                        'corr',
+                        'joint',
+                    }:
+                        if self.corr_loss is None:
+
+                            raise RuntimeError(
+                                'Corr/Joint LGPC stage requires '
+                                'corr_loss, but self.corr_loss is None.'
+                            )
+
+
+                        (
+                            loss_corr,
+                            corr_match_raw,
+                            corr_cycle_raw,
+                        ) = self.corr_loss(
+                            corr_pred=
+                                raw_corrs_active,
+
+                            corr_target=
+                                corr_target_active,
+
+                            cycle=
+                                cycle,
+
+                            queries=
+                                query_input_filtered,
+
+                            cycle_mask=
+                                corr_mask,
+
+                            corr_valid_mask=
+                                corr_valid_mask,
+                        )
+
+
+                        losses[
+                            'loss_corr'
+                        ] = loss_corr
+
+
+                        # --------------------------------------------------------
+                        # Diagnostics only
+                        # --------------------------------------------------------
+
+                        losses[
+                            'corr_match_raw'
+                        ] = corr_match_raw
+
+                        losses[
+                            'corr_cycle_raw'
+                        ] = corr_cycle_raw
+
+                        losses[
+                            'corr_valid_ratio'
+                        ] = (
+                            corr_valid_mask
+                            .float()
+                            .mean()
+                            .detach()
+                        )
+
+
+                        # ========================================================
+                        # Pixel-domain correspondence diagnostics
+                        #
+                        # 1) corr_epe_px
+                        #    CorrNet prediction vs geometric GT
+                        #
+                        # 2) identity_epe_px
+                        #    No-correction baseline vs geometric GT
+                        #
+                        # 3) corr_recovery
+                        #    How much of the identity error is recovered
+                        # ========================================================
+
+                        with torch.no_grad():
+
+                            W_IMG = 1600.0
+                            H_IMG = 900.0
+
+
+                            # ====================================================
+                            # A. CorrNet prediction -> original image pixels
+                            #
+                            # CorrNet output is on RIGHT SBS image:
+                            #
+                            # x_norm = 0.5 + u / (2*1600)
+                            # y_norm = v / 900
+                            # ====================================================
+
+                            pred_u = (
+                                (
+                                    raw_corrs_active[
+                                        ...,
+                                        0
+                                    ]
+                                    - 0.5
+                                )
+                                * 2.0
+                                * W_IMG
+                            )
+
+                            pred_v = (
+                                raw_corrs_active[
+                                    ...,
+                                    1
+                                ]
+                                * H_IMG
+                            )
+
+
+                            # ====================================================
+                            # B. Geometric GT correspondence -> pixels
+                            # ====================================================
+
+                            gt_u = (
+                                (
+                                    corr_target_active[
+                                        ...,
+                                        0
+                                    ]
+                                    - 0.5
+                                )
+                                * 2.0
+                                * W_IMG
+                            )
+
+                            gt_v = (
+                                corr_target_active[
+                                    ...,
+                                    1
+                                ]
+                                * H_IMG
+                            )
+
+
+                            # ====================================================
+                            # C. CorrNet EPE
+                            #
+                            # distance:
+                            #
+                            #   prediction (u'_pred, v'_pred)
+                            #             vs
+                            #   GT         (u'_GT,   v'_GT)
+                            # ====================================================
+
+                            corr_epe = torch.sqrt(
+                                (
+                                    pred_u
+                                    - gt_u
+                                ) ** 2
+                                +
+                                (
+                                    pred_v
+                                    - gt_v
+                                ) ** 2
+                            )
+
+
+                            # ====================================================
+                            # D. Identity / No-Correction baseline
+                            #
+                            # query_input_filtered is LEFT SBS coordinate:
+                            #
+                            # q_x = (u / 1600) / 2
+                            # q_y = v / 900
+                            #
+                            # If CorrNet performs NO correction,
+                            # the corresponding point on the right image is
+                            # simply the SAME original pixel (u,v).
+                            #
+                            # Therefore:
+                            #
+                            # identity_u = q_x * 2 * 1600
+                            # identity_v = q_y * 900
+                            # ====================================================
+
+                            identity_u = (
+                                query_input_filtered[
+                                    ...,
+                                    0
+                                ]
+                                * 2.0
+                                * W_IMG
+                            )
+
+                            identity_v = (
+                                query_input_filtered[
+                                    ...,
+                                    1
+                                ]
+                                * H_IMG
+                            )
+
+
+                            # ====================================================
+                            # E. Identity EPE
+                            #
+                            # distance:
+                            #
+                            #   no-correction (u,v)
+                            #             vs
+                            #   GT            (u'_GT,v'_GT)
+                            #
+                            # This tells us how large the correspondence error
+                            # caused by calibration corruption originally was.
+                            # ====================================================
+
+                            identity_epe = torch.sqrt(
+                                (
+                                    identity_u
+                                    - gt_u
+                                ) ** 2
+                                +
+                                (
+                                    identity_v
+                                    - gt_v
+                                ) ** 2
+                            )
+
+
+                            # ====================================================
+                            # F. IMPORTANT:
+                            #
+                            # Use EXACTLY the same valid correspondence mask
+                            # for CorrNet and Identity baseline.
+                            #
+                            # Otherwise the comparison is not fair.
+                            # ====================================================
+
+                            if corr_valid_mask.any():
+
+                                corr_epe_px = (
+                                    corr_epe[
+                                        corr_valid_mask
+                                    ]
+                                    .mean()
+                                )
+
+
+                                identity_epe_px = (
+                                    identity_epe[
+                                        corr_valid_mask
+                                    ]
+                                    .mean()
+                                )
+
+                            else:
+
+                                corr_epe_px = (
+                                    corr_epe
+                                    .new_tensor(
+                                        0.0
+                                    )
+                                )
+
+                                identity_epe_px = (
+                                    identity_epe
+                                    .new_tensor(
+                                        0.0
+                                    )
+                                )
+
+
+                        # ====================================================
+                        # G. Correspondence recovery ratio
+                        #
+                        # recovery =
+                        #
+                        #      1 - CorrNet_EPE / Identity_EPE
+                        #
+                        # Example:
+                        #
+                        # Identity = 100 px
+                        # CorrNet  =  30 px
+                        #
+                        # recovery = 0.70 = 70 %
+                        #
+                        # negative:
+                        # CorrNet made correspondence worse
+                        # ====================================================
+
+                        corr_recovery = torch.where(
+                            identity_epe_px > 1e-6,
+
+                            1.0
+                            - (
+                                corr_epe_px
+                                / identity_epe_px
+                            ),
+
+                            torch.zeros_like(
+                                identity_epe_px
+                            ),
+                        )
+
+
+                        # ====================================================
+                        # H. Logging diagnostics
+                        #
+                        # IMPORTANT:
+                        #
+                        # These names do NOT contain "loss",
+                        # so parse_losses() will NOT add them
+                        # to optimizer loss.
+                        # ====================================================
+
+                        losses[
+                            'corr_epe_px'
+                        ] = corr_epe_px
+
+
+                        losses[
+                            'identity_epe_px'
+                        ] = identity_epe_px
+
+
+                        losses[
+                            'corr_recovery'
+                        ] = corr_recovery
+
+                        
+                        losses[
+                            'corr_valid_count'
+                        ] = (
+                            corr_valid_mask
+                            .float()
+                            .sum()
+                            .detach()
+                        )
+
+                        losses[
+                            'corr_total_count'
+                        ] = torch.tensor(
+                            float(
+                                corr_valid_mask.numel()
+                            ),
+                            device=corr_valid_mask.device,
+                        )
+
+
+                # ============================================================
+                # 3. CORR-ONLY STAGE ENDS HERE
+                #
+                # Do NOT execute:
+                #   ZEstimator
+                #   CalibHead
+                #
+                # This is the key memory saving for Corr pretraining.
+                # ============================================================
+
+                if (
+                    self.is_lgpc_stage1
+                    and stage == 'corr'
+                ):
+
+                    return losses
+
+
+                # ============================================================
+                # 4. Corr output -> original broken-image pixel
+                # ============================================================
+
+                r_x = (
+                    (
+                        raw_corrs_active[
+                            ...,
+                            0
+                        ]
+                        - 0.5
+                    )
+                    * 2.0
+                    * 1600.0
+                )
+
+                r_y = (
+                    raw_corrs_active[
+                        ...,
+                        1
+                    ]
+                    * 900.0
+                )
+
+
+                uv_pixels_from_corr = (
+                    torch.stack(
+                        [
+                            r_x,
+                            r_y,
+                        ],
+                        dim=-1,
+                    )
+                )
+
+                # # ============================================================
+                # # 4. TEMP ORACLE CORR UV TEST
+                # #
+                # # ZEstimator에 CorrNet prediction 대신
+                # # geometric GT correspondence를 입력
+                # # ============================================================
+
+                # oracle_corrs_active = (
+                #     corr_target_active
+                #     .detach()
+                # )
+
+                # r_x = (
+                #     (
+                #         oracle_corrs_active[
+                #             ...,
+                #             0
+                #         ]
+                #         - 0.5
+                #     )
+                #     * 2.0
+                #     * 1600.0
+                # )
+
+                # r_y = (
+                #     oracle_corrs_active[
+                #         ...,
+                #         1
+                #     ]
+                #     * 900.0
+                # )
+
+                # uv_pixels_from_corr = (
+                #     torch.stack(
+                #         [
+                #             r_x,
+                #             r_y,
+                #         ],
+                #         dim=-1,
+                #     )
+                # )
+
+
+                # ============================================================
+                # 5. BROKEN depth for ZEstimator
+                # ============================================================
+
+                depth_map_reshaped_BROKEN = (
+                    dense_depth_map.view(
+                        B * N,
+                        900,
+                        1600,
+                    )
+                )
+
+                depth_map_active_BROKEN = (
+                    depth_map_reshaped_BROKEN[
+                        active_cam_indices
+                    ]
+                )
+
+
+                # ============================================================
+                # 6. ZEstimator Forward
+                #
+                # z / joint:
+                #     gradient ON
+                #
+                # calib:
+                #     ZEstimator is frozen/no_grad
+                # ============================================================
+
+                if stage in {
+                    'z',
+                    'joint',
+                }:
+
+                    esitmated_z_active = (
+                        self.z_estimator(
+                            uv_sbs_normalized=
+                                raw_corrs_active,
+
+                            uv_orig_pixels=
+                                uv_pixels_from_corr,
+
+                            depth_map=
+                                depth_map_active_BROKEN,
+
+                            enc_out=
+                                enc_out_active_4d,
+                        )
+                    )
+
+                else:
+
+                    # --------------------------------------------------------
+                    # calib stage:
+                    # CorrNet and ZEstimator only provide fixed inputs.
+                    # --------------------------------------------------------
+
+                    with torch.no_grad():
+
+                        esitmated_z_active = (
+                            self.z_estimator(
+                                uv_sbs_normalized=
+                                    raw_corrs_active,
+
+                                uv_orig_pixels=
+                                    uv_pixels_from_corr,
+
+                                depth_map=
+                                    depth_map_active_BROKEN,
+
+                                enc_out=
+                                    enc_out_active_4d,
+                            )
+                        )
+
+                # ============================================================
+                # 7. Z outputs
+                # ============================================================
+
+                z_estimated_active = (
+                    esitmated_z_active[
+                        'z_estimated_real'
+                    ]
+                )
+
+                z_estimated_hybrid = (
+                    esitmated_z_active[
+                        'depth'
+                    ]
+                )
+
+
+                # ============================================================
+                # Training GT Z
+                #
+                # IMPORTANT:
+                # z_broken_geom_gt is the depth of the SAME physical
+                # 3D point used to generate CorrNet GT (u'_GT, v'_GT).
+                #
+                # This value is used ONLY as training supervision.
+                # It is NOT an inference input.
                 # ============================================================
 
                 z_target_broken = (
-                    esitmated_z_active[
-                        'z_lidar_real'
-                    ]
+                    z_broken_geom_gt
                     .detach()
-                    .squeeze(-1)
                 )
 
+
+                # ============================================================
+                # ZEstimator prediction
+                # ============================================================
 
                 z_prediction = (
                     z_estimated_active
@@ -2537,76 +3980,818 @@ class BEVFusion(Base3DDetector):
                 )
 
 
-                valid_z_mask = (
-                    z_target_broken > 0
+                # ============================================================
+                # Build valid Z supervision mask
+                #
+                # We require BOTH:
+                #
+                # 1. Geometric GT correspondence is valid
+                # 2. CorrNet predicted UV is inside the actual image
+                #
+                # Why?
+                #
+                # Even if GT (u'_GT,v'_GT) is valid, CorrNet itself may
+                # predict outside [0,1600)x[0,900). Such a prediction does
+                # not provide a meaningful local depth input to ZEstimator.
+                # ============================================================
+
+                pred_u = (
+                    uv_pixels_from_corr[
+                        ...,
+                        0
+                    ]
+                )
+
+                pred_v = (
+                    uv_pixels_from_corr[
+                        ...,
+                        1
+                    ]
                 )
 
 
-                if valid_z_mask.any():
+                pred_uv_valid = (
+                    (pred_u >= 0.0)
+                    & (pred_u < 1600.0)
+                    & (pred_v >= 0.0)
+                    & (pred_v < 900.0)
+                )
 
-                    loss_z_estimation = (
-                        F.smooth_l1_loss(
-                            z_prediction[
-                                valid_z_mask
-                            ],
-                            z_target_broken[
-                                valid_z_mask
-                            ],
-                            reduction='mean',
-                            beta=1.0,
+
+                valid_z_mask = (
+                    corr_valid_mask
+                    & pred_uv_valid
+                    & torch.isfinite(
+                        z_target_broken
+                    )
+                    & torch.isfinite(
+                        z_prediction
+                    )
+                    & (
+                        z_target_broken
+                        > 1e-3
+                    )
+                )
+
+                # ============================================================
+                # Diagnostic:
+                #
+                # OLD Z target vs NEW geometry-consistent Z target
+                #
+                # OLD:
+                #   z_lidar_real
+                #   = broken depth associated with Corr predicted UV
+                #
+                # NEW:
+                #   z_broken_geom_gt
+                #   = depth of the SAME physical 3D point used for
+                #     geometric CorrNet GT.
+                #
+                # IMPORTANT:
+                # - diagnostic only
+                # - detached
+                # - NOT included in optimizer loss
+                # ============================================================
+
+                if stage in {
+                    'z',
+                    'joint',
+                }:
+
+                    z_old_target_broken = (
+                        esitmated_z_active[
+                            'z_lidar_real'
+                        ]
+                        .detach()
+                        .squeeze(-1)
+                    )
+
+
+                    # --------------------------------------------------------
+                    # Fair comparison mask
+                    #
+                    # Both old/new targets must be:
+                    # - based on valid geometric correspondence
+                    # - Corr prediction inside the image
+                    # - finite
+                    # - positive depth
+                    # --------------------------------------------------------
+
+                    z_target_compare_mask = (
+                        corr_valid_mask
+                        & pred_uv_valid
+
+                        & torch.isfinite(
+                            z_old_target_broken
+                        )
+
+                        & torch.isfinite(
+                            z_target_broken
+                        )
+
+                        & (
+                            z_old_target_broken
+                            > 1e-3
+                        )
+
+                        & (
+                            z_target_broken
+                            > 1e-3
                         )
                     )
 
+
+                    with torch.no_grad():
+
+                        if z_target_compare_mask.any():
+
+                            # ========================================================
+                            # 1. RAW local LiDAR depth error
+                            #
+                            # z_old_target_broken:
+                            #   Corr predicted UV에서 실제로 읽은 broken depth
+                            #
+                            # z_target_broken:
+                            #   same-physical-point geometry GT
+                            # ========================================================
+
+                            z_raw_error_same_mask = torch.abs(
+                                z_old_target_broken[
+                                    z_target_compare_mask
+                                ]
+                                -
+                                z_target_broken[
+                                    z_target_compare_mask
+                                ]
+                            )
+
+
+                            z_raw_mae_same_mask_m = (
+                                z_raw_error_same_mask
+                                .mean()
+                            )
+
+
+                            # ========================================================
+                            # 2. ZEstimator prediction error
+                            #
+                            # IMPORTANT:
+                            # RAW depth와 EXACTLY SAME mask를 사용한다.
+                            #
+                            # 따라서 아래 두 값은 직접 비교 가능:
+                            #
+                            #   z_raw_mae_same_mask_m
+                            #   z_pred_mae_same_mask_m
+                            # ========================================================
+
+                            z_pred_error_same_mask = torch.abs(
+                                z_prediction[
+                                    z_target_compare_mask
+                                ]
+                                -
+                                z_target_broken[
+                                    z_target_compare_mask
+                                ]
+                            )
+
+
+                            z_pred_mae_same_mask_m = (
+                                z_pred_error_same_mask
+                                .mean()
+                            )
+
+
+                            # ========================================================
+                            # 3. Depth recovery ratio
+                            #
+                            # recovery =
+                            #
+                            #   1 - Pred_Error / Raw_Error
+                            #
+                            # Example:
+                            #
+                            # raw  = 5.0 m
+                            # pred = 3.0 m
+                            #
+                            # recovery = 1 - 3/5 = 0.40
+                            #
+                            # => raw depth error의 40%를 복구
+                            #
+                            # > 0 : ZEstimator better
+                            # = 0 : same
+                            # < 0 : ZEstimator worse
+                            # ========================================================
+
+                            z_depth_recovery = torch.where(
+                                z_raw_mae_same_mask_m > 1e-6,
+
+                                1.0
+                                -
+                                (
+                                    z_pred_mae_same_mask_m
+                                    /
+                                    z_raw_mae_same_mask_m
+                                ),
+
+                                torch.zeros_like(
+                                    z_raw_mae_same_mask_m
+                                ),
+                            )
+
+
+                            # ========================================================
+                            # Existing target disagreement diagnostics
+                            #
+                            # 이것은 사실상 RAW depth error의 MAE/RMSE이다.
+                            # 기존 로그 호환성을 위해 유지.
+                            # ========================================================
+
+                            z_target_disagreement = (
+                                z_raw_error_same_mask
+                            )
+
+
+                            z_target_disagree_mae_m = (
+                                z_target_disagreement
+                                .mean()
+                            )
+
+
+                            z_target_disagree_rmse_m = (
+                                torch.sqrt(
+                                    torch.mean(
+                                        z_target_disagreement ** 2
+                                    )
+                                )
+                            )
+
+
+                            z_target_compare_ratio = (
+                                z_target_compare_mask
+                                .float()
+                                .mean()
+                            )
+
+                            # ========================================================
+                            # V3: Neighborhood anchor quality
+                            # ========================================================
+
+                            z_anchor_real = (
+                                esitmated_z_active[
+                                    'z_anchor_real'
+                                ]
+                                .detach()
+                                .squeeze(-1)
+                            )
+
+
+                            z_anchor_error_same_mask = torch.abs(
+                                z_anchor_real[
+                                    z_target_compare_mask
+                                ]
+                                -
+                                z_target_broken[
+                                    z_target_compare_mask
+                                ]
+                            )
+
+
+                            z_anchor_mae_same_mask_m = (
+                                z_anchor_error_same_mask
+                                .mean()
+                            )
+
+
+                            z_anchor_recovery = torch.where(
+                                z_raw_mae_same_mask_m > 1e-6,
+
+                                1.0
+                                -
+                                (
+                                    z_anchor_mae_same_mask_m
+                                    /
+                                    z_raw_mae_same_mask_m
+                                ),
+
+                                torch.zeros_like(
+                                    z_raw_mae_same_mask_m
+                                ),
+                            )
+
+
+                        else:
+
+                            z_target_disagree_mae_m = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+
+                            z_target_disagree_rmse_m = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+
+                            z_target_compare_ratio = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+
+
+                            # NEW
+                            z_raw_mae_same_mask_m = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+
+                            z_pred_mae_same_mask_m = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+
+                            z_depth_recovery = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+
+                            z_anchor_mae_same_mask_m = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+                            z_anchor_recovery = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+                        
+
+                    # --------------------------------------------------------
+                    # Diagnostic names intentionally DO NOT contain "loss"
+                    # --------------------------------------------------------
+
                     losses[
-                        'loss_z_estimation'
+                        'z_target_disagree_mae_m'
                     ] = (
-                        loss_z_estimation
+                        z_target_disagree_mae_m
                     )
-                
-                # --- ✨ 1. [신규] Z-Estimator의 예측(z')을 Corr 예측(u', v')과 결합 ---
-                # raw_corrs_active: (NumActive, Q, 2)
-                # z_estimated_active: (NumActive, Q, 1)
-                # -> (u', v', z') 3D 대응점 생성
-                corrs_3d_active = torch.cat([raw_corrs_active, z_estimated_hybrid], dim=-1) # (NumActive, Q, 3)
 
-                pred_delta_6dof_active = self.calib_head(
-                    enc_out_active_4d, 
-                    query_input_filtered, 
-                    corrs_3d_active, # ✨ Corr 예측 (u', v', z') - 3D
+                    losses[
+                        'z_target_disagree_rmse_m'
+                    ] = (
+                        z_target_disagree_rmse_m
+                    )
+
+
+                    losses[
+                        'z_target_compare_ratio'
+                    ] = (
+                        z_target_compare_ratio
+                    )
+
+                    losses[
+                        'z_raw_mae_same_mask_m'
+                    ] = (
+                        z_raw_mae_same_mask_m
+                    )
+
+
+                    losses[
+                        'z_pred_mae_same_mask_m'
+                    ] = (
+                        z_pred_mae_same_mask_m
+                    )
+
+
+                    losses[
+                        'z_depth_recovery'
+                    ] = (
+                        z_depth_recovery
+                    )
+
+                    losses[
+                        'z_anchor_mae_same_mask_m'
+                    ] = (
+                        z_anchor_mae_same_mask_m
+                    )
+
+
+                    losses[
+                        'z_anchor_recovery'
+                    ] = (
+                        z_anchor_recovery
+                    )
+
+
+                    losses[
+                        'z_neighbor_valid_ratio'
+                    ] = (
+                        esitmated_z_active[
+                            'neighbor_valid_ratio'
+                        ]
+                        .detach()
+                        .mean()
+                    )
+
+
+                    losses[
+                        'z_neighbor_weight_max'
+                    ] = (
+                        esitmated_z_active[
+                            'neighbor_weight_max'
+                        ]
+                        .detach()
+                        .mean()
+                    )
+
+
+                if (
+                    self.is_lgpc_stage1
+                    and stage == 'z'
+                    and not hasattr(
+                        self,
+                        '_z_mode_debug_done'
+                    )
+                ):
+
+                    corr_trainable = sum(
+                        p.numel()
+                        for p in self.corr.parameters()
+                        if p.requires_grad
+                    )
+
+                    z_trainable = sum(
+                        p.numel()
+                        for p in self.z_estimator.parameters()
+                        if p.requires_grad
+                    )
+
+                    calib_trainable = sum(
+                        p.numel()
+                        for p in self.calib_head.parameters()
+                        if p.requires_grad
+                    )
+
+                    img_trainable = sum(
+                        p.numel()
+                        for p in self.img_backbone.parameters()
+                        if p.requires_grad
+                    )
+
+                    print(
+                        '\n'
+                        '========================================='
+                    )
+
+                    print('[Z STAGE MODE DEBUG]')
+
+                    print(
+                        'BEVFusion.training =',
+                        self.training
+                    )
+
+                    print(
+                        'Corr.training =',
+                        self.corr.training,
+                        '/ trainable params =',
+                        corr_trainable
+                    )
+
+                    print(
+                        'ZEstimator.training =',
+                        self.z_estimator.training,
+                        '/ trainable params =',
+                        z_trainable
+                    )
+
+                    print(
+                        'CalibHead.training =',
+                        self.calib_head.training,
+                        '/ trainable params =',
+                        calib_trainable
+                    )
+
+                    print(
+                        'img_backbone.training =',
+                        self.img_backbone.training,
+                        '/ trainable params =',
+                        img_trainable
+                    )
+
+                    print(
+                        '=========================================\n'
+                    )
+
+                    self._z_mode_debug_done = True
+                # ============================================================
+                # 8. Z loss
+                #
+                # IMPORTANT:
+                #
+                # Only z and joint stages calculate L_z.
+                # ============================================================
+
+                if stage in {
+                    'z',
+                    'joint',
+                }:
+
+                    if valid_z_mask.any():
+
+                        loss_z_estimation = (
+                            F.smooth_l1_loss(
+                                z_prediction[
+                                    valid_z_mask
+                                ],
+
+                                z_target_broken[
+                                    valid_z_mask
+                                ],
+
+                                reduction='mean',
+                                beta=1.0,
+                            )
+                        )
+
+                        losses[
+                            'loss_z_estimation'
+                        ] = loss_z_estimation
+
+                    else:
+
+                        # Keep valid autograd graph
+                        losses[
+                            'loss_z_estimation'
+                        ] = (
+                            z_prediction.sum()
+                            * 0.0
+                        )
+
+                # ============================================================
+                # ZEstimator physical diagnostics
+                #
+                # z_prediction / z_target_broken are real depth values.
+                # ============================================================
+
+                with torch.no_grad():
+
+                    if valid_z_mask.any():
+
+                        z_error = (
+                            z_prediction[
+                                valid_z_mask
+                            ]
+                            -
+                            z_target_broken[
+                                valid_z_mask
+                            ]
+                        )
+
+                        # Mean Absolute Error [m]
+                        z_mae_m = (
+                            torch.abs(
+                                z_error
+                            )
+                            .mean()
+                        )
+
+                        # Root Mean Squared Error [m]
+                        z_rmse_m = torch.sqrt(
+                            torch.mean(
+                                z_error ** 2
+                            )
+                        )
+
+                        z_valid_ratio = (
+                            valid_z_mask
+                            .float()
+                            .mean()
+                        )
+
+                    else:
+
+                        z_mae_m = (
+                            z_prediction
+                            .new_tensor(0.0)
+                        )
+
+                        z_rmse_m = (
+                            z_prediction
+                            .new_tensor(0.0)
+                        )
+
+                        z_valid_ratio = (
+                            z_prediction
+                            .new_tensor(0.0)
+                        )
+
+
+                    losses[
+                        'z_mae_m'
+                    ] = z_mae_m
+
+                    losses[
+                        'z_rmse_m'
+                    ] = z_rmse_m
+
+                    losses[
+                        'z_valid_ratio'
+                    ] = z_valid_ratio    
+
+
+                # ============================================================
+                # 9. Z-ONLY STAGE ENDS HERE
+                #
+                # Do NOT execute CalibHead.
+                # ============================================================
+
+                if (
+                    self.is_lgpc_stage1
+                    and stage == 'z'
+                ):
+
+                    return losses
+
+
+                # ============================================================
+                # 10. Build 3D correspondence
+                #
+                # Reaching here means:
+                #
+                #   stage == calib
+                #       or
+                #   stage == joint
+                # ============================================================
+
+                corrs_3d_active = (
+                    torch.cat(
+                        [
+                            raw_corrs_active,
+                            z_estimated_hybrid,
+                        ],
+                        dim=-1,
+                    )
                 )
-                
-                if B == 1:
-                    raw_corrs[active_cam_indices] = raw_corrs_active
-                    enc_out[active_cam_indices] = enc_out_active_3d
-                    pred_delta_6dof[0, active_cam_indices] = pred_delta_6dof_active
-                    
-                    esitmated_uvz_active = torch.cat(
-                        [uv_pixels_from_corr, esitmated_z_active['depth']], dim=-1
-                    ) # ✨
-                    esitmated_uvz[active_cam_indices] = esitmated_uvz_active
 
-                pred_rot_filtered = pred_delta_6dof_active[..., :3]
-                pred_trans_filtered = pred_delta_6dof_active[..., 3:]
 
-                gt_rot_filtered = gt_delta_rot[:, active_cam_indices].squeeze(0)
-                gt_trans_filtered = gt_delta_trans[:, active_cam_indices].squeeze(0)
+                # ============================================================
+                # 11. CalibHead
+                #
+                # calib:
+                #     Corr, Z are no_grad.
+                #     CalibHead only receives gradient.
+                #
+                # joint:
+                #     gradient flows end-to-end.
+                # ============================================================
 
-                R_pred_calib = axis_angle_to_matrix(pred_rot_filtered)
-                R_gt_calib = axis_angle_to_matrix(gt_rot_filtered)
-                # 🛑 [NEW] 1. Translation 예측의 강제 보수화 (Zero Regularization Loss)
-                # pred_trans_filtered (예측된 이동 델타)가 0에서 멀어지는 것을 처벌합니다.
-                # L2 정규화 (torch.sum(x**2))는 L2 Loss와 동일한 역할을 합니다.
-                # loss_trans_regularization = torch.sum(pred_trans_filtered**2).mean()
-                # # 💡 가중치 10.0을 적용하여 강한 보수성을 부여 (요청하신 대로)
-                # losses['loss_reg_trans'] = loss_trans_regularization * 1.0
-                losses['loss_calib_rot'] = identity_matrix_loss(R_pred_calib, R_gt_calib) * 100.0
-                losses['loss_calib_trans'] = F.smooth_l1_loss(pred_trans_filtered, gt_trans_filtered, reduction='mean') * 50.0
-            # --- if/else 블록 끝 ---
+                pred_delta_6dof_active = (
+                    self.calib_head(
+                        enc_out_active_4d,
+                        query_input_filtered,
+                        corrs_3d_active,
+                    )
+                )
+
+
+                # ============================================================
+                # 12. Store output only when downstream PCC is needed
+                #
+                # LGPC Stage1 will return before BEVFusion/RRRF.
+                # ============================================================
+
+                if (
+                    not self.is_lgpc_stage1
+                    and B == 1
+                ):
+
+                    raw_corrs[
+                        active_cam_indices
+                    ] = raw_corrs_active
+
+                    enc_out[
+                        active_cam_indices
+                    ] = enc_out_active_3d
+
+                    pred_delta_6dof[
+                        0,
+                        active_cam_indices
+                    ] = pred_delta_6dof_active
+
+
+                    esitmated_uvz_active = (
+                        torch.cat(
+                            [
+                                uv_pixels_from_corr,
+                                esitmated_z_active[
+                                    'depth'
+                                ],
+                            ],
+                            dim=-1,
+                        )
+                    )
+
+                    esitmated_uvz[
+                        active_cam_indices
+                    ] = esitmated_uvz_active
+
+
+                # ============================================================
+                # 13. Calibration supervision
+                # ============================================================
+
+                pred_rot_filtered = (
+                    pred_delta_6dof_active[
+                        ...,
+                        :3
+                    ]
+                )
+
+                pred_trans_filtered = (
+                    pred_delta_6dof_active[
+                        ...,
+                        3:
+                    ]
+                )
+
+
+                gt_rot_filtered = (
+                    gt_delta_rot[
+                        :,
+                        active_cam_indices
+                    ]
+                    .squeeze(0)
+                )
+
+                gt_trans_filtered = (
+                    gt_delta_trans[
+                        :,
+                        active_cam_indices
+                    ]
+                    .squeeze(0)
+                )
+
+
+                R_pred_calib = (
+                    axis_angle_to_matrix(
+                        pred_rot_filtered
+                    )
+                )
+
+                R_gt_calib = (
+                    axis_angle_to_matrix(
+                        gt_rot_filtered
+                    )
+                )
+
+
+                # ============================================================
+                # 14. Calib losses
+                #
+                # calib / joint only reach this point.
+                # ============================================================
+
+                losses[
+                    'loss_calib_rot'
+                ] = (
+                    identity_matrix_loss(
+                        R_pred_calib,
+                        R_gt_calib,
+                    )
+                    * 100.0
+                )
+
+
+                losses[
+                    'loss_calib_trans'
+                ] = (
+                    F.smooth_l1_loss(
+                        pred_trans_filtered,
+                        gt_trans_filtered,
+                        reduction='mean',
+                    )
+                    * 50.0
+                )
+            
+            # ============================================================
+            # Stage-1 LGPC standalone training ends here.
+            #
+            # Objective:
+            #   loss_corr
+            #   loss_z_estimation
+            #   loss_calib_rot
+            #   loss_calib_trans
+            #
+            # Do NOT train RRRF / BEVFusion detector here.
+            # ============================================================
+
+            if self.is_lgpc_stage1:
+
+                return losses
             
             enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
             
             pred_delta_rot = pred_delta_6dof[..., :3]
             pred_delta_trans = pred_delta_6dof[..., 3:]
+
+
 
             # # ##### 검증용 display ######
             # from .imageprocessing_unit import draw_correspondences
@@ -2968,7 +5153,8 @@ class BEVFusion(Base3DDetector):
             batch_inputs_dict, batch_input_metas,visualize=False)
         B, N, C, H, W = sbs_img.shape
         d_model = 312
-        feat_h, feat_w = 12, 64 # 우리가 확인한 실제 피처맵 크기
+        # feat_h, feat_w = 12, 64 # 우리가 확인한 실제 피처맵 크기
+        feat_h, feat_w = 12, 80 # 우리가 확인한 실제 피처맵 크기
 
         raw_corrs_shape = (B * N, query_input.shape[1], query_input.shape[2])
         enc_out_shape = (B * N, feat_h * feat_w, d_model) # [B*N, 768, 312]

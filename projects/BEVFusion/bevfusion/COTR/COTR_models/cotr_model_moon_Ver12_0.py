@@ -45,7 +45,8 @@ class COTR(nn.Module):
         queries = queries.reshape(_b, _q, -1)
         queries = queries.permute(1, 0, 2)
         # queries = torch.tensor(queries ,dtype=torch.float32)
-        queries_clone = queries.clone().detach()
+        # queries_clone = queries.clone().detach()
+        queries_clone = queries.clone()
         tr_input= self.input_proj(src)
         # hs  = self.transformer(tr_input, mask, queries, pos[-1])[0]
         hs , enc_out = self.transformer(tr_input, mask, queries_clone, pos[-1])

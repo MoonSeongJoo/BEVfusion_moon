@@ -269,17 +269,20 @@ model = {'type': 'BEVFusion',
           'position_embedding': 'lin_sine',
           'load_weights_freeze': False,
           'init_cfg': {'type': 'Pretrained',
-                       'checkpoint': 'data/work_dirs/extracted_backbones8(final)/corr_pretrained.pth'}},
+                       'checkpoint': 'data/work_dirs/extracted_backbones8(final)/corr_pretrained.pth'}
+                       },
  'z_estimator': {'type': 'ZEstimator',
                  'enc_channels': 312,
                  'uv_dim': 2,
                  'hidden_dim': 512,
                  'init_cfg': {'type': 'Pretrained',
-                              'checkpoint': 'data/work_dirs/extracted_backbones8(final)/z_estimator_pretrained.pth'}},
+                              'checkpoint': 'data/work_dirs/extracted_backbones8(final)/z_estimator_pretrained.pth'}
+                              },
  'calib_head': {'type': 'CalibrationCorrectionHead',
                 'in_channels': 312,
                 'init_cfg': {'type': 'Pretrained',
-                             'checkpoint': 'data/work_dirs/extracted_backbones8(final)/calib_head_pretrained.pth'}},
+                             'checkpoint': 'data/work_dirs/extracted_backbones8(final)/calib_head_pretrained.pth'}
+                             },
  'fusion_layer': {'type': 'ConvFuser', 'in_channels': [80, 256], 'out_channels': 256}}
 
 
