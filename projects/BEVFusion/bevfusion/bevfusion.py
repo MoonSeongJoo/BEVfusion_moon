@@ -230,6 +230,7 @@ class BEVFusion(Base3DDetector):
         # corr  : CorrNet only
         # z     : ZEstimator only
         # calib : CalibHead only
+        # z_calib : ZEstimator + CalibHead, Corr frozen
         # joint : Corr + Z + Calib end-to-end
         # ============================================================
 
@@ -239,6 +240,7 @@ class BEVFusion(Base3DDetector):
             'corr',
             'z',
             'calib',
+            'z_calib',
             'joint',
         }
 
@@ -322,6 +324,139 @@ class BEVFusion(Base3DDetector):
         self.training_step = 0
         # self.pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
         self.pc_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+
+    def _build_calib_z_reliability(
+        self,
+        z_output,
+    ):
+        """
+        Build inference-available Z reliability descriptor
+        for CalibHead.
+
+        NO GT INFORMATION IS USED.
+
+        Returns:
+            [M,Q,4]
+
+            0: neighborhood valid ratio
+            1: neighborhood max candidate weight
+            2: center depth valid indicator
+            3: anchor-center disagreement / 80m
+        """
+
+        neighbor_valid_ratio = (
+            z_output[
+                'neighbor_valid_ratio'
+            ]
+            .float()
+        )
+
+
+        neighbor_weight_max = (
+            z_output[
+                'neighbor_weight_max'
+            ]
+            .float()
+        )
+
+
+        center_valid = (
+            z_output[
+                'confidence'
+            ]
+            .float()
+        )
+
+
+        z_anchor = torch.nan_to_num(
+
+            z_output[
+                'z_anchor_real'
+            ],
+
+            nan=0.0,
+
+            posinf=80.0,
+
+            neginf=0.0,
+        )
+
+
+        z_center = torch.nan_to_num(
+
+            z_output[
+                'z_lidar_real'
+            ],
+
+            nan=0.0,
+
+            posinf=80.0,
+
+            neginf=0.0,
+        )
+
+
+        # ------------------------------------------------------------
+        # How much does the center raw depth disagree
+        # with the neighborhood anchor?
+        #
+        # This can be a strong cue that a single Corr pixel
+        # has landed on the wrong surface.
+        # ------------------------------------------------------------
+
+        anchor_center_gap = (
+            torch.abs(
+                z_anchor
+                - z_center
+            )
+            .clamp(
+                min=0.0,
+                max=80.0,
+            )
+            / 80.0
+        )
+
+
+        # center depth does not exist:
+        # disagreement itself is meaningless.
+        anchor_center_gap = (
+            anchor_center_gap
+            * center_valid
+        )
+
+
+        reliability = torch.cat(
+
+            [
+                neighbor_valid_ratio,
+                neighbor_weight_max,
+                center_valid,
+                anchor_center_gap,
+            ],
+
+            dim=-1,
+        )
+
+
+        reliability = torch.nan_to_num(
+
+            reliability,
+
+            nan=0.0,
+
+            posinf=1.0,
+
+            neginf=0.0,
+        )
+
+
+        return (
+            reliability
+            .clamp(
+                0.0,
+                1.0,
+            )
+        )
     
     def _configure_lgpc_substage(self):
 
@@ -354,6 +489,7 @@ class BEVFusion(Base3DDetector):
         train_z = (
             stage in {
                 'z',
+                'z_calib',
                 'joint',
             }
         )
@@ -361,6 +497,7 @@ class BEVFusion(Base3DDetector):
         train_calib = (
             stage in {
                 'calib',
+                'z_calib',
                 'joint',
             }
         )
@@ -563,7 +700,15 @@ class BEVFusion(Base3DDetector):
 
             # Only CalibHead is optimized.
             self.calib_head.train()
+        
+        elif stage == 'z_calib':
 
+            # CorrNet is the fixed epoch-10 correspondence provider.
+            self.corr.eval()
+
+            # Train both downstream LGPC modules.
+            self.z_estimator.train()
+            self.calib_head.train()
 
         elif stage == 'joint':
 
@@ -3397,6 +3542,7 @@ class BEVFusion(Base3DDetector):
                 if stage in {
                     'corr',
                     'z',
+                    'z_calib',   # <<< NEW
                     'joint',
                 }:
 
@@ -3892,6 +4038,7 @@ class BEVFusion(Base3DDetector):
 
                 if stage in {
                     'z',
+                    'z_calib',    # <<< NEW
                     'joint',
                 }:
 
@@ -3953,47 +4100,37 @@ class BEVFusion(Base3DDetector):
                 )
 
 
-                # ============================================================
-                # Training GT Z
-                #
-                # IMPORTANT:
-                # z_broken_geom_gt is the depth of the SAME physical
-                # 3D point used to generate CorrNet GT (u'_GT, v'_GT).
-                #
-                # This value is used ONLY as training supervision.
-                # It is NOT an inference input.
-                # ============================================================
+            # ============================================================
+            # Z supervision
+            #
+            # z:
+            #     ZEstimator training
+            #
+            # z_calib:
+            #     ZEstimator + CalibHead concurrent training
+            #
+            # joint:
+            #     full LGPC training
+            #
+            # calib:
+            #     ZEstimator frozen, therefore no Z GT is required
+            # ============================================================
+
+            if stage in {
+                'z',
+                'z_calib',
+                'joint',
+            }:
 
                 z_target_broken = (
                     z_broken_geom_gt
                     .detach()
                 )
 
-
-                # ============================================================
-                # ZEstimator prediction
-                # ============================================================
-
                 z_prediction = (
                     z_estimated_active
                     .squeeze(-1)
                 )
-
-
-                # ============================================================
-                # Build valid Z supervision mask
-                #
-                # We require BOTH:
-                #
-                # 1. Geometric GT correspondence is valid
-                # 2. CorrNet predicted UV is inside the actual image
-                #
-                # Why?
-                #
-                # Even if GT (u'_GT,v'_GT) is valid, CorrNet itself may
-                # predict outside [0,1600)x[0,900). Such a prediction does
-                # not provide a meaningful local depth input to ZEstimator.
-                # ============================================================
 
                 pred_u = (
                     uv_pixels_from_corr[
@@ -4009,14 +4146,12 @@ class BEVFusion(Base3DDetector):
                     ]
                 )
 
-
                 pred_uv_valid = (
                     (pred_u >= 0.0)
                     & (pred_u < 1600.0)
                     & (pred_v >= 0.0)
                     & (pred_v < 900.0)
                 )
-
 
                 valid_z_mask = (
                     corr_valid_mask
@@ -4055,6 +4190,7 @@ class BEVFusion(Base3DDetector):
 
                 if stage in {
                     'z',
+                    'z_calib',
                     'joint',
                 }:
 
@@ -4490,6 +4626,7 @@ class BEVFusion(Base3DDetector):
 
                 if stage in {
                     'z',
+                    'z_calib',     # <<< NEW
                     'joint',
                 }:
 
@@ -4529,71 +4666,75 @@ class BEVFusion(Base3DDetector):
                 #
                 # z_prediction / z_target_broken are real depth values.
                 # ============================================================
+                if stage in {
+                    'z',
+                    'z_calib',
+                    'joint',
+                }:
+                    with torch.no_grad():
 
-                with torch.no_grad():
+                        if valid_z_mask.any():
 
-                    if valid_z_mask.any():
-
-                        z_error = (
-                            z_prediction[
-                                valid_z_mask
-                            ]
-                            -
-                            z_target_broken[
-                                valid_z_mask
-                            ]
-                        )
-
-                        # Mean Absolute Error [m]
-                        z_mae_m = (
-                            torch.abs(
-                                z_error
+                            z_error = (
+                                z_prediction[
+                                    valid_z_mask
+                                ]
+                                -
+                                z_target_broken[
+                                    valid_z_mask
+                                ]
                             )
-                            .mean()
-                        )
 
-                        # Root Mean Squared Error [m]
-                        z_rmse_m = torch.sqrt(
-                            torch.mean(
-                                z_error ** 2
+                            # Mean Absolute Error [m]
+                            z_mae_m = (
+                                torch.abs(
+                                    z_error
+                                )
+                                .mean()
                             )
-                        )
 
-                        z_valid_ratio = (
-                            valid_z_mask
-                            .float()
-                            .mean()
-                        )
+                            # Root Mean Squared Error [m]
+                            z_rmse_m = torch.sqrt(
+                                torch.mean(
+                                    z_error ** 2
+                                )
+                            )
 
-                    else:
+                            z_valid_ratio = (
+                                valid_z_mask
+                                .float()
+                                .mean()
+                            )
 
-                        z_mae_m = (
-                            z_prediction
-                            .new_tensor(0.0)
-                        )
+                        else:
 
-                        z_rmse_m = (
-                            z_prediction
-                            .new_tensor(0.0)
-                        )
+                            z_mae_m = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
 
-                        z_valid_ratio = (
-                            z_prediction
-                            .new_tensor(0.0)
-                        )
+                            z_rmse_m = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
+
+                            z_valid_ratio = (
+                                z_prediction
+                                .new_tensor(0.0)
+                            )
 
 
-                    losses[
-                        'z_mae_m'
-                    ] = z_mae_m
+                        losses[
+                            'z_mae_m'
+                        ] = z_mae_m
 
-                    losses[
-                        'z_rmse_m'
-                    ] = z_rmse_m
+                        losses[
+                            'z_rmse_m'
+                        ] = z_rmse_m
 
-                    losses[
-                        'z_valid_ratio'
-                    ] = z_valid_ratio    
+                        losses[
+                            'z_valid_ratio'
+                        ] = z_valid_ratio    
 
 
                 # ============================================================
@@ -4613,43 +4754,139 @@ class BEVFusion(Base3DDetector):
                 # ============================================================
                 # 10. Build 3D correspondence
                 #
-                # Reaching here means:
+                # z_calib V1 policy:
                 #
-                #   stage == calib
-                #       or
-                #   stage == joint
+                #   ZEstimator
+                #       <- optimized ONLY by Z loss
+                #
+                #   CalibHead
+                #       <- optimized ONLY by calibration loss
+                #
+                # Therefore, in z_calib stage:
+                #
+                #   z prediction       : detach before CalibHead
+                #   Z reliability      : detach before CalibHead
+                #
+                # This prevents calibration loss from backpropagating
+                # into ZEstimator during the first concurrent-training pilot.
                 # ============================================================
 
-                corrs_3d_active = (
-                    torch.cat(
-                        [
-                            raw_corrs_active,
-                            z_estimated_hybrid,
-                        ],
-                        dim=-1,
+                if stage == 'z_calib':
+
+                    z_for_calib = (
+                        z_estimated_hybrid
+                        .detach()
+                    )
+
+                else:
+
+                    z_for_calib = (
+                        z_estimated_hybrid
+                    )
+
+
+                # ============================================================
+                # 11. Build Corr + Z correspondence
+                #
+                # raw_corrs_active:
+                #     [NumActive, Q, 2]
+                #
+                # z_for_calib:
+                #     [NumActive, Q, 1]
+                #
+                # result:
+                #     [NumActive, Q, 3]
+                #     = [u', v', z']
+                # ============================================================
+
+                corrs_3d_active = torch.cat(
+
+                    [
+                        raw_corrs_active,
+                        z_for_calib,
+                    ],
+
+                    dim=-1,
+                )
+
+
+                # ============================================================
+                # 12. Build runtime-available Z reliability
+                #
+                # IMPORTANT:
+                #
+                # This uses only inference-available ZEstimator V3 outputs.
+                # No GT information is included.
+                #
+                # Expected:
+                #     [NumActive, Q, 4]
+                # ============================================================
+
+                z_reliability_active = (
+                    self._build_calib_z_reliability(
+                        esitmated_z_active
                     )
                 )
 
 
                 # ============================================================
-                # 11. CalibHead
+                # z_calib V1:
                 #
-                # calib:
-                #     Corr, Z are no_grad.
-                #     CalibHead only receives gradient.
+                # Calib loss must NOT modify:
                 #
-                # joint:
-                #     gradient flows end-to-end.
+                #   - neighborhood candidate scoring
+                #   - Z anchor construction
+                #   - ZEstimator reliability path
+                #
+                # ZEstimator is trained only by loss_z_estimation.
                 # ============================================================
 
-                pred_delta_6dof_active = (
-                    self.calib_head(
+                if stage == 'z_calib':
+
+                    z_reliability_active = (
+                        z_reliability_active
+                        .detach()
+                    )
+
+
+                # ============================================================
+                # 13. CalibHead V1
+                # ============================================================
+
+                (
+                    pred_delta_6dof_active,
+                    calib_diag,
+                ) = self.calib_head(
+
+                    enc_out=
                         enc_out_active_4d,
+
+                    query_input=
                         query_input_filtered,
+
+                    corrs_pred_3d=
                         corrs_3d_active,
-                    )
+
+                    z_reliability=
+                        z_reliability_active,
                 )
 
+
+                # ============================================================
+                # 14. CalibHead diagnostics
+                #
+                # IMPORTANT:
+                #
+                # These are logging metrics only.
+                # Their names do NOT contain "loss", so MMEngine will
+                # not include them in the optimization loss.
+                # ============================================================
+
+                for key, value in calib_diag.items():
+
+                    losses[
+                        key
+                    ] = value.detach()
 
                 # ============================================================
                 # 12. Store output only when downstream PCC is needed
@@ -4768,6 +5005,72 @@ class BEVFusion(Base3DDetector):
                         reduction='mean',
                     )
                     * 50.0
+                )
+
+                # ============================================================
+                # Physical Calib diagnostics
+                # ============================================================
+
+                with torch.no_grad():
+
+                    rot_error_rad = (
+                        geodesic_distance_loss(
+                            R_pred_calib,
+                            R_gt_calib,
+                        )
+                    )
+
+                    calib_rot_err_deg = (
+                        rot_error_rad
+                        .mean()
+                        * (
+                            180.0
+                            / math.pi
+                        )
+                    )
+
+
+                    trans_error = (
+                        pred_trans_filtered
+                        - gt_trans_filtered
+                    )
+
+
+                    calib_trans_mae_m = (
+                        torch.abs(
+                            trans_error
+                        )
+                        .mean()
+                    )
+
+
+                    calib_trans_l2_m = (
+                        torch.linalg.norm(
+                            trans_error,
+                            dim=-1,
+                        )
+                        .mean()
+                    )
+
+
+                losses[
+                    'calib_rot_err_deg'
+                ] = (
+                    calib_rot_err_deg
+                )
+
+
+                losses[
+                    'calib_trans_mae_m'
+                ] = (
+                    calib_trans_mae_m
+                )
+
+
+                losses[
+                    'calib_trans_l2_m'
+                ] = (
+                    calib_trans_l2_m
                 )
             
             # ============================================================
@@ -5149,8 +5452,30 @@ class BEVFusion(Base3DDetector):
 
         # sbs_img, _, dense_depth_map = self.extract_sbs_img(
         #     batch_inputs_dict, batch_input_metas, visualize=False)
-        sbs_img, pertubed_points,dense_depth_map,dense_depth_map_gt = self.extract_sbs_img(
-            batch_inputs_dict, batch_input_metas,visualize=False)
+        if self.calibration_mode == 'pcc_clean_refine':
+
+            depth_mode = 'clean'
+
+        else:
+
+            depth_mode = 'broken'
+
+
+        (
+            sbs_img,
+            pertubed_points,
+            dense_depth_map,
+            dense_depth_map_gt,
+        ) = self.extract_sbs_img(
+
+            batch_inputs_dict,
+            batch_input_metas,
+
+            visualize=False,
+
+            depth_mode=depth_mode,
+        )
+        
         B, N, C, H, W = sbs_img.shape
         d_model = 312
         # feat_h, feat_w = 12, 64 # 우리가 확인한 실제 피처맵 크기
@@ -5213,15 +5538,41 @@ class BEVFusion(Base3DDetector):
             # z_estimated_filtered = esitmated_z_filtered['z_estimated_real'] # [NumActive, Q, 1]
             z_estimated_hybrid = esitmated_z_filtered['depth']
 
-            # 5. Create 3D correspondences (u', v', z')
-            corrs_3d_filtered = torch.cat([raw_corrs_filtered, z_estimated_hybrid], dim=-1) # (NumActive, Q, 3)
+            corrs_3d_filtered = torch.cat(
 
-            # 6. Call calib_head with 3D correspondences
-            pred_delta_6dof_filtered = self.calib_head(
-                enc_out_filtered_4d,    # 4D tensor
-                query_input_filtered,   # (NumActive, Q, 2 or 3)
-                corrs_3d_filtered       # (NumActive, Q, 3)
-            ) # 출력 shape: (NumActive, 6)
+                [
+                    raw_corrs_filtered,
+                    z_estimated_hybrid,
+                ],
+
+                dim=-1,
+            )
+
+
+            z_reliability_filtered = (
+                self._build_calib_z_reliability(
+                    esitmated_z_filtered
+                )
+            )
+
+
+            (
+                pred_delta_6dof_filtered,
+                _
+            ) = self.calib_head(
+
+                enc_out=
+                    enc_out_filtered_4d,
+
+                query_input=
+                    query_input_filtered,
+
+                corrs_pred_3d=
+                    corrs_3d_filtered,
+
+                z_reliability=
+                    z_reliability_filtered,
+            )
 
             # Convert 4D enc_out to 3D for storage
             b_act, c_f, h_f, w_f = enc_out_filtered_4d.shape

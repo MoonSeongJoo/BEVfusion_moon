@@ -31,7 +31,7 @@ model = dict(
     # --------------------------------------------------------
     # NEW LGPC sub-stage
     # --------------------------------------------------------
-    lgpc_train_stage='z',
+    lgpc_train_stage='z_calib',
 
     bbox_head=dict(
         rrrf_mode='lgpc_only',
@@ -49,8 +49,16 @@ model = dict(
     ),
 
     calib_head=dict(
+        type='CalibrationCorrectionHead',
+        in_channels=312,
+        num_kp=200,
+        dropout_p=0.1,
+        local_dim=32,
+        point_dim=64,
+        global_dim=64,
         init_cfg=None,
     ),
+
 )
 
 

@@ -278,11 +278,8 @@ model = {'type': 'BEVFusion',
                  'init_cfg': {'type': 'Pretrained',
                               'checkpoint': 'data/work_dirs/extracted_backbones8(final)/z_estimator_pretrained.pth'}
                               },
- 'calib_head': {'type': 'CalibrationCorrectionHead',
-                'in_channels': 312,
-                'init_cfg': {'type': 'Pretrained',
-                             'checkpoint': 'data/work_dirs/extracted_backbones8(final)/calib_head_pretrained.pth'}
-                             },
+ 'calib_head' :{'type': 'CalibrationCorrectionHead','in_channels': 312,
+                'num_kp': 200,'dropout_p':0.1,'local_dim':32,'point_dim':64,'global_dim':64,'init_cfg':None,},
  'fusion_layer': {'type': 'ConvFuser', 'in_channels': [80, 256], 'out_channels': 256}}
 
 

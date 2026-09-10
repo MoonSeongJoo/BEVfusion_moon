@@ -251,236 +251,1061 @@ def correct_camera_proposals(det_xyz_norm, pred_delta_rot, pred_delta_trans, pc_
 
     return det_xyz_corrected_norm
 
-# @MODELS.register_module()
-# class CalibrationCorrectionHead(nn.Module):
-#     """
-#     특징 맵을 입력받아 6-DoF 보정 파라미터를 예측하는 헤드.
-
-#     Args:
-#         in_channels (int): 입력 특징 맵의 채널 수.
-#         hidden_dim (int): MLP의 중간층 차원.
-#         out_dim (int): 출력 차원. 기본값은 6 (rot 3 + trans 3).
-#     """
-#     def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
-#         super().__init__()
-        
-#         # 1. 공간 차원(H, W)을 없애고 채널 정보만 남기기 위한 풀링 레이어
-#         self.pool = nn.AdaptiveAvgPool2d(1)
-        
-#         # 2. 풀링된 특징 벡터를 최종 6-DoF 값으로 매핑하는 MLP
-#         self.mlp = nn.Sequential(
-#             nn.Linear(in_channels, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, out_dim)
-#         )
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Args:
-#             x (torch.Tensor): 입력 특징 맵 (B*N, C, H, W)
-        
-#         Returns:
-#             torch.Tensor: 예측된 6-DoF 파라미터 (B*N, 6)
-#         """
-#         # (B*N, C, H, W) -> (B*N, C, 1, 1)
-#         x = self.pool(x)
-        
-#         # (B*N, C, 1, 1) -> (B*N, C)
-#         x = torch.flatten(x, 1)
-        
-#         # (B*N, C) -> (B*N, 6)
-#         pred_delta_6dof = self.mlp(x)
-        
-#         return pred_delta_6dof
-    
-# --------------------------------------------------------------------
-# 1. DepthCalibTranformer의 'regressor' 로직을 위한 헬퍼 클래스
-#    (CalibrationCorrectionHead 클래스보다 *먼저* 정의되어야 합니다)
-# --------------------------------------------------------------------
-class _CalibHeadRegressor(nn.Module):
-    """
-    DepthCalibTranformer의 regressor 로직을 구현한 내부 헬퍼 클래스.
-    BEVFusion의 2D 입력(num_kp*6)과 쿼터니언(4D) 출력에 맞게 수정됨.
-    """
-    def __init__(self, in_channels=312, dropout=0.5, num_kp=200):
-        super(_CalibHeadRegressor, self).__init__()
-        self.num_kp = num_kp
-        self.mish = nn.Mish()
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # 1. Global Feature (enc_out) 처리용
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.flatten = nn.Flatten()
-        
-        # --- ✨ 1. Local Feature 차원 수정 (6 -> 8) ---
-        # (u,v), (u',v',z'), (u-u'), (v-v'), (z') = 8 dims per Kp
-        self.corrs_emb_dim = self.num_kp * 7
-        
-        # 3. MLP 입력 차원 = Global (in_channels) + Local (corrs_emb_dim)
-        self.mlp_input_dim = self.corrs_emb_dim + in_channels # 예: (200 * 6) + 312 = 1512
-
-        # 4. 회전(Rotation) 브랜치 (regressor와 동일 구조)
-        self.fc0_rot_aggr = nn.Linear(self.mlp_input_dim, 1024)
-        self.bn0_rot_aggr = nn.BatchNorm1d(1024)
-        self.fc0_rot = nn.Linear(1024, 512)
-        self.bn0_rot = nn.BatchNorm1d(512)
-        self.fc1_rot = nn.Linear(512, 256)
-        self.bn1_rot = nn.BatchNorm1d(256)
-        # --- ✨ 수정: NaN 방지를 위해 쿼터니언(4D) 출력 ---
-        self.fc2_rot = nn.Linear(256, 3) 
-
-        # 5. 이동(Translation) 브랜치 (regressor와 동일 구조)
-        self.fc0_tarsl_aggr = nn.Linear(self.mlp_input_dim, 1024)
-        self.bn0_tarsl_aggr = nn.BatchNorm1d(1024)
-        self.fc0_trasl = nn.Linear(1024, 512)
-        self.bn0_trasl = nn.BatchNorm1d(512)
-        self.fc1_trasl = nn.Linear(512, 256)
-        self.bn1_trasl = nn.BatchNorm1d(256)
-        self.fc2_trasl = nn.Linear(256, 3) # 3D translation
-
-    def forward(self, x_global, y_local_flat):
-        """
-        Args:
-            x_global (Tensor): (B*N, C) - Global AvgPool Feature
-            y_local_flat (Tensor): (B*N, num_kp*6) - Flattened Corrs Feature
-        """
-        # (B*N, C + num_kp*6)
-        feature_emb = torch.cat((x_global, y_local_flat), dim=-1)
-        
-        # --- 회전 브랜치 ---
-        aggr_rot_x = self.mish(self.bn0_rot_aggr(self.fc0_rot_aggr(feature_emb)))
-        aggr_rot_x = self.dropout2(aggr_rot_x)
-        rot = self.mish(self.bn0_rot(self.fc0_rot(aggr_rot_x)))
-        rot = self.mish(self.bn1_rot(self.fc1_rot(rot)))
-        rot = self.fc2_rot(rot) # (B*N, 3) 축-각 원복
-        # rot = torch.tanh(self.fc2_rot(rot))
-
-        # --- 이동 브랜치 ---
-        aggr_transl_x = self.mish(self.bn0_tarsl_aggr(self.fc0_tarsl_aggr(feature_emb)))
-        aggr_transl_x = self.dropout2(aggr_transl_x)
-        transl = self.mish(self.bn0_trasl(self.fc0_trasl(aggr_transl_x)))
-        transl = self.mish(self.bn1_trasl(self.fc1_trasl(transl)))
-        transl = self.fc2_trasl(transl) # (B*N, 3)
-
-        return rot, transl
-
-# --------------------------------------------------------------------
-# 2. 새로운 CalibrationCorrectionHead (기존 스텁 덮어쓰기)
-# --------------------------------------------------------------------
 @MODELS.register_module()
 class CalibrationCorrectionHead(BaseModule):
     """
-    특징 맵(enc_out)과 대응점(corrs)을 입력받아
-    'regressor' 로직을 사용해 6-DoF 보정 파라미터를 예측하는 헤드.
-    (쿼터니언 4D + 이동 3D = 7D 출력)
+    Reliability-Aware Set Aggregation Calibration Head V1.
 
-    Args:
-        in_channels (int): enc_out의 채널 수. (기본값: 312)
-        num_kp (int): correspondence keypoint의 수. (기본값: 200)
-        dropout_p (float): 드롭아웃 확률. (기본값: 0.5)
+    Main changes from legacy CalibHead:
+
+    1. NO flattening of Q correspondences.
+    2. Same shared Point-MLP is applied to every correspondence.
+    3. Rotation / Translation use separate learned reliability weights.
+    4. ZEstimator V3 reliability is explicitly provided.
+    5. CorrNet local query/correspondence features are explicitly sampled.
+    6. LayerNorm is used instead of BatchNorm.
+    7. No Transformer.
+
+    Inputs
+    ------
+    enc_out:
+        [M, C, H, W]
+        CorrNet encoder feature.
+
+    query_input:
+        [M, Q, 2]
+        SBS normalized query coordinates.
+        u in [0, 0.5], v in [0, 1].
+
+    corrs_pred_3d:
+        [M, Q, 3]
+        [u', v', z']
+        u' in [0.5, 1], v' in [0, 1], z' in meters.
+
+    z_reliability:
+        [M, Q, 4]
+
+        channel 0:
+            neighborhood valid ratio
+
+        channel 1:
+            neighborhood max weight
+
+        channel 2:
+            center raw-depth valid indicator
+
+        channel 3:
+            normalized disagreement between
+            neighborhood anchor and center raw depth
+
+    Returns
+    -------
+    pred_delta_6dof:
+        [M, 6]
+
+    diagnostics:
+        dict
     """
-    def __init__(self, in_channels: int = 312, num_kp: int = 200, dropout_p: float = 0.5, init_cfg=None):
-        super().__init__(init_cfg=init_cfg)
-        self.num_kp = num_kp
-        
-        # regressor 로직을 포함하는 내부 모듈 생성
-        self.regressor = _CalibHeadRegressor(
-            in_channels=in_channels, 
-            dropout=dropout_p, 
-            num_kp=num_kp
-        )
-        # --- ✨ 3. 가중치 수동 로드 로직 (모든 레이어 생성 후) ---
-        if self.init_cfg and self.init_cfg.get('type') == 'Pretrained':
-            checkpoint_path = self.init_cfg.get('checkpoint')
-            if checkpoint_path:
-                print_log(f'Manually loading checkpoint for CalibHead from: {checkpoint_path}', logger='current')
-                
-                # ⭐️ (중요) 'self' (GeneralizedLSSFPN 인스턴스)에 로드합니다.
-                load_checkpoint(
-                    self, 
-                    checkpoint_path, 
-                    map_location='cpu', 
-                    strict=False, # True로 하면 키가 정확히 일치해야 함
-                    
-                    # ⭐️ (중요) 체크포인트의 접두사에 맞게 수정하세요.
-                    # 예: 체크포인트 키가 'img_neck.lateral_convs...' 라면
-                    revise_keys=[('^calib_head\\.', '')]
-                    # 예: 체크포인트 키가 'neck.lateral_convs...' 라면
-                    # revise_keys=[('^neck\\.', '')]
-                    # 예: 접두사가 없다면 이 'revise_keys' 라인을 삭제하거나 주석 처리
-                )
-            else:
-                print_log('No checkpoint path in init_cfg for CalibHead.', logger='current', level='WARNING')
 
-    def forward(self, 
-                enc_out: torch.Tensor, 
-                query_input: torch.Tensor, 
-                corrs_pred_3d: torch.Tensor) -> torch.Tensor:
+    def __init__(
+        self,
+        in_channels: int = 312,
+        num_kp: int = 200,
+        dropout_p: float = 0.1,
+        local_dim: int = 32,
+        point_dim: int = 64,
+        global_dim: int = 64,
+        init_cfg=None,
+    ):
+        super().__init__(
+            init_cfg=init_cfg
+        )
+
+        self.num_kp = num_kp
+        self.in_channels = in_channels
+
+        self.local_dim = local_dim
+        self.point_dim = point_dim
+        self.global_dim = global_dim
+
+        self.z_reliability_dim = 4
+
+
+        # ============================================================
+        # 1. CorrNet local feature adaptor
+        #
+        # 312 -> 32
+        #
+        # The same compressed feature map is used to sample:
+        #
+        #   query feature
+        #   correspondence feature
+        #
+        # ============================================================
+
+        self.local_adaptor = nn.Sequential(
+
+            nn.Conv2d(
+                in_channels,
+                local_dim,
+                kernel_size=1,
+            ),
+
+            nn.Mish(),
+        )
+
+
+        # ============================================================
+        # 2. Global Corr context
+        #
+        # Keep the useful global context from the old CalibHead,
+        # but compress it:
+        #
+        # 312 -> 64
+        #
+        # ============================================================
+
+        self.global_pool = (
+            nn.AdaptiveAvgPool2d(
+                (1, 1)
+            )
+        )
+
+
+        self.global_encoder = nn.Sequential(
+
+            nn.Linear(
+                in_channels,
+                global_dim,
+            ),
+
+            nn.LayerNorm(
+                global_dim
+            ),
+
+            nn.Mish(),
+        )
+
+
+        # ============================================================
+        # 3. Per-point input
+        #
+        # Geometric / correspondence values:
+        #
+        #   q_u
+        #   q_v
+        #   corr_u
+        #   corr_v
+        #   z
+        #   signed_du
+        #   signed_dv
+        #
+        # = 7
+        #
+        # Z reliability:
+        #
+        # = 4
+        #
+        # Local Corr features:
+        #
+        # query feature       = 32
+        # corr feature        = 32
+        # abs difference      = 32
+        #
+        # = 96
+        #
+        # Total:
+        #
+        # 7 + 4 + 96 = 107
+        #
+        # ============================================================
+
+        point_input_dim = (
+            7
+            + self.z_reliability_dim
+            + local_dim * 3
+        )
+
+
+        # ============================================================
+        # 4. Shared per-point encoder
+        #
+        # SAME MLP is applied to all Q points.
+        #
+        # This removes slot dependence of the old flatten head.
+        #
+        # ============================================================
+
+        self.point_encoder = nn.Sequential(
+
+            nn.Linear(
+                point_input_dim,
+                128,
+            ),
+
+            nn.LayerNorm(
+                128
+            ),
+
+            nn.Mish(),
+
+
+            nn.Linear(
+                128,
+                point_dim,
+            ),
+
+            nn.LayerNorm(
+                point_dim
+            ),
+
+            nn.Mish(),
+        )
+
+
+        # ============================================================
+        # 5. Separate reliability scoring
+        #
+        # Rotation and Translation are allowed to trust
+        # different correspondences.
+        #
+        # Translation in particular can learn to care more
+        # about Z reliability.
+        #
+        # ============================================================
+
+        score_input_dim = (
+            point_dim
+            + self.z_reliability_dim
+        )
+
+
+        self.rot_score_head = nn.Sequential(
+
+            nn.Linear(
+                score_input_dim,
+                32,
+            ),
+
+            nn.Mish(),
+
+            nn.Linear(
+                32,
+                1,
+            ),
+        )
+
+
+        self.trans_score_head = nn.Sequential(
+
+            nn.Linear(
+                score_input_dim,
+                32,
+            ),
+
+            nn.Mish(),
+
+            nn.Linear(
+                32,
+                1,
+            ),
+        )
+
+
+        # ============================================================
+        # 6. Pose heads
+        #
+        # Weighted set feature:
+        #      64
+        #
+        # Global Corr context:
+        #      64
+        #
+        # Total:
+        #     128
+        #
+        # ============================================================
+
+        pose_input_dim = (
+            point_dim
+            + global_dim
+        )
+
+
+        self.rot_head = nn.Sequential(
+
+            nn.Linear(
+                pose_input_dim,
+                128,
+            ),
+
+            nn.LayerNorm(
+                128
+            ),
+
+            nn.Mish(),
+
+            nn.Dropout(
+                dropout_p
+            ),
+
+
+            nn.Linear(
+                128,
+                64,
+            ),
+
+            nn.LayerNorm(
+                64
+            ),
+
+            nn.Mish(),
+
+
+            nn.Linear(
+                64,
+                3,
+            ),
+        )
+
+
+        self.trans_head = nn.Sequential(
+
+            nn.Linear(
+                pose_input_dim,
+                128,
+            ),
+
+            nn.LayerNorm(
+                128
+            ),
+
+            nn.Mish(),
+
+            nn.Dropout(
+                dropout_p
+            ),
+
+
+            nn.Linear(
+                128,
+                64,
+            ),
+
+            nn.LayerNorm(
+                64
+            ),
+
+            nn.Mish(),
+
+
+            nn.Linear(
+                64,
+                3,
+            ),
+        )
+
+
+        # ============================================================
+        # 7. Stable initialization
+        #
+        # Reliability:
+        #
+        # Initially all correspondences receive equal weights.
+        #
+        # Q=200:
+        # weight ~= 1 / 200 = 0.005
+        #
+        # ============================================================
+
+        nn.init.zeros_(
+            self.rot_score_head[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.rot_score_head[-1].bias
+        )
+
+
+        nn.init.zeros_(
+            self.trans_score_head[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.trans_score_head[-1].bias
+        )
+
+
+        # ============================================================
+        # Pose starts from identity correction:
+        #
+        # axis-angle = [0,0,0]
+        # translation = [0,0,0]
+        #
+        # ============================================================
+
+        nn.init.zeros_(
+            self.rot_head[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.rot_head[-1].bias
+        )
+
+
+        nn.init.zeros_(
+            self.trans_head[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.trans_head[-1].bias
+        )
+
+
+    def _sample_local_feature(
+        self,
+        feature_map,
+        uv_sbs,
+    ):
         """
         Args:
-            enc_out (torch.Tensor): (B*N, C, H, W) e.g., (B*N, 312, 12, 64)
-            query_input (torch.Tensor): (B*N, N_kp, 2) (u: [0, 0.5], v: [0, 1])
-            corrs_pred_3d (torch.Tensor): (B*N, N_kp, 3) (u': [0.5, 1], v': [0, 1], z': [0, 80])
-        ...
+            feature_map:
+                [M, C_local, H, W]
+
+            uv_sbs:
+                [M, Q, 2]
+                SBS coordinate in [0,1].
+
+        Returns:
+            sampled:
+                [M, Q, C_local]
         """
-        
-        # 1. Global Feature (enc_out) 처리 (동일)
-        x_global = self.regressor.flatten(self.regressor.avgpool(enc_out))
-        
-        # --- 2. Local Feature (corrs_emb) 처리 (✨ [0, 1] 정규화 ✨) ---
-        
-        # 2a. 입력 텐서 분리
-        query_u = query_input[..., 0:1] # (B*N, 200, 1) - [0, 0.5]
-        query_v = query_input[..., 1:2] # (B*N, 200, 1) - [0, 1]
-        
-        corrs_u_prime = corrs_pred_3d[..., 0:1] # (B*N, 200, 1) - [0.5, 1]
-        corrs_v_prime = corrs_pred_3d[..., 1:2] # (B*N, 200, 1) - [0, 1]
-        corrs_z_prime = corrs_pred_3d[..., 2:3] # (B*N, 200, 1) - [0, 80]
 
-        # 2b. 모든 입력을 [0, 1] 범위로 정규화
-        # [0, 0.5]  -> [0, 1]  (x * 2.0)
-        query_u_norm = query_u * 2.0
-        
-        # [0.5, 1]  -> [0, 1]  ( (x - 0.5) * 2.0 )
-        corrs_u_prime_norm = (corrs_u_prime - 0.5) * 2.0
-        
-        # [0, 1]    -> [0, 1]  (변경 없음)
-        query_v_norm = query_v
-        corrs_v_prime_norm = corrs_v_prime
-        
-        # [0, 80]   -> [0, 1]  (x / 80.0)
-        corrs_z_prime_norm = corrs_z_prime / 80.0
+        # [0,1] -> [-1,1]
+        grid = (
+            uv_sbs
+            * 2.0
+            - 1.0
+        )
 
-        # 2c. [0, 1] 정규화된 좌표로 차이(diff) 벡터 계산
-        # (u - u')와 (v - v') 차이 벡터
-        x_diff = query_u_norm - corrs_u_prime_norm # [0, 1] - [0, 1] -> [-1, 1]
-        y_diff = query_v_norm - corrs_v_prime_norm # [0, 1] - [0, 1] -> [-1, 1]
-        
-        # diff 벡터도 [0, 1] 범위로 스케일링
-        x_diff_norm = (x_diff + 1.0) / 2.0 # [-1, 1] -> [0, 2] -> [0, 1]
-        y_diff_norm = (y_diff + 1.0) / 2.0 # [-1, 1] -> [0, 2] -> [0, 1]
-        
-        concat_pred_corrs_diff_norm = torch.cat([x_diff_norm, y_diff_norm], dim=-1) # (B*N, 200, 2)
-        
-        # 2d. [0, 1]로 정규화된 모든 특징 결합
-        # (u,v) + (u',v') + (z') + (u-u')_norm + (v-v')_norm -> 7D
-        corrs_emb = torch.cat(
-            (query_u_norm,              # (B*N, 200, 1)
-             query_v_norm,              # (B*N, 200, 1)
-             corrs_u_prime_norm,        # (B*N, 200, 1)
-             corrs_v_prime_norm,        # (B*N, 200, 1)
-             corrs_z_prime_norm,        # (B*N, 200, 1)
-             concat_pred_corrs_diff_norm),# (B*N, 200, 2)
-            dim=-1
-        ) # (B*N, 200, 7)
-        
-        # MLP 입력을 위해 (B*N, 200, 7) -> (B*N, 200 * 7)
-        y_local_flat = corrs_emb.view(corrs_emb.size(0), -1) # (B*N, 1400)
-        
-        # 3. Regressor 호출 (동일)
-        pred_rot, pred_trans = self.regressor(x_global, y_local_flat)
-        
-        # 4. 결과 결합 (동일)
-        pred_delta_6dof = torch.cat([pred_rot, pred_trans], dim=1)
-        
-        return pred_delta_6dof
+
+        # grid_sample:
+        #
+        # [M,Q,2]
+        # ->
+        # [M,1,Q,2]
+        grid = (
+            grid
+            .unsqueeze(1)
+        )
+
+
+        sampled = F.grid_sample(
+
+            feature_map,
+
+            grid,
+
+            mode='bilinear',
+
+            padding_mode='zeros',
+
+            align_corners=False,
+        )
+        # [M,C,1,Q]
+
+
+        sampled = (
+            sampled
+            .squeeze(2)
+            .permute(
+                0,
+                2,
+                1,
+            )
+            .contiguous()
+        )
+        # [M,Q,C]
+
+
+        return sampled
+
+
+    def forward(
+        self,
+        enc_out: torch.Tensor,
+        query_input: torch.Tensor,
+        corrs_pred_3d: torch.Tensor,
+        z_reliability: torch.Tensor,
+    ):
+        """
+        Returns:
+            pred_delta_6dof:
+                [M,6]
+
+            diagnostics:
+                dict
+        """
+
+        M, Q, _ = (
+            corrs_pred_3d.shape
+        )
+
+
+        # ============================================================
+        # Runtime guards
+        # ============================================================
+
+        if enc_out.ndim != 4:
+
+            raise RuntimeError(
+                '[CalibHead V1] '
+                f'enc_out must be 4D, '
+                f'got {enc_out.shape}'
+            )
+
+
+        if query_input.shape[:2] != (
+            M,
+            Q,
+        ):
+
+            raise RuntimeError(
+                '[CalibHead V1] '
+                'query / correspondence '
+                'shape mismatch: '
+                f'query={query_input.shape}, '
+                f'corr={corrs_pred_3d.shape}'
+            )
+
+
+        if (
+            z_reliability.shape[0] != M
+            or z_reliability.shape[1] != Q
+            or z_reliability.shape[-1]
+            != self.z_reliability_dim
+        ):
+
+            raise RuntimeError(
+                '[CalibHead V1] '
+                'z_reliability must be '
+                f'[M,Q,{self.z_reliability_dim}], '
+                f'got {z_reliability.shape}'
+            )
+
+
+        # ============================================================
+        # 1. Normalize correspondence geometry
+        #
+        # IMPORTANT:
+        #
+        # Absolute coordinates remain [0,1].
+        #
+        # du,dv remain SIGNED [-1,1].
+        #
+        # No more:
+        #
+        #     (diff + 1) / 2
+        #
+        # Identity displacement therefore corresponds to:
+        #
+        #     du = 0
+        #     dv = 0
+        #
+        # ============================================================
+
+        query_u = (
+            query_input[
+                ...,
+                0:1
+            ]
+            * 2.0
+        )
+        # left SBS [0,0.5] -> [0,1]
+
+
+        query_v = (
+            query_input[
+                ...,
+                1:2
+            ]
+        )
+
+
+        corr_u = (
+            (
+                corrs_pred_3d[
+                    ...,
+                    0:1
+                ]
+                - 0.5
+            )
+            * 2.0
+        )
+        # right SBS [0.5,1] -> [0,1]
+
+
+        corr_v = (
+            corrs_pred_3d[
+                ...,
+                1:2
+            ]
+        )
+
+
+        z_norm = (
+            corrs_pred_3d[
+                ...,
+                2:3
+            ]
+            .clamp(
+                min=0.0,
+                max=80.0,
+            )
+            / 80.0
+        )
+
+
+        du = (
+            query_u
+            - corr_u
+        )
+
+
+        dv = (
+            query_v
+            - corr_v
+        )
+
+
+        geom_feature = torch.cat(
+
+            [
+                query_u,
+                query_v,
+
+                corr_u,
+                corr_v,
+
+                z_norm,
+
+                du,
+                dv,
+            ],
+
+            dim=-1,
+        )
+        # [M,Q,7]
+
+
+        # ============================================================
+        # 2. Sanitize Z reliability
+        #
+        # All 4 values are intended in [0,1].
+        #
+        # ============================================================
+
+        z_reliability = torch.nan_to_num(
+
+            z_reliability,
+
+            nan=0.0,
+
+            posinf=1.0,
+
+            neginf=0.0,
+        )
+
+
+        z_reliability = (
+            z_reliability
+            .clamp(
+                min=0.0,
+                max=1.0,
+            )
+        )
+
+
+        # ============================================================
+        # 3. Compress Corr feature map
+        #
+        # 312 -> 32
+        #
+        # ============================================================
+
+        local_map = (
+            self.local_adaptor(
+                enc_out
+            )
+        )
+
+
+        # ============================================================
+        # 4. Sample left-query feature
+        #
+        # query_input itself is SBS coordinate.
+        #
+        # ============================================================
+
+        query_uv_sbs = (
+            query_input[
+                ...,
+                :2
+            ]
+        )
+
+
+        query_local = (
+            self._sample_local_feature(
+                local_map,
+                query_uv_sbs,
+            )
+        )
+        # [M,Q,32]
+
+
+        # ============================================================
+        # 5. Sample right-correspondence feature
+        #
+        # corrs_pred_3d[...,0:2] is also SBS coordinate.
+        #
+        # ============================================================
+
+        corr_uv_sbs = (
+            corrs_pred_3d[
+                ...,
+                :2
+            ]
+        )
+
+
+        corr_local = (
+            self._sample_local_feature(
+                local_map,
+                corr_uv_sbs,
+            )
+        )
+        # [M,Q,32]
+
+
+        # ============================================================
+        # 6. Corr local matching feature
+        #
+        # Preserve:
+        #
+        #   query semantic feature
+        #   candidate feature
+        #   discrepancy between them
+        #
+        # ============================================================
+
+        local_match_feature = torch.cat(
+
+            [
+                query_local,
+                corr_local,
+
+                torch.abs(
+                    query_local
+                    - corr_local
+                ),
+            ],
+
+            dim=-1,
+        )
+        # [M,Q,96]
+
+
+        # ============================================================
+        # 7. Build per-correspondence descriptor
+        #
+        # 7 geometry
+        # 4 Z reliability
+        # 96 Corr local
+        #
+        # = 107
+        #
+        # ============================================================
+
+        point_input = torch.cat(
+
+            [
+                geom_feature,
+                z_reliability,
+                local_match_feature,
+            ],
+
+            dim=-1,
+        )
+        # [M,Q,107]
+
+
+        # ============================================================
+        # 8. SAME point encoder for all correspondences
+        #
+        # ============================================================
+
+        point_feature = (
+            self.point_encoder(
+                point_input
+            )
+        )
+        # [M,Q,64]
+
+
+        # ============================================================
+        # 9. Reliability scoring input
+        #
+        # Directly expose Z reliability once more.
+        #
+        # This is especially useful for Translation weights.
+        #
+        # ============================================================
+
+        score_input = torch.cat(
+
+            [
+                point_feature,
+                z_reliability,
+            ],
+
+            dim=-1,
+        )
+        # [M,Q,68]
+
+
+        # ============================================================
+        # 10. Rotation reliability
+        # ============================================================
+
+        rot_logits = (
+            self.rot_score_head(
+                score_input
+            )
+        )
+        # [M,Q,1]
+
+
+        rot_weights = torch.softmax(
+            rot_logits,
+            dim=1,
+        )
+
+
+        # ============================================================
+        # 11. Translation reliability
+        # ============================================================
+
+        trans_logits = (
+            self.trans_score_head(
+                score_input
+            )
+        )
+
+
+        trans_weights = torch.softmax(
+            trans_logits,
+            dim=1,
+        )
+
+
+        # ============================================================
+        # 12. Weighted SET aggregation
+        #
+        # Point order no longer changes the result.
+        #
+        # ============================================================
+
+        rot_set_feature = (
+            rot_weights
+            * point_feature
+        ).sum(
+            dim=1
+        )
+        # [M,64]
+
+
+        trans_set_feature = (
+            trans_weights
+            * point_feature
+        ).sum(
+            dim=1
+        )
+        # [M,64]
+
+
+        # ============================================================
+        # 13. Global Corr feature
+        #
+        # Preserve current CalibHead global context.
+        #
+        # ============================================================
+
+        global_feature = (
+            self.global_pool(
+                enc_out
+            )
+            .flatten(1)
+        )
+        # [M,312]
+
+
+        global_feature = (
+            self.global_encoder(
+                global_feature
+            )
+        )
+        # [M,64]
+
+
+        # ============================================================
+        # 14. Separate Rotation / Translation context
+        # ============================================================
+
+        rot_feature = torch.cat(
+
+            [
+                rot_set_feature,
+                global_feature,
+            ],
+
+            dim=-1,
+        )
+        # [M,128]
+
+
+        trans_feature = torch.cat(
+
+            [
+                trans_set_feature,
+                global_feature,
+            ],
+
+            dim=-1,
+        )
+        # [M,128]
+
+
+        # ============================================================
+        # 15. Pose regression
+        # ============================================================
+
+        pred_rot = (
+            self.rot_head(
+                rot_feature
+            )
+        )
+        # [M,3]
+
+
+        pred_trans = (
+            self.trans_head(
+                trans_feature
+            )
+        )
+        # [M,3]
+
+
+        pred_delta_6dof = torch.cat(
+
+            [
+                pred_rot,
+                pred_trans,
+            ],
+
+            dim=-1,
+        )
+
+
+        # ============================================================
+        # 16. Diagnostics
+        #
+        # Initially:
+        #
+        # Q=200
+        #
+        # weight_max ~= 0.005
+        # effective_k ~= 200
+        #
+        # As reliability learning becomes selective:
+        #
+        # max_weight increases
+        # effective_k decreases
+        #
+        # ============================================================
+
+        with torch.no_grad():
+
+            rot_weight_max = (
+                rot_weights
+                .max(
+                    dim=1
+                )
+                .values
+                .mean()
+            )
+
+
+            trans_weight_max = (
+                trans_weights
+                .max(
+                    dim=1
+                )
+                .values
+                .mean()
+            )
+
+
+            rot_effective_k = (
+                1.0
+                /
+                (
+                    rot_weights
+                    .squeeze(-1)
+                    .pow(2)
+                    .sum(
+                        dim=1
+                    )
+                    + 1e-8
+                )
+            ).mean()
+
+
+            trans_effective_k = (
+                1.0
+                /
+                (
+                    trans_weights
+                    .squeeze(-1)
+                    .pow(2)
+                    .sum(
+                        dim=1
+                    )
+                    + 1e-8
+                )
+            ).mean()
+
+
+        diagnostics = {
+
+            'calib_rot_weight_max':
+                rot_weight_max,
+
+            'calib_trans_weight_max':
+                trans_weight_max,
+
+            'calib_rot_effective_k':
+                rot_effective_k,
+
+            'calib_trans_effective_k':
+                trans_effective_k,
+        }
+
+
+        return (
+            pred_delta_6dof,
+            diagnostics,
+        )
+
+
+
