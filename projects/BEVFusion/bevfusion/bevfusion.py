@@ -170,6 +170,7 @@ class BEVFusion(Base3DDetector):
             # Stage-1 SE(3) correction is NOT applied.
             'pcc_broken_refine',
             'pcc_clean_refine',
+            'geo_oracle_gtrot',
         }
 
         if self.calibration_mode not in valid_calibration_modes:
@@ -925,45 +926,166 @@ class BEVFusion(Base3DDetector):
         pass
 
     def parse_losses(
-        self, losses: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Parses the raw outputs (losses) of the network.
-
-        Args:
-            losses (dict): Raw output of the network, which usually contain
-                losses and other necessary information.
-
-        Returns:
-            tuple[Tensor, dict]: There are two elements. The first is the
-            loss tensor passed to optim_wrapper which may be a weighted sum
-            of all losses, and the second is log_vars which will be sent to
-            the logger.
+        self,
+        losses: Dict[str, torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+    ]:
         """
-        log_vars = []
-        for loss_name, loss_value in losses.items():
-            if isinstance(loss_value, torch.Tensor):
-                log_vars.append([loss_name, loss_value.mean()])
-            elif is_list_of(loss_value, torch.Tensor):
-                log_vars.append(
-                    [loss_name,
-                     sum(_loss.mean() for _loss in loss_value)])
-            else:
-                raise TypeError(
-                    f'{loss_name} is not a tensor or list of tensors')
+        Parse optimization losses and logging metrics.
 
-        loss = sum(value for key, value in log_vars if 'loss' in key)
-        log_vars.insert(0, ['loss', loss])
-        log_vars = OrderedDict(log_vars)  # type: ignore
+        IMPORTANT:
+        Empty optimization-loss handling must be done inside loss(),
+        i.e. inside the DDP forward graph.
+
+        parse_losses() must NOT directly attach model parameters
+        to a newly-created zero loss.
+        """
+
+        log_vars = []
+
+
+        # ============================================================
+        # 1. Convert values to scalar tensors
+        # ============================================================
+
+        for loss_name, loss_value in losses.items():
+
+            if isinstance(
+                loss_value,
+                torch.Tensor,
+            ):
+
+                log_vars.append(
+                    [
+                        loss_name,
+                        loss_value.mean(),
+                    ]
+                )
+
+
+            elif is_list_of(
+                loss_value,
+                torch.Tensor,
+            ):
+
+                if len(loss_value) == 0:
+
+                    raise RuntimeError(
+                        '[parse_losses] '
+                        f'Empty tensor list: {loss_name}'
+                    )
+
+
+                value = sum(
+                    (
+                        item.mean()
+                        for item in loss_value
+                    ),
+                    loss_value[0].new_zeros(()),
+                )
+
+
+                log_vars.append(
+                    [
+                        loss_name,
+                        value,
+                    ]
+                )
+
+
+            else:
+
+                raise TypeError(
+                    f'{loss_name} is not a Tensor '
+                    f'or list of Tensors. '
+                    f'Got {type(loss_value)}'
+                )
+
+
+        # ============================================================
+        # 2. Optimization loss only
+        # ============================================================
+
+        loss_terms = [
+            value
+            for key, value in log_vars
+            if 'loss' in key
+        ]
+
+
+        if len(loss_terms) == 0:
+
+            raise RuntimeError(
+                '[parse_losses] '
+                'loss() returned no optimization loss. '
+                f'keys={list(losses.keys())}'
+            )
+
+
+        loss = sum(
+            loss_terms[1:],
+            loss_terms[0],
+        )
+
+
+        # ============================================================
+        # 3. Aggregate loss logging
+        # ============================================================
+
+        log_vars.insert(
+            0,
+            [
+                'loss',
+                loss,
+            ],
+        )
+
+
+        log_vars = OrderedDict(
+            log_vars
+        )
+
+
+        # ============================================================
+        # 4. Distributed logging reduction
+        # ============================================================
 
         for loss_name, loss_value in log_vars.items():
-            # reduce loss when distributed training
-            if dist.is_available() and dist.is_initialized():
-                loss_value = loss_value.data.clone()
-                dist.all_reduce(loss_value.div_(dist.get_world_size()))
-            log_vars[loss_name] = loss_value.item()
 
-        return loss, log_vars  # type: ignore
+            log_value = (
+                loss_value
+                .detach()
+                .clone()
+            )
 
+
+            if (
+                dist.is_available()
+                and dist.is_initialized()
+            ):
+
+                dist.all_reduce(
+                    log_value
+                )
+
+                log_value = (
+                    log_value
+                    / dist.get_world_size()
+                )
+
+
+            log_vars[
+                loss_name
+            ] = log_value.item()
+
+
+        return (
+            loss,
+            log_vars,
+        )
+    
     def init_weights(self) -> None:
         if self.img_backbone is not None:
             self.img_backbone.init_weights()
@@ -1277,52 +1399,6 @@ class BEVFusion(Base3DDetector):
             return x, lidar_query_feat
         
         return x
-
-    # def extract_feat(
-    #     self,
-    #     batch_inputs_dict,
-    #     batch_input_metas,
-    #     **kwargs,
-    # ):
-    #     imgs = batch_inputs_dict.get('imgs', None)
-    #     points = batch_inputs_dict.get('points', None)
-    #     features = []
-    #     if imgs is not None:
-    #         imgs = imgs.contiguous()
-    #         lidar2image, camera_intrinsics, camera2lidar = [], [], []
-    #         img_aug_matrix, lidar_aug_matrix = [], []
-    #         for i, meta in enumerate(batch_input_metas):
-    #             lidar2image.append(meta['lidar2img'])
-    #             camera_intrinsics.append(meta['cam2img'])
-    #             camera2lidar.append(meta['cam2lidar'])
-    #             img_aug_matrix.append(meta.get('img_aug_matrix', np.eye(4)))
-    #             lidar_aug_matrix.append(
-    #                 meta.get('lidar_aug_matrix', np.eye(4)))
-
-    #         lidar2image = imgs.new_tensor(np.asarray(lidar2image))
-    #         camera_intrinsics = imgs.new_tensor(np.array(camera_intrinsics))
-    #         camera2lidar = imgs.new_tensor(np.asarray(camera2lidar))
-    #         img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
-    #         lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
-    #         img_feature ,raw_img_feature = self.extract_img_feat(imgs, deepcopy(points),
-    #                                             lidar2image, camera_intrinsics,
-    #                                             camera2lidar, img_aug_matrix,
-    #                                             lidar_aug_matrix,
-    #                                             batch_input_metas)
-    #         features.append(img_feature)
-    #     pts_feature = self.extract_pts_feat(batch_inputs_dict)
-    #     features.append(pts_feature)
-
-    #     if self.fusion_layer is not None:
-    #         x = self.fusion_layer(features)
-    #     else:
-    #         assert len(features) == 1, features
-    #         x = features[0]
-
-    #     x = self.pts_backbone(x)
-    #     x = self.pts_neck(x)
-
-    #     return x, raw_img_feature,lidar2image, camera_intrinsics, camera2lidar
     
     def extract_sbs_img(
         self,
@@ -1821,81 +1897,6 @@ class BEVFusion(Base3DDetector):
         center_points = torch.stack([cam_ids, obj_ids, center_x, center_y], dim=1)
         return center_points
     
-    ##### old code ######
-    # def batch_rois_center_by_cam_id(self, rois_center, batch_size=100):
-    #     """
-    #     rois_center 텐서에서 카메라 ID를 읽어, 항상 6개의 카메라에 대한
-    #     고정된 크기의 배치(batch) 텐서를 생성합니다.
-    #     존재하지 않는 카메라 ID의 슬롯은 0으로 채워집니다.
-    #     """
-    #     device = rois_center.device
-        
-    #     # 입력 텐서가 비어있는 경우, 빈 텐서를 반환
-    #     if rois_center.shape[0] == 0:
-    #         # num_cams를 알 수 없으므로 기본값 6으로 설정하거나, 호출하는 쪽에서 처리
-    #         return torch.zeros((6, batch_size, 4), device=device)
-
-    #     # 1. rois_center의 0열에서 모든 카메라 인덱스를 추출합니다.
-    #     cam_indices_tensor = rois_center[:, 0]
-        
-    #     # 2. 존재하는 고유한 카메라 ID 목록을 찾습니다.
-    #     unique_cam_ids = torch.unique(cam_indices_tensor).long().cpu().tolist()
-        
-    #     # 3. 최대 카메라 ID를 기반으로 출력 텐서의 크기를 결정합니다.
-    #     #    예: [0, 1, 5]가 있다면, 크기가 6인 텐서 (0~5)를 생성합니다.
-    #     max_cam_id = int(torch.max(cam_indices_tensor).item())
-    #     num_total_cams = max_cam_id + 1
-        
-    #     batched_centers = torch.zeros((num_total_cams, batch_size, 4), device=device)
-        
-    #     # 원본 객체 ID 저장 (검증 로직은 그대로 유지)
-    #     original_obj_ids = rois_center[:, 1].cpu().numpy()
-        
-    #     # 4. 하드코딩된 range(num_cams) 대신, 실제 존재하는 카메라 ID들을 순회합니다.
-    #     for cam_id in unique_cam_ids:
-    #         cam_mask = (rois_center[:, 0] == cam_id)
-    #         cam_centers = rois_center[cam_mask]
-    #         n = cam_centers.size(0)
-            
-    #         if n == 0:
-    #             continue
-                
-    #         # --- (내부 샘플링 로직은 기존과 동일) ---
-    #         obj_ids = cam_centers[:, 1].cpu().numpy()
-    #         unique_obj_ids = np.unique(obj_ids)
-    #         num_unique_objs = len(unique_obj_ids)
-            
-    #         if num_unique_objs <= batch_size:
-    #             if n < batch_size:
-    #                 repeat_factor = (batch_size + n - 1) // n
-    #                 cam_centers = cam_centers.repeat(repeat_factor, 1)[:batch_size]
-    #         else:
-    #             selected_indices = []
-    #             for obj_id in unique_obj_ids:
-    #                 obj_indices = np.where(obj_ids == obj_id)[0]
-    #                 selected_idx = np.random.choice(obj_indices)
-    #                 selected_indices.append(selected_idx)
-                    
-    #             if len(selected_indices) < batch_size:
-    #                 remaining = batch_size - len(selected_indices)
-    #                 all_indices = np.arange(n)
-    #                 # 이미 선택된 인덱스를 제외하고 남은 풀에서 추가 선택
-    #                 pool = np.setdiff1d(all_indices, selected_indices)
-    #                 # 만약 풀이 부족하면 복원 추출 허용
-    #                 replace = len(pool) < remaining
-    #                 extra_indices = np.random.choice(
-    #                     pool,
-    #                     size=remaining,
-    #                     replace=replace
-    #                 )
-    #                 selected_indices.extend(extra_indices)
-                    
-    #             selected_indices = torch.tensor(selected_indices, device=device, dtype=torch.long)
-    #             cam_centers = cam_centers[selected_indices]
-            
-    #         batched_centers[cam_id, :cam_centers.size(0)] = cam_centers[:batch_size]
-        
-    #     return batched_centers
     
     def batch_rois_center_by_cam_id(self, rois_center, batch_size=100):
         """
@@ -1911,9 +1912,34 @@ class BEVFusion(Base3DDetector):
         # ✨ 2. 출력 텐서를 고정된 [6, batch_size, 4] 크기로 생성합니다.
         batched_centers = torch.zeros((NUM_CAMS, batch_size, 4), device=device)
 
+        # ============================================================
+        # NEW:
+        # Which query slots correspond to REAL detections?
+        #
+        # CorrNet still receives exactly batch_size=200 queries.
+        #
+        # True:
+        #     original detection
+        #
+        # False:
+        #     repeated filler used only to satisfy fixed-Q CorrNet
+        # ============================================================
+
+        query_unique_mask = torch.zeros(
+            (
+                NUM_CAMS,
+                batch_size,
+            ),
+            dtype=torch.bool,
+            device=device,
+        )
+
         # 입력 텐서가 비어있는 경우, 위에서 생성한 제로 텐서를 그대로 반환
         if rois_center.shape[0] == 0:
-            return batched_centers
+            return (
+                batched_centers,
+                query_unique_mask,
+            )
 
         # 1. rois_center의 0열에서 모든 카메라 인덱스를 추출합니다.
         cam_indices_tensor = rois_center[:, 0]
@@ -1935,6 +1961,20 @@ class BEVFusion(Base3DDetector):
             
             if n == 0:
                 continue
+
+            # ============================================================
+            # Number of actual detector queries BEFORE repetition.
+            # ============================================================
+
+            num_real = min(
+                n,
+                batch_size,
+            )
+
+            query_unique_mask[
+                cam_id,
+                :num_real,
+            ] = True
                 
             # --- (내부 샘플링 로직은 기존과 동일) ---
             obj_ids = cam_centers[:, 1].cpu().numpy()
@@ -1969,7 +2009,10 @@ class BEVFusion(Base3DDetector):
             
             batched_centers[cam_id] = cam_centers[:batch_size]
 
-        return batched_centers
+        return (
+            batched_centers,
+            query_unique_mask,
+        )
     
     def remove_duplicate_objs(self,corrs_pred_with_obj):
         """
@@ -2443,6 +2486,527 @@ class BEVFusion(Base3DDetector):
             'cam2img': camera_intrinsics,
             'cam2lidar': camera2lidar,
         }
+    
+    @torch.no_grad()
+    def _solve_translation_given_rotation(
+        self,
+        query_input,
+        source_uv_pixels,
+        source_z,
+        point_valid_mask,
+        broken_camera2lidar,
+        camera_intrinsics,
+        delta_rot,
+    ):
+        """
+        Solve Delta translation t when Delta rotation R is known.
+
+        Convention:
+            broken_C2L = Delta @ clean_C2L
+
+            Delta = [R, t]
+
+        Therefore:
+
+            corrected_C2L
+                = inv(Delta) @ broken_C2L
+
+        Inputs
+        ------
+        query_input:
+            [A,Q,2]
+            Left-SBS target query.
+
+        source_uv_pixels:
+            [A,Q,2]
+            Corr/source pixel on broken projection.
+
+        source_z:
+            [A,Q,1]
+            Optical-axis depth [m].
+
+        point_valid_mask:
+            [A,Q]
+
+        broken_camera2lidar:
+            [A,4,4]
+
+        camera_intrinsics:
+            [A,4,4]
+
+        delta_rot:
+            [A,3]
+            axis-angle rotation of Delta.
+
+        Returns
+        -------
+        pred_trans:
+            [A,3]
+
+        diagnostics:
+            dict
+        """
+
+        device = query_input.device
+        out_dtype = query_input.dtype
+
+        A_cam, Q, _ = query_input.shape
+
+        # ============================================================
+        # 1. Original-image target pixels
+        #
+        # query x occupies LEFT SBS half:
+        #
+        # q_x = (u / 1600) / 2
+        # q_y = v / 900
+        # ============================================================
+
+        target_u = (
+            query_input[..., 0]
+            * 2.0
+            * 1600.0
+        )
+
+        target_v = (
+            query_input[..., 1]
+            * 900.0
+        )
+
+
+        # ============================================================
+        # 2. Camera intrinsics
+        # ============================================================
+
+        K = (
+            camera_intrinsics[
+                ...,
+                :3,
+                :3
+            ]
+        )
+
+        K_inv = torch.linalg.inv(K)
+
+
+        # ============================================================
+        # 3. Target pixel -> camera ray
+        #
+        # r = K^-1 [u,v,1]
+        # ============================================================
+
+        target_pix_h = torch.stack(
+            [
+                target_u,
+                target_v,
+                torch.ones_like(target_u),
+            ],
+            dim=-1,
+        )
+        # [A,Q,3]
+
+
+        target_ray = torch.einsum(
+            'aij,aqj->aqi',
+            K_inv,
+            target_pix_h,
+        )
+
+
+        # Unit normalization improves numerical conditioning.
+        target_ray = F.normalize(
+            target_ray,
+            p=2,
+            dim=-1,
+            eps=1e-8,
+        )
+
+
+        # ============================================================
+        # 4. Broken source pixel -> camera XYZ
+        #
+        # Z is optical-axis depth:
+        #
+        # X = (u-cx)/fx * Z
+        # Y = (v-cy)/fy * Z
+        # ============================================================
+
+        source_u = source_uv_pixels[..., 0]
+        source_v = source_uv_pixels[..., 1]
+
+        source_pix_h = torch.stack(
+            [
+                source_u,
+                source_v,
+                torch.ones_like(source_u),
+            ],
+            dim=-1,
+        )
+
+
+        source_ray = torch.einsum(
+            'aij,aqj->aqi',
+            K_inv,
+            source_pix_h,
+        )
+
+
+        source_xyz_cam = (
+            source_ray
+            * source_z
+        )
+        # [A,Q,3]
+
+
+        # ============================================================
+        # 5. Broken camera XYZ -> LiDAR XYZ
+        #
+        # broken C2L:
+        #
+        # X_L = R_B X_C + t_B
+        # ============================================================
+
+        R_broken = (
+            broken_camera2lidar[
+                ...,
+                :3,
+                :3
+            ]
+        )
+
+        t_broken = (
+            broken_camera2lidar[
+                ...,
+                :3,
+                3
+            ]
+        )
+
+
+        source_xyz_lidar = (
+            torch.einsum(
+                'aij,aqj->aqi',
+                R_broken,
+                source_xyz_cam,
+            )
+            +
+            t_broken.unsqueeze(1)
+        )
+
+
+        # ============================================================
+        # 6. Known Delta rotation
+        # ============================================================
+
+        R_delta = axis_angle_to_matrix(
+            delta_rot
+        )
+        # [A,3,3]
+
+
+        # ============================================================
+        # 7. Translation linear system
+        #
+        # corrected L2C:
+        #
+        #     inv(corrected_C2L)
+        #   = inv(inv(Delta) @ Broken)
+        #   = inv(Broken) @ Delta
+        #
+        # Therefore target camera point:
+        #
+        # X_C =
+        # R_B^T ( R_delta X_L + t_delta - t_B )
+        #
+        # It must lie on target ray r:
+        #
+        # [r]_x X_C = 0
+        #
+        # giving:
+        #
+        # [r]_x R_B^T t_delta
+        #
+        #   =
+        #
+        # - [r]_x R_B^T
+        #       (R_delta X_L - t_B)
+        #
+        # This is:
+        #
+        # A t = b
+        # ============================================================
+
+        pred_trans = torch.zeros(
+            (
+                A_cam,
+                3,
+            ),
+            device=device,
+            dtype=torch.float64,
+        )
+
+
+        valid_counts = []
+        residuals = []
+        cond_numbers = []
+
+
+        for cam_idx in range(A_cam):
+
+            valid = (
+                point_valid_mask[
+                    cam_idx
+                ]
+                &
+                torch.isfinite(
+                    source_xyz_lidar[
+                        cam_idx
+                    ]
+                ).all(dim=-1)
+                &
+                torch.isfinite(
+                    target_ray[
+                        cam_idx
+                    ]
+                ).all(dim=-1)
+                &
+                torch.isfinite(
+                    source_z[
+                        cam_idx,
+                        :,
+                        0
+                    ]
+                )
+                &
+                (
+                    source_z[
+                        cam_idx,
+                        :,
+                        0
+                    ]
+                    > 1e-3
+                )
+            )
+
+
+            num_valid = int(
+                valid.sum().item()
+            )
+
+            valid_counts.append(
+                num_valid
+            )
+
+
+            if num_valid < 6:
+
+                raise RuntimeError(
+                    '[GEO SOLVER] '
+                    f'cam={cam_idx}: '
+                    f'only {num_valid} valid points.'
+                )
+
+
+            r = (
+                target_ray[
+                    cam_idx,
+                    valid
+                ]
+                .double()
+            )
+            # [Nv,3]
+
+
+            X = (
+                source_xyz_lidar[
+                    cam_idx,
+                    valid
+                ]
+                .double()
+            )
+
+
+            Rb = (
+                R_broken[
+                    cam_idx
+                ]
+                .double()
+            )
+
+
+            tb = (
+                t_broken[
+                    cam_idx
+                ]
+                .double()
+            )
+
+
+            Rd = (
+                R_delta[
+                    cam_idx
+                ]
+                .double()
+            )
+
+
+            # --------------------------------------------------------
+            # skew(r)
+            #
+            # [ 0  -rz  ry ]
+            # [ rz  0  -rx ]
+            # [-ry  rx  0  ]
+            # --------------------------------------------------------
+
+            rx = r[:, 0]
+            ry = r[:, 1]
+            rz = r[:, 2]
+
+            zero = torch.zeros_like(rx)
+
+
+            skew_r = torch.stack(
+                [
+                    zero, -rz,   ry,
+                    rz,   zero, -rx,
+                    -ry,  rx,    zero,
+                ],
+                dim=-1,
+            ).reshape(
+                -1,
+                3,
+                3,
+            )
+
+
+            Rb_T = Rb.transpose(0, 1)
+
+
+            # A_i = [r_i]_x R_B^T
+            A_block = (
+                skew_r
+                @ Rb_T
+            )
+            # [Nv,3,3]
+
+
+            rotated_X = (
+                torch.einsum(
+                    'ij,qj->qi',
+                    Rd,
+                    X,
+                )
+            )
+
+
+            rhs_point = (
+                rotated_X
+                - tb.unsqueeze(0)
+            )
+
+
+            # b_i =
+            # - [r_i]_x R_B^T (R_delta X_i - t_B)
+
+            tmp = torch.einsum(
+                'ij,qj->qi',
+                Rb_T,
+                rhs_point,
+            )
+
+
+            b_block = -torch.einsum(
+                'qij,qj->qi',
+                skew_r,
+                tmp,
+            )
+
+
+            A_matrix = A_block.reshape(
+                -1,
+                3,
+            )
+
+            b_vector = b_block.reshape(
+                -1,
+                1,
+            )
+
+
+            # ========================================================
+            # 8. Least-squares solve
+            # ========================================================
+
+            solution = torch.linalg.lstsq(
+                A_matrix,
+                b_vector,
+            ).solution[
+                :3,
+                0
+            ]
+
+
+            pred_trans[
+                cam_idx
+            ] = solution
+
+
+            # ========================================================
+            # Diagnostics
+            # ========================================================
+
+            residual = (
+                A_matrix
+                @ solution.unsqueeze(-1)
+                - b_vector
+            )
+
+
+            residuals.append(
+                torch.sqrt(
+                    torch.mean(
+                        residual ** 2
+                    )
+                )
+            )
+
+
+            normal_matrix = (
+                A_matrix.transpose(0, 1)
+                @ A_matrix
+            )
+
+
+            cond_numbers.append(
+                torch.linalg.cond(
+                    normal_matrix
+                )
+            )
+
+
+        diagnostics = {
+            'valid_count':
+                torch.tensor(
+                    valid_counts,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+
+            'residual_rmse':
+                torch.stack(
+                    residuals
+                ).float(),
+
+            'condition_number':
+                torch.stack(
+                    cond_numbers
+                ).float(),
+        }
+
+
+        return (
+            pred_trans.to(out_dtype),
+            diagnostics,
+        )
     
     def _make_delta_matrix(
         self,
@@ -3386,7 +3950,121 @@ class BEVFusion(Base3DDetector):
             else:
                 active_cam_indices = torch.tensor([], dtype=torch.long, device=rois_center.device)
             
-            trimed_center_pts =self.batch_rois_center_by_cam_id(rois_center,batch_size=200)
+
+            # ============================================================
+            # Calib-only DDP empty-query safety
+            #
+            # Some DDP ranks may occasionally receive a sample for which
+            # no usable 2D object query is generated.
+            #
+            # In calib-only training:
+            #
+            #   CorrNet      = frozen
+            #   ZEstimator   = frozen
+            #   CalibHead    = trainable
+            #
+            # If active_cam_indices is empty, the normal CalibHead path
+            # cannot produce loss_calib_rot / loss_calib_trans.
+            #
+            # Therefore create a graph-connected ZERO loss HERE,
+            # inside model.loss() / DDP forward.
+            #
+            # IMPORTANT:
+            # Do NOT create this zero loss inside parse_losses().
+            # ============================================================
+
+            if (
+                self.is_lgpc_stage1
+                and self.lgpc_train_stage == 'calib'
+                and len(active_cam_indices) == 0
+            ):
+
+                zero_calib_loss = None
+
+
+                for param in self.calib_head.parameters():
+
+                    if not param.requires_grad:
+                        continue
+
+
+                    zero_term = (
+                        param.sum()
+                        * 0.0
+                    )
+
+
+                    if zero_calib_loss is None:
+
+                        zero_calib_loss = zero_term
+
+                    else:
+
+                        zero_calib_loss = (
+                            zero_calib_loss
+                            + zero_term
+                        )
+
+
+                if zero_calib_loss is None:
+
+                    raise RuntimeError(
+                        '[CALIB EMPTY BATCH] '
+                        'CalibHead has no trainable parameter.'
+                    )
+
+
+                # Name contains "loss", therefore MMEngine optimizer
+                # will receive this graph-connected zero.
+                losses[
+                    'loss_calib_empty_batch'
+                ] = zero_calib_loss
+
+
+                # Logging only
+                losses[
+                    'calib_empty_query_batch'
+                ] = torch.ones(
+                    (),
+                    device=target_device,
+                    dtype=torch.float32,
+                )
+
+
+                rank = (
+                    dist.get_rank()
+                    if (
+                        dist.is_available()
+                        and dist.is_initialized()
+                    )
+                    else 0
+                )
+
+
+                print(
+                    '\n'
+                    '=========================================\n'
+                    '[CALIB EMPTY QUERY BATCH]\n'
+                    f'rank = {rank}\n'
+                    f'rois_center shape = '
+                    f'{tuple(rois_center.shape)}\n'
+                    f'active_cam_indices = []\n'
+                    'This batch is skipped with a '
+                    'DDP-safe zero CalibHead loss.\n'
+                    '=========================================\n'
+                )
+
+                return losses
+            
+            (
+                trimed_center_pts,
+                query_unique_mask,
+            ) = self.batch_rois_center_by_cam_id(
+
+                rois_center,
+
+                batch_size=200,
+            )
 
             query_coords = trimed_center_pts[..., 2:]
             q_x = (query_coords[..., 0] / 1600) / 2
@@ -3436,9 +4114,28 @@ class BEVFusion(Base3DDetector):
             if len(active_cam_indices) > 0:
                 sbs_img_filtered = sbs_img[:, active_cam_indices]
                 query_input_filtered = query_input[active_cam_indices]
+                query_unique_mask_filtered = (
+                    query_unique_mask[
+                        active_cam_indices
+                    ]
+                )
                 
                 num_active_cams = sbs_img_filtered.shape[1]
                 sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
+
+                if B != 1:
+
+                    raise RuntimeError(
+                        '[LGPC CalibHead V2] '
+                        f'Current active-camera path expects B=1, got B={B}.'
+                    )
+
+                camera_intrinsics_active = (
+                    broken_camera_intrinsics[
+                        0,
+                        active_cam_indices,
+                    ]
+                )
                 
                 # ============================================================
                 # LGPC internal training stage
@@ -4099,691 +4796,698 @@ class BEVFusion(Base3DDetector):
                     ]
                 )
 
-
-            # ============================================================
-            # Z supervision
-            #
-            # z:
-            #     ZEstimator training
-            #
-            # z_calib:
-            #     ZEstimator + CalibHead concurrent training
-            #
-            # joint:
-            #     full LGPC training
-            #
-            # calib:
-            #     ZEstimator frozen, therefore no Z GT is required
-            # ============================================================
-
-            if stage in {
-                'z',
-                'z_calib',
-                'joint',
-            }:
-
-                z_target_broken = (
-                    z_broken_geom_gt
-                    .detach()
-                )
-
-                z_prediction = (
-                    z_estimated_active
-                    .squeeze(-1)
-                )
-
-                pred_u = (
-                    uv_pixels_from_corr[
-                        ...,
-                        0
-                    ]
-                )
-
-                pred_v = (
-                    uv_pixels_from_corr[
-                        ...,
-                        1
-                    ]
-                )
-
-                pred_uv_valid = (
-                    (pred_u >= 0.0)
-                    & (pred_u < 1600.0)
-                    & (pred_v >= 0.0)
-                    & (pred_v < 900.0)
-                )
-
-                valid_z_mask = (
-                    corr_valid_mask
-                    & pred_uv_valid
-                    & torch.isfinite(
-                        z_target_broken
-                    )
-                    & torch.isfinite(
-                        z_prediction
-                    )
-                    & (
-                        z_target_broken
-                        > 1e-3
-                    )
-                )
-
                 # ============================================================
-                # Diagnostic:
+                # Z inputs for CalibHead
                 #
-                # OLD Z target vs NEW geometry-consistent Z target
+                # z_pred_for_calib:
+                #     final ZEstimator V3 prediction
                 #
-                # OLD:
-                #   z_lidar_real
-                #   = broken depth associated with Corr predicted UV
+                # z_raw_for_calib:
+                #     raw center LiDAR depth
                 #
-                # NEW:
-                #   z_broken_geom_gt
-                #   = depth of the SAME physical 3D point used for
-                #     geometric CorrNet GT.
+                # calib / z_calib:
+                #     calibration loss must not update ZEstimator
                 #
-                # IMPORTANT:
-                # - diagnostic only
-                # - detached
-                # - NOT included in optimizer loss
+                # joint:
+                #     allow end-to-end gradient
                 # ============================================================
 
-                if stage in {
-                    'z',
-                    'z_calib',
-                    'joint',
-                }:
+                if stage == 'joint':
 
-                    z_old_target_broken = (
+                    z_pred_for_calib = (
+                        z_estimated_hybrid
+                    )
+
+                    z_raw_for_calib = (
                         esitmated_z_active[
                             'z_lidar_real'
                         ]
-                        .detach()
-                        .squeeze(-1)
-                    )
-
-
-                    # --------------------------------------------------------
-                    # Fair comparison mask
-                    #
-                    # Both old/new targets must be:
-                    # - based on valid geometric correspondence
-                    # - Corr prediction inside the image
-                    # - finite
-                    # - positive depth
-                    # --------------------------------------------------------
-
-                    z_target_compare_mask = (
-                        corr_valid_mask
-                        & pred_uv_valid
-
-                        & torch.isfinite(
-                            z_old_target_broken
-                        )
-
-                        & torch.isfinite(
-                            z_target_broken
-                        )
-
-                        & (
-                            z_old_target_broken
-                            > 1e-3
-                        )
-
-                        & (
-                            z_target_broken
-                            > 1e-3
-                        )
-                    )
-
-
-                    with torch.no_grad():
-
-                        if z_target_compare_mask.any():
-
-                            # ========================================================
-                            # 1. RAW local LiDAR depth error
-                            #
-                            # z_old_target_broken:
-                            #   Corr predicted UV에서 실제로 읽은 broken depth
-                            #
-                            # z_target_broken:
-                            #   same-physical-point geometry GT
-                            # ========================================================
-
-                            z_raw_error_same_mask = torch.abs(
-                                z_old_target_broken[
-                                    z_target_compare_mask
-                                ]
-                                -
-                                z_target_broken[
-                                    z_target_compare_mask
-                                ]
-                            )
-
-
-                            z_raw_mae_same_mask_m = (
-                                z_raw_error_same_mask
-                                .mean()
-                            )
-
-
-                            # ========================================================
-                            # 2. ZEstimator prediction error
-                            #
-                            # IMPORTANT:
-                            # RAW depth와 EXACTLY SAME mask를 사용한다.
-                            #
-                            # 따라서 아래 두 값은 직접 비교 가능:
-                            #
-                            #   z_raw_mae_same_mask_m
-                            #   z_pred_mae_same_mask_m
-                            # ========================================================
-
-                            z_pred_error_same_mask = torch.abs(
-                                z_prediction[
-                                    z_target_compare_mask
-                                ]
-                                -
-                                z_target_broken[
-                                    z_target_compare_mask
-                                ]
-                            )
-
-
-                            z_pred_mae_same_mask_m = (
-                                z_pred_error_same_mask
-                                .mean()
-                            )
-
-
-                            # ========================================================
-                            # 3. Depth recovery ratio
-                            #
-                            # recovery =
-                            #
-                            #   1 - Pred_Error / Raw_Error
-                            #
-                            # Example:
-                            #
-                            # raw  = 5.0 m
-                            # pred = 3.0 m
-                            #
-                            # recovery = 1 - 3/5 = 0.40
-                            #
-                            # => raw depth error의 40%를 복구
-                            #
-                            # > 0 : ZEstimator better
-                            # = 0 : same
-                            # < 0 : ZEstimator worse
-                            # ========================================================
-
-                            z_depth_recovery = torch.where(
-                                z_raw_mae_same_mask_m > 1e-6,
-
-                                1.0
-                                -
-                                (
-                                    z_pred_mae_same_mask_m
-                                    /
-                                    z_raw_mae_same_mask_m
-                                ),
-
-                                torch.zeros_like(
-                                    z_raw_mae_same_mask_m
-                                ),
-                            )
-
-
-                            # ========================================================
-                            # Existing target disagreement diagnostics
-                            #
-                            # 이것은 사실상 RAW depth error의 MAE/RMSE이다.
-                            # 기존 로그 호환성을 위해 유지.
-                            # ========================================================
-
-                            z_target_disagreement = (
-                                z_raw_error_same_mask
-                            )
-
-
-                            z_target_disagree_mae_m = (
-                                z_target_disagreement
-                                .mean()
-                            )
-
-
-                            z_target_disagree_rmse_m = (
-                                torch.sqrt(
-                                    torch.mean(
-                                        z_target_disagreement ** 2
-                                    )
-                                )
-                            )
-
-
-                            z_target_compare_ratio = (
-                                z_target_compare_mask
-                                .float()
-                                .mean()
-                            )
-
-                            # ========================================================
-                            # V3: Neighborhood anchor quality
-                            # ========================================================
-
-                            z_anchor_real = (
-                                esitmated_z_active[
-                                    'z_anchor_real'
-                                ]
-                                .detach()
-                                .squeeze(-1)
-                            )
-
-
-                            z_anchor_error_same_mask = torch.abs(
-                                z_anchor_real[
-                                    z_target_compare_mask
-                                ]
-                                -
-                                z_target_broken[
-                                    z_target_compare_mask
-                                ]
-                            )
-
-
-                            z_anchor_mae_same_mask_m = (
-                                z_anchor_error_same_mask
-                                .mean()
-                            )
-
-
-                            z_anchor_recovery = torch.where(
-                                z_raw_mae_same_mask_m > 1e-6,
-
-                                1.0
-                                -
-                                (
-                                    z_anchor_mae_same_mask_m
-                                    /
-                                    z_raw_mae_same_mask_m
-                                ),
-
-                                torch.zeros_like(
-                                    z_raw_mae_same_mask_m
-                                ),
-                            )
-
-
-                        else:
-
-                            z_target_disagree_mae_m = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-                            z_target_disagree_rmse_m = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-                            z_target_compare_ratio = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-
-                            # NEW
-                            z_raw_mae_same_mask_m = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-                            z_pred_mae_same_mask_m = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-                            z_depth_recovery = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-                            z_anchor_mae_same_mask_m = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-                            z_anchor_recovery = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-                        
-
-                    # --------------------------------------------------------
-                    # Diagnostic names intentionally DO NOT contain "loss"
-                    # --------------------------------------------------------
-
-                    losses[
-                        'z_target_disagree_mae_m'
-                    ] = (
-                        z_target_disagree_mae_m
-                    )
-
-                    losses[
-                        'z_target_disagree_rmse_m'
-                    ] = (
-                        z_target_disagree_rmse_m
-                    )
-
-
-                    losses[
-                        'z_target_compare_ratio'
-                    ] = (
-                        z_target_compare_ratio
-                    )
-
-                    losses[
-                        'z_raw_mae_same_mask_m'
-                    ] = (
-                        z_raw_mae_same_mask_m
-                    )
-
-
-                    losses[
-                        'z_pred_mae_same_mask_m'
-                    ] = (
-                        z_pred_mae_same_mask_m
-                    )
-
-
-                    losses[
-                        'z_depth_recovery'
-                    ] = (
-                        z_depth_recovery
-                    )
-
-                    losses[
-                        'z_anchor_mae_same_mask_m'
-                    ] = (
-                        z_anchor_mae_same_mask_m
-                    )
-
-
-                    losses[
-                        'z_anchor_recovery'
-                    ] = (
-                        z_anchor_recovery
-                    )
-
-
-                    losses[
-                        'z_neighbor_valid_ratio'
-                    ] = (
-                        esitmated_z_active[
-                            'neighbor_valid_ratio'
-                        ]
-                        .detach()
-                        .mean()
-                    )
-
-
-                    losses[
-                        'z_neighbor_weight_max'
-                    ] = (
-                        esitmated_z_active[
-                            'neighbor_weight_max'
-                        ]
-                        .detach()
-                        .mean()
-                    )
-
-
-                if (
-                    self.is_lgpc_stage1
-                    and stage == 'z'
-                    and not hasattr(
-                        self,
-                        '_z_mode_debug_done'
-                    )
-                ):
-
-                    corr_trainable = sum(
-                        p.numel()
-                        for p in self.corr.parameters()
-                        if p.requires_grad
-                    )
-
-                    z_trainable = sum(
-                        p.numel()
-                        for p in self.z_estimator.parameters()
-                        if p.requires_grad
-                    )
-
-                    calib_trainable = sum(
-                        p.numel()
-                        for p in self.calib_head.parameters()
-                        if p.requires_grad
-                    )
-
-                    img_trainable = sum(
-                        p.numel()
-                        for p in self.img_backbone.parameters()
-                        if p.requires_grad
-                    )
-
-                    print(
-                        '\n'
-                        '========================================='
-                    )
-
-                    print('[Z STAGE MODE DEBUG]')
-
-                    print(
-                        'BEVFusion.training =',
-                        self.training
-                    )
-
-                    print(
-                        'Corr.training =',
-                        self.corr.training,
-                        '/ trainable params =',
-                        corr_trainable
-                    )
-
-                    print(
-                        'ZEstimator.training =',
-                        self.z_estimator.training,
-                        '/ trainable params =',
-                        z_trainable
-                    )
-
-                    print(
-                        'CalibHead.training =',
-                        self.calib_head.training,
-                        '/ trainable params =',
-                        calib_trainable
-                    )
-
-                    print(
-                        'img_backbone.training =',
-                        self.img_backbone.training,
-                        '/ trainable params =',
-                        img_trainable
-                    )
-
-                    print(
-                        '=========================================\n'
-                    )
-
-                    self._z_mode_debug_done = True
-                # ============================================================
-                # 8. Z loss
-                #
-                # IMPORTANT:
-                #
-                # Only z and joint stages calculate L_z.
-                # ============================================================
-
-                if stage in {
-                    'z',
-                    'z_calib',     # <<< NEW
-                    'joint',
-                }:
-
-                    if valid_z_mask.any():
-
-                        loss_z_estimation = (
-                            F.smooth_l1_loss(
-                                z_prediction[
-                                    valid_z_mask
-                                ],
-
-                                z_target_broken[
-                                    valid_z_mask
-                                ],
-
-                                reduction='mean',
-                                beta=1.0,
-                            )
-                        )
-
-                        losses[
-                            'loss_z_estimation'
-                        ] = loss_z_estimation
-
-                    else:
-
-                        # Keep valid autograd graph
-                        losses[
-                            'loss_z_estimation'
-                        ] = (
-                            z_prediction.sum()
-                            * 0.0
-                        )
-
-                # ============================================================
-                # ZEstimator physical diagnostics
-                #
-                # z_prediction / z_target_broken are real depth values.
-                # ============================================================
-                if stage in {
-                    'z',
-                    'z_calib',
-                    'joint',
-                }:
-                    with torch.no_grad():
-
-                        if valid_z_mask.any():
-
-                            z_error = (
-                                z_prediction[
-                                    valid_z_mask
-                                ]
-                                -
-                                z_target_broken[
-                                    valid_z_mask
-                                ]
-                            )
-
-                            # Mean Absolute Error [m]
-                            z_mae_m = (
-                                torch.abs(
-                                    z_error
-                                )
-                                .mean()
-                            )
-
-                            # Root Mean Squared Error [m]
-                            z_rmse_m = torch.sqrt(
-                                torch.mean(
-                                    z_error ** 2
-                                )
-                            )
-
-                            z_valid_ratio = (
-                                valid_z_mask
-                                .float()
-                                .mean()
-                            )
-
-                        else:
-
-                            z_mae_m = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-                            z_rmse_m = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-                            z_valid_ratio = (
-                                z_prediction
-                                .new_tensor(0.0)
-                            )
-
-
-                        losses[
-                            'z_mae_m'
-                        ] = z_mae_m
-
-                        losses[
-                            'z_rmse_m'
-                        ] = z_rmse_m
-
-                        losses[
-                            'z_valid_ratio'
-                        ] = z_valid_ratio    
-
-
-                # ============================================================
-                # 9. Z-ONLY STAGE ENDS HERE
-                #
-                # Do NOT execute CalibHead.
-                # ============================================================
-
-                if (
-                    self.is_lgpc_stage1
-                    and stage == 'z'
-                ):
-
-                    return losses
-
-
-                # ============================================================
-                # 10. Build 3D correspondence
-                #
-                # z_calib V1 policy:
-                #
-                #   ZEstimator
-                #       <- optimized ONLY by Z loss
-                #
-                #   CalibHead
-                #       <- optimized ONLY by calibration loss
-                #
-                # Therefore, in z_calib stage:
-                #
-                #   z prediction       : detach before CalibHead
-                #   Z reliability      : detach before CalibHead
-                #
-                # This prevents calibration loss from backpropagating
-                # into ZEstimator during the first concurrent-training pilot.
-                # ============================================================
-
-                if stage == 'z_calib':
-
-                    z_for_calib = (
-                        z_estimated_hybrid
-                        .detach()
                     )
 
                 else:
 
-                    z_for_calib = (
+                    z_pred_for_calib = (
                         z_estimated_hybrid
+                        .detach()
                     )
 
+                    z_raw_for_calib = (
+                        esitmated_z_active[
+                            'z_lidar_real'
+                        ]
+                        .detach()
+                    )
+
+
+                # ============================================================
+                # Z supervision
+                #
+                # z:
+                #     ZEstimator training
+                #
+                # z_calib:
+                #     ZEstimator + CalibHead concurrent training
+                #
+                # joint:
+                #     full LGPC training
+                #
+                # calib:
+                #     ZEstimator frozen, therefore no Z GT is required
+                # ============================================================
+
+                if stage in {
+                    'z',
+                    'z_calib',
+                    'joint',
+                }:
+
+                    z_target_broken = (
+                        z_broken_geom_gt
+                        .detach()
+                    )
+
+                    z_prediction = (
+                        z_estimated_active
+                        .squeeze(-1)
+                    )
+
+                    pred_u = (
+                        uv_pixels_from_corr[
+                            ...,
+                            0
+                        ]
+                    )
+
+                    pred_v = (
+                        uv_pixels_from_corr[
+                            ...,
+                            1
+                        ]
+                    )
+
+                    pred_uv_valid = (
+                        (pred_u >= 0.0)
+                        & (pred_u < 1600.0)
+                        & (pred_v >= 0.0)
+                        & (pred_v < 900.0)
+                    )
+
+                    valid_z_mask = (
+                        corr_valid_mask
+                        & pred_uv_valid
+                        & torch.isfinite(
+                            z_target_broken
+                        )
+                        & torch.isfinite(
+                            z_prediction
+                        )
+                        & (
+                            z_target_broken
+                            > 1e-3
+                        )
+                    )
+
+                    # ============================================================
+                    # Diagnostic:
+                    #
+                    # OLD Z target vs NEW geometry-consistent Z target
+                    #
+                    # OLD:
+                    #   z_lidar_real
+                    #   = broken depth associated with Corr predicted UV
+                    #
+                    # NEW:
+                    #   z_broken_geom_gt
+                    #   = depth of the SAME physical 3D point used for
+                    #     geometric CorrNet GT.
+                    #
+                    # IMPORTANT:
+                    # - diagnostic only
+                    # - detached
+                    # - NOT included in optimizer loss
+                    # ============================================================
+
+                    if stage in {
+                        'z',
+                        'z_calib',
+                        'joint',
+                    }:
+
+                        z_old_target_broken = (
+                            esitmated_z_active[
+                                'z_lidar_real'
+                            ]
+                            .detach()
+                            .squeeze(-1)
+                        )
+
+
+                        # --------------------------------------------------------
+                        # Fair comparison mask
+                        #
+                        # Both old/new targets must be:
+                        # - based on valid geometric correspondence
+                        # - Corr prediction inside the image
+                        # - finite
+                        # - positive depth
+                        # --------------------------------------------------------
+
+                        z_target_compare_mask = (
+                            corr_valid_mask
+                            & pred_uv_valid
+
+                            & torch.isfinite(
+                                z_old_target_broken
+                            )
+
+                            & torch.isfinite(
+                                z_target_broken
+                            )
+
+                            & (
+                                z_old_target_broken
+                                > 1e-3
+                            )
+
+                            & (
+                                z_target_broken
+                                > 1e-3
+                            )
+                        )
+
+
+                        with torch.no_grad():
+
+                            if z_target_compare_mask.any():
+
+                                # ========================================================
+                                # 1. RAW local LiDAR depth error
+                                #
+                                # z_old_target_broken:
+                                #   Corr predicted UV에서 실제로 읽은 broken depth
+                                #
+                                # z_target_broken:
+                                #   same-physical-point geometry GT
+                                # ========================================================
+
+                                z_raw_error_same_mask = torch.abs(
+                                    z_old_target_broken[
+                                        z_target_compare_mask
+                                    ]
+                                    -
+                                    z_target_broken[
+                                        z_target_compare_mask
+                                    ]
+                                )
+
+
+                                z_raw_mae_same_mask_m = (
+                                    z_raw_error_same_mask
+                                    .mean()
+                                )
+
+
+                                # ========================================================
+                                # 2. ZEstimator prediction error
+                                #
+                                # IMPORTANT:
+                                # RAW depth와 EXACTLY SAME mask를 사용한다.
+                                #
+                                # 따라서 아래 두 값은 직접 비교 가능:
+                                #
+                                #   z_raw_mae_same_mask_m
+                                #   z_pred_mae_same_mask_m
+                                # ========================================================
+
+                                z_pred_error_same_mask = torch.abs(
+                                    z_prediction[
+                                        z_target_compare_mask
+                                    ]
+                                    -
+                                    z_target_broken[
+                                        z_target_compare_mask
+                                    ]
+                                )
+
+
+                                z_pred_mae_same_mask_m = (
+                                    z_pred_error_same_mask
+                                    .mean()
+                                )
+
+
+                                # ========================================================
+                                # 3. Depth recovery ratio
+                                #
+                                # recovery =
+                                #
+                                #   1 - Pred_Error / Raw_Error
+                                #
+                                # Example:
+                                #
+                                # raw  = 5.0 m
+                                # pred = 3.0 m
+                                #
+                                # recovery = 1 - 3/5 = 0.40
+                                #
+                                # => raw depth error의 40%를 복구
+                                #
+                                # > 0 : ZEstimator better
+                                # = 0 : same
+                                # < 0 : ZEstimator worse
+                                # ========================================================
+
+                                z_depth_recovery = torch.where(
+                                    z_raw_mae_same_mask_m > 1e-6,
+
+                                    1.0
+                                    -
+                                    (
+                                        z_pred_mae_same_mask_m
+                                        /
+                                        z_raw_mae_same_mask_m
+                                    ),
+
+                                    torch.zeros_like(
+                                        z_raw_mae_same_mask_m
+                                    ),
+                                )
+
+
+                                # ========================================================
+                                # Existing target disagreement diagnostics
+                                #
+                                # 이것은 사실상 RAW depth error의 MAE/RMSE이다.
+                                # 기존 로그 호환성을 위해 유지.
+                                # ========================================================
+
+                                z_target_disagreement = (
+                                    z_raw_error_same_mask
+                                )
+
+
+                                z_target_disagree_mae_m = (
+                                    z_target_disagreement
+                                    .mean()
+                                )
+
+
+                                z_target_disagree_rmse_m = (
+                                    torch.sqrt(
+                                        torch.mean(
+                                            z_target_disagreement ** 2
+                                        )
+                                    )
+                                )
+
+
+                                z_target_compare_ratio = (
+                                    z_target_compare_mask
+                                    .float()
+                                    .mean()
+                                )
+
+                                # ========================================================
+                                # V3: Neighborhood anchor quality
+                                # ========================================================
+
+                                z_anchor_real = (
+                                    esitmated_z_active[
+                                        'z_anchor_real'
+                                    ]
+                                    .detach()
+                                    .squeeze(-1)
+                                )
+
+
+                                z_anchor_error_same_mask = torch.abs(
+                                    z_anchor_real[
+                                        z_target_compare_mask
+                                    ]
+                                    -
+                                    z_target_broken[
+                                        z_target_compare_mask
+                                    ]
+                                )
+
+
+                                z_anchor_mae_same_mask_m = (
+                                    z_anchor_error_same_mask
+                                    .mean()
+                                )
+
+
+                                z_anchor_recovery = torch.where(
+                                    z_raw_mae_same_mask_m > 1e-6,
+
+                                    1.0
+                                    -
+                                    (
+                                        z_anchor_mae_same_mask_m
+                                        /
+                                        z_raw_mae_same_mask_m
+                                    ),
+
+                                    torch.zeros_like(
+                                        z_raw_mae_same_mask_m
+                                    ),
+                                )
+
+
+                            else:
+
+                                z_target_disagree_mae_m = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+                                z_target_disagree_rmse_m = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+                                z_target_compare_ratio = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+
+                                # NEW
+                                z_raw_mae_same_mask_m = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+                                z_pred_mae_same_mask_m = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+                                z_depth_recovery = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+                                z_anchor_mae_same_mask_m = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+                                z_anchor_recovery = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+                            
+
+                        # --------------------------------------------------------
+                        # Diagnostic names intentionally DO NOT contain "loss"
+                        # --------------------------------------------------------
+
+                        losses[
+                            'z_target_disagree_mae_m'
+                        ] = (
+                            z_target_disagree_mae_m
+                        )
+
+                        losses[
+                            'z_target_disagree_rmse_m'
+                        ] = (
+                            z_target_disagree_rmse_m
+                        )
+
+
+                        losses[
+                            'z_target_compare_ratio'
+                        ] = (
+                            z_target_compare_ratio
+                        )
+
+                        losses[
+                            'z_raw_mae_same_mask_m'
+                        ] = (
+                            z_raw_mae_same_mask_m
+                        )
+
+
+                        losses[
+                            'z_pred_mae_same_mask_m'
+                        ] = (
+                            z_pred_mae_same_mask_m
+                        )
+
+
+                        losses[
+                            'z_depth_recovery'
+                        ] = (
+                            z_depth_recovery
+                        )
+
+                        losses[
+                            'z_anchor_mae_same_mask_m'
+                        ] = (
+                            z_anchor_mae_same_mask_m
+                        )
+
+
+                        losses[
+                            'z_anchor_recovery'
+                        ] = (
+                            z_anchor_recovery
+                        )
+
+
+                        losses[
+                            'z_neighbor_valid_ratio'
+                        ] = (
+                            esitmated_z_active[
+                                'neighbor_valid_ratio'
+                            ]
+                            .detach()
+                            .mean()
+                        )
+
+
+                        losses[
+                            'z_neighbor_weight_max'
+                        ] = (
+                            esitmated_z_active[
+                                'neighbor_weight_max'
+                            ]
+                            .detach()
+                            .mean()
+                        )
+
+
+                    if (
+                        self.is_lgpc_stage1
+                        and stage == 'z'
+                        and not hasattr(
+                            self,
+                            '_z_mode_debug_done'
+                        )
+                    ):
+
+                        corr_trainable = sum(
+                            p.numel()
+                            for p in self.corr.parameters()
+                            if p.requires_grad
+                        )
+
+                        z_trainable = sum(
+                            p.numel()
+                            for p in self.z_estimator.parameters()
+                            if p.requires_grad
+                        )
+
+                        calib_trainable = sum(
+                            p.numel()
+                            for p in self.calib_head.parameters()
+                            if p.requires_grad
+                        )
+
+                        img_trainable = sum(
+                            p.numel()
+                            for p in self.img_backbone.parameters()
+                            if p.requires_grad
+                        )
+
+                        print(
+                            '\n'
+                            '========================================='
+                        )
+
+                        print('[Z STAGE MODE DEBUG]')
+
+                        print(
+                            'BEVFusion.training =',
+                            self.training
+                        )
+
+                        print(
+                            'Corr.training =',
+                            self.corr.training,
+                            '/ trainable params =',
+                            corr_trainable
+                        )
+
+                        print(
+                            'ZEstimator.training =',
+                            self.z_estimator.training,
+                            '/ trainable params =',
+                            z_trainable
+                        )
+
+                        print(
+                            'CalibHead.training =',
+                            self.calib_head.training,
+                            '/ trainable params =',
+                            calib_trainable
+                        )
+
+                        print(
+                            'img_backbone.training =',
+                            self.img_backbone.training,
+                            '/ trainable params =',
+                            img_trainable
+                        )
+
+                        print(
+                            '=========================================\n'
+                        )
+
+                        self._z_mode_debug_done = True
+                    # ============================================================
+                    # 8. Z loss
+                    #
+                    # IMPORTANT:
+                    #
+                    # Only z and joint stages calculate L_z.
+                    # ============================================================
+
+                    if stage in {
+                        'z',
+                        'z_calib',     # <<< NEW
+                        'joint',
+                    }:
+
+                        if valid_z_mask.any():
+
+                            loss_z_estimation = (
+                                F.smooth_l1_loss(
+                                    z_prediction[
+                                        valid_z_mask
+                                    ],
+
+                                    z_target_broken[
+                                        valid_z_mask
+                                    ],
+
+                                    reduction='mean',
+                                    beta=1.0,
+                                )
+                            )
+
+                            losses[
+                                'loss_z_estimation'
+                            ] = loss_z_estimation
+
+                        else:
+
+                            # Keep valid autograd graph
+                            losses[
+                                'loss_z_estimation'
+                            ] = (
+                                z_prediction.sum()
+                                * 0.0
+                            )
+
+                    # ============================================================
+                    # ZEstimator physical diagnostics
+                    #
+                    # z_prediction / z_target_broken are real depth values.
+                    # ============================================================
+                    if stage in {
+                        'z',
+                        'z_calib',
+                        'joint',
+                    }:
+                        with torch.no_grad():
+
+                            if valid_z_mask.any():
+
+                                z_error = (
+                                    z_prediction[
+                                        valid_z_mask
+                                    ]
+                                    -
+                                    z_target_broken[
+                                        valid_z_mask
+                                    ]
+                                )
+
+                                # Mean Absolute Error [m]
+                                z_mae_m = (
+                                    torch.abs(
+                                        z_error
+                                    )
+                                    .mean()
+                                )
+
+                                # Root Mean Squared Error [m]
+                                z_rmse_m = torch.sqrt(
+                                    torch.mean(
+                                        z_error ** 2
+                                    )
+                                )
+
+                                z_valid_ratio = (
+                                    valid_z_mask
+                                    .float()
+                                    .mean()
+                                )
+
+                            else:
+
+                                z_mae_m = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+                                z_rmse_m = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+                                z_valid_ratio = (
+                                    z_prediction
+                                    .new_tensor(0.0)
+                                )
+
+
+                            losses[
+                                'z_mae_m'
+                            ] = z_mae_m
+
+                            losses[
+                                'z_rmse_m'
+                            ] = z_rmse_m
+
+                            losses[
+                                'z_valid_ratio'
+                            ] = z_valid_ratio    
+
+
+                    # ============================================================
+                    # 9. Z-ONLY STAGE ENDS HERE
+                    #
+                    # Do NOT execute CalibHead.
+                    # ============================================================
+
+                    if (
+                        self.is_lgpc_stage1
+                        and stage == 'z'
+                    ):
+
+                        return losses
 
                 # ============================================================
                 # 11. Build Corr + Z correspondence
@@ -4803,10 +5507,74 @@ class BEVFusion(Base3DDetector):
 
                     [
                         raw_corrs_active,
-                        z_for_calib,
+                        z_pred_for_calib,
                     ],
 
                     dim=-1,
+                )
+
+                # ============================================================
+                # CalibHead point-valid mask
+                #
+                # IMPORTANT:
+                # CorrNet itself still processed all 200 slots.
+                #
+                # CalibHead will use only original detector queries.
+                # ============================================================
+
+                corr_finite = (
+                    torch.isfinite(
+                        raw_corrs_active
+                    )
+                    .all(
+                        dim=-1
+                    )
+                )
+
+
+                corr_in_range = (
+
+                    (
+                        raw_corrs_active[
+                            ...,
+                            0
+                        ]
+                        >= 0.5
+                    )
+
+                    & (
+                        raw_corrs_active[
+                            ...,
+                            0
+                        ]
+                        <= 1.0
+                    )
+
+                    & (
+                        raw_corrs_active[
+                            ...,
+                            1
+                        ]
+                        >= 0.0
+                    )
+
+                    & (
+                        raw_corrs_active[
+                            ...,
+                            1
+                        ]
+                        <= 1.0
+                    )
+                )
+
+
+                calib_point_valid_mask = (
+
+                    query_unique_mask_filtered
+
+                    & corr_finite
+
+                    & corr_in_range
                 )
 
 
@@ -4852,7 +5620,6 @@ class BEVFusion(Base3DDetector):
                 # ============================================================
                 # 13. CalibHead V1
                 # ============================================================
-
                 (
                     pred_delta_6dof_active,
                     calib_diag,
@@ -4869,8 +5636,19 @@ class BEVFusion(Base3DDetector):
 
                     z_reliability=
                         z_reliability_active,
-                )
 
+                    # NEW: Adaptive Z Gate
+                    z_raw=
+                        z_raw_for_calib,
+
+                    # NEW: K-aware geometry
+                    camera_intrinsics=
+                        camera_intrinsics_active,
+
+                    # Duplicate / invalid Corr exclusion
+                    point_valid_mask=
+                        calib_point_valid_mask,
+                )
 
                 # ============================================================
                 # 14. CalibHead diagnostics
@@ -5085,10 +5863,48 @@ class BEVFusion(Base3DDetector):
             # Do NOT train RRRF / BEVFusion detector here.
             # ============================================================
 
+
+            # ============================================================
+            # LGPC Stage-1 safety/debug:
+            # check whether a REAL optimization loss was produced.
+            # ============================================================
+
             if self.is_lgpc_stage1:
 
+                has_optimization_loss = any(
+                    'loss' in key
+                    for key in losses.keys()
+                )
+
+
+                if not has_optimization_loss:
+
+                    rank = (
+                        dist.get_rank()
+                        if (
+                            dist.is_available()
+                            and dist.is_initialized()
+                        )
+                        else 0
+                    )
+
+
+                    print(
+                        '\n'
+                        '=========================================\n'
+                        '[LGPC NO-LOSS BATCH DEBUG]\n'
+                        f'rank = {rank}\n'
+                        f'stage = {stage}\n'
+                        f'active_cam_indices = '
+                        f'{active_cam_indices.detach().cpu().tolist()}\n'
+                        f'num_rois = {rois_center.shape[0]}\n'
+                        f'loss keys = {list(losses.keys())}\n'
+                        '=========================================\n'
+                    )
+
+
                 return losses
-            
+
             enc_out = enc_out.permute(0, 2, 1).reshape(-1, d_model, feat_h, feat_w)
             
             pred_delta_rot = pred_delta_6dof[..., :3]
@@ -5382,6 +6198,7 @@ class BEVFusion(Base3DDetector):
             # NEW
             'pcc_broken_refine',
             'pcc_clean_refine',
+            'geo_oracle_gtrot',
 
         }:
 
@@ -5418,6 +6235,29 @@ class BEVFusion(Base3DDetector):
             s.camera2lidar
             for s in batch_data_samples
         ]).to(target_device)
+
+        # ============================================================
+        # Oracle geometric-solver diagnostics
+        # ============================================================
+
+        gt_delta_rot = torch.stack(
+            [
+                s.gt_delta_rot
+                for s in batch_data_samples
+            ]
+        ).to(
+            target_device
+        )
+
+
+        gt_delta_trans = torch.stack(
+            [
+                s.gt_delta_trans
+                for s in batch_data_samples
+            ]
+        ).to(
+            target_device
+        )
         
         img_feats = self.extract_multiscale_img_feats(batch_inputs_dict)
         reshaped_img_feats, reshaped_data_samples = self._prepare_2d_head_inputs(
@@ -5438,7 +6278,15 @@ class BEVFusion(Base3DDetector):
         else:
             active_cam_indices = torch.tensor([], dtype=torch.long, device=rois_center.device)
         
-        trimed_center_pts = self.batch_rois_center_by_cam_id(rois_center, batch_size=200)
+        (
+            trimed_center_pts,
+            query_unique_mask,
+        ) = self.batch_rois_center_by_cam_id(
+
+            rois_center,
+
+            batch_size=200,
+        )
 
         query_coords = trimed_center_pts[..., 2:]
         q_x = (query_coords[..., 0] / 1600) / 2
@@ -5490,15 +6338,42 @@ class BEVFusion(Base3DDetector):
         esitmated_uvz = torch.zeros(esitmated_uvz_shape, device=query_input.device)
         pred_delta_6dof = torch.zeros(B, N, 6, device=target_device)
 
+        # Stores A/B/C/D geometric-oracle diagnostics for this sample.
+        geo_oracle_summary = None
+
         # Handle the two cases: with or without active cameras
         if len(active_cam_indices) > 0:
             # Filter inputs for active cameras
             sbs_img_filtered = sbs_img[:, active_cam_indices]
             query_input_filtered = query_input[active_cam_indices]
+            query_unique_mask_filtered = (
+                query_unique_mask[
+                    active_cam_indices
+                ]
+            )
             
             num_active_cams = sbs_img_filtered.shape[1]
             sbs_view = sbs_img_filtered.view(B * num_active_cams, C, H, W)
-            
+
+            # ============================================================
+            # CalibHead V2 intrinsic for inference
+            # ============================================================
+
+            if B != 1:
+
+                raise RuntimeError(
+                    '[LGPC CalibHead V2 Predict] '
+                    f'Current active-camera path expects B=1, got B={B}.'
+                )
+
+
+            camera_intrinsics_filtered = (
+                broken_camera_intrinsics[
+                    0,
+                    active_cam_indices,
+                ]
+            )
+                        
             # # Call the correlation network with filtered data
             # # --- ⏱️ Stage-1 (LGPC) 순수 오버헤드 측정 시작 ---
             # s1_start = torch.cuda.Event(enable_timing=True)
@@ -5516,6 +6391,89 @@ class BEVFusion(Base3DDetector):
             # # --- ⏱️ Stage-1 (LGPC) 측정 종료 ---
 
             # print(f"✅ [Stage-1: LGPC Latency]: {t1_ms:.2f} ms")
+
+            # ============================================================
+            # NEW:
+            # Runtime-valid point mask for CalibHead
+            #
+            # CorrNet still receives fixed Q=200.
+            #
+            # query_unique_mask_filtered:
+            #   True  = original detector query
+            #   False = repeated filler query
+            #
+            # raw_corrs_filtered:
+            #   CorrNet prediction on RIGHT SBS image
+            # ============================================================
+
+            corr_finite = (
+                torch.isfinite(
+                    raw_corrs_filtered
+                )
+                .all(
+                    dim=-1
+                )
+            )
+
+
+            # CorrNet correspondence output:
+            #
+            # x:
+            #   right SBS region = [0.5, 1.0]
+            #
+            # y:
+            #   normalized image range = [0.0, 1.0]
+            corr_in_range = (
+
+                (
+                    raw_corrs_filtered[
+                        ...,
+                        0
+                    ]
+                    >= 0.5
+                )
+
+                & (
+                    raw_corrs_filtered[
+                        ...,
+                        0
+                    ]
+                    <= 1.0
+                )
+
+                & (
+                    raw_corrs_filtered[
+                        ...,
+                        1
+                    ]
+                    >= 0.0
+                )
+
+                & (
+                    raw_corrs_filtered[
+                        ...,
+                        1
+                    ]
+                    <= 1.0
+                )
+            )
+
+
+            # ============================================================
+            # Final mask used ONLY by CalibHead.
+            #
+            # No GT information is used.
+            # Therefore safe for inference.
+            # ============================================================
+
+            calib_point_valid_mask = (
+
+                query_unique_mask_filtered
+
+                & corr_finite
+
+                & corr_in_range
+            )
                 
             # 1. Convert normalized corrs to pixel coordinates
             r_x = (raw_corrs_filtered[..., 0] - 0.5) * 2 * 1600 
@@ -5537,6 +6495,11 @@ class BEVFusion(Base3DDetector):
             # 4. Get the predicted Z value
             # z_estimated_filtered = esitmated_z_filtered['z_estimated_real'] # [NumActive, Q, 1]
             z_estimated_hybrid = esitmated_z_filtered['depth']
+            z_raw_for_calib = (
+                esitmated_z_filtered[
+                    'z_lidar_real'
+                ]
+            )
 
             corrs_3d_filtered = torch.cat(
 
@@ -5555,24 +6518,399 @@ class BEVFusion(Base3DDetector):
                 )
             )
 
+            # ============================================================
+            # GEOMETRIC SOLVER ORACLE: 2x2 BOTTLENECK MATRIX
+            #
+            # A = GT Corr   + GT Z              + GT Rotation
+            # B = Pred Corr + GT Z              + GT Rotation
+            # C = GT Corr   + Pred Z @ GT Corr  + GT Rotation
+            # D = Pred Corr + Pred Z @ Pred Corr+ GT Rotation
+            #
+            # IMPORTANT:
+            #   Case C MUST re-run ZEstimator at GT Corr. Reusing
+            #   z_estimated_hybrid would leak Pred-Corr localization error
+            #   into the Z-only test.
+            # ============================================================
 
-            (
-                pred_delta_6dof_filtered,
-                _
-            ) = self.calib_head(
+            if self.calibration_mode == 'geo_oracle_gtrot':
 
-                enc_out=
-                    enc_out_filtered_4d,
+                if B != 1:
+                    raise RuntimeError(
+                        '[GEO ORACLE] '
+                        f'Current diagnostic expects B=1, got B={B}.'
+                    )
 
-                query_input=
-                    query_input_filtered,
+                gt_rot_active = gt_delta_rot[
+                    0,
+                    active_cam_indices,
+                ]
 
-                corrs_pred_3d=
-                    corrs_3d_filtered,
+                gt_trans_active = gt_delta_trans[
+                    0,
+                    active_cam_indices,
+                ]
 
-                z_reliability=
-                    z_reliability_filtered,
-            )
+                broken_c2l_active = broken_camera2lidar[
+                    0,
+                    active_cam_indices,
+                ]
+
+                # ========================================================
+                # Build perfect GT source correspondence and GT depth.
+                # ========================================================
+                (
+                    corr_target_gt,
+                    corr_valid_gt,
+                    z_broken_gt,
+                ) = self._build_corr_target_from_clean_depth(
+                    query_input_active=query_input_filtered,
+                    active_cam_indices=active_cam_indices,
+                    dense_depth_map_gt=dense_depth_map_gt,
+                    clean_camera2lidar=clean_camera2lidar,
+                    broken_camera2lidar=broken_camera2lidar,
+                    camera_intrinsics=broken_camera_intrinsics,
+                )
+
+                # GT Corr is represented on the RIGHT SBS image.
+                # Convert it back to original-image pixel coordinates.
+                gt_source_u = (
+                    (corr_target_gt[..., 0] - 0.5)
+                    * 2.0
+                    * 1600.0
+                )
+                gt_source_v = corr_target_gt[..., 1] * 900.0
+
+                gt_source_uv = torch.stack(
+                    [gt_source_u, gt_source_v],
+                    dim=-1,
+                )
+
+                gt_solver_mask = (
+                    query_unique_mask_filtered
+                    & corr_valid_gt
+                    & torch.isfinite(z_broken_gt)
+                    & (z_broken_gt > 1e-3)
+                )
+
+                # ========================================================
+                # A. SOLVER SANITY
+                # GT Corr + GT Z + GT Rotation
+                # ========================================================
+                (
+                    trans_a,
+                    diag_a,
+                ) = self._solve_translation_given_rotation(
+                    query_input=query_input_filtered,
+                    source_uv_pixels=gt_source_uv,
+                    source_z=z_broken_gt.unsqueeze(-1),
+                    point_valid_mask=gt_solver_mask,
+                    broken_camera2lidar=broken_c2l_active,
+                    camera_intrinsics=camera_intrinsics_filtered,
+                    delta_rot=gt_rot_active,
+                )
+
+                # ========================================================
+                # D-common:
+                # Pred Corr + Pred Z, but evaluated on exactly the same
+                # GT-valid subset as A/B/C.
+                #
+                # Diagnostic only. GT mask is NOT for inference.
+                # ========================================================
+
+                d_common_mask = (
+                    query_unique_mask_filtered
+                    &
+                    calib_point_valid_mask
+                    &
+                    corr_valid_gt
+                    &
+                    torch.isfinite(z_broken_gt)
+                    &
+                    (z_broken_gt > 1e-3)
+                )
+
+
+                (
+                    trans_d_common,
+                    diag_d_common,
+                ) = self._solve_translation_given_rotation(
+
+                    query_input=
+                        query_input_filtered,
+
+                    source_uv_pixels=
+                        uv_pixels_from_corr_filtered,
+
+                    source_z=
+                        z_estimated_hybrid,
+
+                    point_valid_mask=
+                        d_common_mask,
+
+                    broken_camera2lidar=
+                        broken_c2l_active,
+
+                    camera_intrinsics=
+                        camera_intrinsics_filtered,
+
+                    delta_rot=
+                        gt_rot_active,
+                )
+
+
+                d_common_mae = (
+                    torch.abs(
+                        trans_d_common
+                        - gt_trans_active
+                    )
+                    .mean()
+                )
+
+
+                d_common_l2 = (
+                    torch.linalg.norm(
+                        trans_d_common
+                        - gt_trans_active,
+                        dim=-1,
+                    )
+                    .mean()
+                )
+
+                a_mae = torch.abs(
+                    trans_a - gt_trans_active
+                ).mean()
+
+                a_l2 = torch.linalg.norm(
+                    trans_a - gt_trans_active,
+                    dim=-1,
+                ).mean()
+
+                # ========================================================
+                # B. CORRNET-ONLY ERROR ISOLATION
+                # Pred Corr + GT Z + GT Rotation
+                #
+                # GT depth belongs to the correct physical point;
+                # only the UV source location is replaced by CorrNet output.
+                # ========================================================
+                b_valid_mask = (
+                    query_unique_mask_filtered
+                    & corr_finite
+                    & corr_in_range
+                    & corr_valid_gt
+                    & torch.isfinite(z_broken_gt)
+                    & (z_broken_gt > 1e-3)
+                )
+
+                (
+                    trans_b,
+                    diag_b,
+                ) = self._solve_translation_given_rotation(
+                    query_input=query_input_filtered,
+                    source_uv_pixels=uv_pixels_from_corr_filtered,
+                    source_z=z_broken_gt.unsqueeze(-1),
+                    point_valid_mask=b_valid_mask,
+                    broken_camera2lidar=broken_c2l_active,
+                    camera_intrinsics=camera_intrinsics_filtered,
+                    delta_rot=gt_rot_active,
+                )
+
+                b_mae = torch.abs(
+                    trans_b - gt_trans_active
+                ).mean()
+
+                b_l2 = torch.linalg.norm(
+                    trans_b - gt_trans_active,
+                    dim=-1,
+                ).mean()
+
+                # ========================================================
+                # C. ZESTIMATOR-ONLY ERROR ISOLATION
+                # GT Corr + Pred Z @ GT Corr + GT Rotation
+                #
+                # Re-run ZEstimator at GT Corr. DO NOT reuse
+                # z_estimated_hybrid, because that was estimated at
+                # Pred Corr and would contaminate this test with Corr error.
+                # ========================================================
+                with torch.no_grad():
+                    estimated_z_at_gtcorr = self.z_estimator(
+                        uv_sbs_normalized=corr_target_gt,
+                        uv_orig_pixels=gt_source_uv,
+                        depth_map=depth_map_active_BROKEN,
+                        enc_out=enc_out_filtered_4d,
+                    )
+
+                z_pred_at_gtcorr = estimated_z_at_gtcorr['depth']
+
+                c_valid_mask = (
+                    query_unique_mask_filtered
+                    & corr_valid_gt
+                    & torch.isfinite(z_pred_at_gtcorr[..., 0])
+                    & (z_pred_at_gtcorr[..., 0] > 1e-3)
+                )
+
+                (
+                    trans_c,
+                    diag_c,
+                ) = self._solve_translation_given_rotation(
+                    query_input=query_input_filtered,
+                    source_uv_pixels=gt_source_uv,
+                    source_z=z_pred_at_gtcorr,
+                    point_valid_mask=c_valid_mask,
+                    broken_camera2lidar=broken_c2l_active,
+                    camera_intrinsics=camera_intrinsics_filtered,
+                    delta_rot=gt_rot_active,
+                )
+
+                c_mae = torch.abs(
+                    trans_c - gt_trans_active
+                ).mean()
+
+                c_l2 = torch.linalg.norm(
+                    trans_c - gt_trans_active,
+                    dim=-1,
+                ).mean()
+
+                # ========================================================
+                # D. REAL PROVIDER TEST
+                # Pred Corr + Pred Z @ Pred Corr + GT Rotation
+                # ========================================================
+                d_valid_mask = (
+                    calib_point_valid_mask
+                    & torch.isfinite(z_estimated_hybrid[..., 0])
+                    & (z_estimated_hybrid[..., 0] > 1e-3)
+                )
+
+                (
+                    trans_d,
+                    diag_d,
+                ) = self._solve_translation_given_rotation(
+                    query_input=query_input_filtered,
+                    source_uv_pixels=uv_pixels_from_corr_filtered,
+                    source_z=z_estimated_hybrid,
+                    point_valid_mask=d_valid_mask,
+                    broken_camera2lidar=broken_c2l_active,
+                    camera_intrinsics=camera_intrinsics_filtered,
+                    delta_rot=gt_rot_active,
+                )
+
+                d_mae = torch.abs(
+                    trans_d - gt_trans_active
+                ).mean()
+
+                d_l2 = torch.linalg.norm(
+                    trans_d - gt_trans_active,
+                    dim=-1,
+                ).mean()
+
+                # Keep scalar diagnostics so they can be attached to
+                # DataSample.metainfo as well as printed.
+                geo_oracle_summary = {
+                    'geo_A_mae_m': float(a_mae.detach().cpu()),
+                    'geo_A_l2_m': float(a_l2.detach().cpu()),
+                    'geo_A_valid_count': float(
+                        diag_a['valid_count'].float().mean().detach().cpu()
+                    ),
+                    'geo_A_residual_rmse': float(
+                        diag_a['residual_rmse'].mean().detach().cpu()
+                    ),
+                    'geo_B_mae_m': float(b_mae.detach().cpu()),
+                    'geo_B_l2_m': float(b_l2.detach().cpu()),
+                    'geo_B_valid_count': float(
+                        diag_b['valid_count'].float().mean().detach().cpu()
+                    ),
+                    'geo_B_residual_rmse': float(
+                        diag_b['residual_rmse'].mean().detach().cpu()
+                    ),
+                    'geo_C_mae_m': float(c_mae.detach().cpu()),
+                    'geo_C_l2_m': float(c_l2.detach().cpu()),
+                    'geo_C_valid_count': float(
+                        diag_c['valid_count'].float().mean().detach().cpu()
+                    ),
+                    'geo_C_residual_rmse': float(
+                        diag_c['residual_rmse'].mean().detach().cpu()
+                    ),
+                    'geo_D_mae_m': float(d_mae.detach().cpu()),
+                    'geo_D_l2_m': float(d_l2.detach().cpu()),
+                    'geo_D_valid_count': float(
+                        diag_d['valid_count'].float().mean().detach().cpu()
+                    ),
+                    'geo_D_residual_rmse': float(
+                        diag_d['residual_rmse'].mean().detach().cpu()
+                    ),
+                }
+
+                # Print up to 200 samples so a deterministic 200-sample
+                # run can be parsed directly from the log.
+                if not hasattr(self, '_geo_oracle_debug_count'):
+                    self._geo_oracle_debug_count = 0
+
+                if self._geo_oracle_debug_count < 200:
+                    print(
+                        '\n'
+                        '=====================================================\n'
+                        '[GEO ORACLE 2x2 BOTTLENECK MATRIX]\n'
+                        '=====================================================\n'
+                        '\n'
+                        '[A] GT Corr + GT Z + GT Rotation\n'
+                        f'MAE      = {a_mae.item():.6f} m\n'
+                        f'L2       = {a_l2.item():.6f} m\n'
+                        f'valid    = {diag_a["valid_count"].float().mean().item():.2f}\n'
+                        f'residual = {diag_a["residual_rmse"].mean().item():.6f}\n'
+                        '\n'
+                        '[B] Pred Corr + GT Z + GT Rotation\n'
+                        f'MAE      = {b_mae.item():.6f} m\n'
+                        f'L2       = {b_l2.item():.6f} m\n'
+                        f'valid    = {diag_b["valid_count"].float().mean().item():.2f}\n'
+                        f'residual = {diag_b["residual_rmse"].mean().item():.6f}\n'
+                        '\n'
+                        '[C] GT Corr + Pred Z@GT-Corr + GT Rotation\n'
+                        f'MAE      = {c_mae.item():.6f} m\n'
+                        f'L2       = {c_l2.item():.6f} m\n'
+                        f'valid    = {diag_c["valid_count"].float().mean().item():.2f}\n'
+                        f'residual = {diag_c["residual_rmse"].mean().item():.6f}\n'
+                        '\n'
+                        '[D] Pred Corr + Pred Z@Pred-Corr + GT Rotation\n'
+                        f'MAE      = {d_mae.item():.6f} m\n'
+                        f'L2       = {d_l2.item():.6f} m\n'
+                        f'valid    = {diag_d["valid_count"].float().mean().item():.2f}\n'
+                        f'residual = {diag_d["residual_rmse"].mean().item():.6f}\n'
+                        '\n'
+                        '[D-common] Pred Corr + Pred Z + GT-R '
+                        'on A/B/C common mask\n'
+                        f'MAE      = {d_common_mae.item():.6f} m\n'
+                        f'L2       = {d_common_l2.item():.6f} m\n'
+                        f'valid    = '
+                        f'{diag_d_common["valid_count"].float().mean().item():.2f}\n'
+                        f'residual = '
+                        f'{diag_d_common["residual_rmse"].mean().item():.6f}\n'
+                        '=====================================================\n'
+                    )
+
+                    self._geo_oracle_debug_count += 1
+
+                # For the existing stage-1 metadata path, use D:
+                # GT rotation + translation solved from real Pred Corr/Z.
+                pred_delta_6dof_filtered = torch.cat(
+                    [gt_rot_active, trans_d],
+                    dim=-1,
+                )
+
+            else:
+                # ========================================================
+                # Existing learned CalibHead
+                # ========================================================
+                (
+                    pred_delta_6dof_filtered,
+                    _
+                ) = self.calib_head(
+                    enc_out=enc_out_filtered_4d,
+                    query_input=query_input_filtered,
+                    corrs_pred_3d=corrs_3d_filtered,
+                    z_reliability=z_reliability_filtered,
+                    z_raw=z_raw_for_calib,
+                    camera_intrinsics=camera_intrinsics_filtered,
+                    point_valid_mask=calib_point_valid_mask,
+                )
 
             # Convert 4D enc_out to 3D for storage
             b_act, c_f, h_f, w_f = enc_out_filtered_4d.shape
@@ -5596,14 +6934,11 @@ class BEVFusion(Base3DDetector):
         pred_delta_rot = pred_delta_6dof[..., :3]
         pred_delta_trans = pred_delta_6dof[..., 3:]
 
-        # 1) 배치별 active_cam_indices를 준비 (현재 코드가 B==1 only면 그 사실을 명시적으로 반영)
-        #    - 현재 snippet에서는 active_cam_indices가 "한 개"만 존재하므로 B==1로 가정한 형태
-        if B == 1:
-            active_list = [active_cam_indices]  # length B
-        else:
-            # TODO: B>1이면 반드시 b별 active 인덱스를 만들어야 함
-            # active_list = active_cam_indices_per_batch  # e.g., List[Tensor] length B
-            raise RuntimeError("B>1이면 active_cam_indices를 배치별로 따로 만들어 저장해야 합니다.")
+        # Current active-camera prediction path is B==1 only.
+        if B != 1:
+            raise RuntimeError(
+                "B>1이면 active_cam_indices를 배치별로 따로 만들어 저장해야 합니다."
+            )
 
         for b in range(B):
             # stage1 per-cam
@@ -5635,7 +6970,19 @@ class BEVFusion(Base3DDetector):
                 'calibration_mode': self.calibration_mode,
             })
 
+            if geo_oracle_summary is not None:
+                mi.update(geo_oracle_summary)
+
             batch_data_samples[b].set_metainfo(mi)
+
+        # Oracle diagnostic stops before BEVFusion detection.
+        # Metadata for the whole batch has already been attached above.
+        if self.calibration_mode == 'geo_oracle_gtrot':
+            if geo_oracle_summary is None:
+                raise RuntimeError(
+                    '[GEO ORACLE] No active camera / no oracle summary was produced.'
+                )
+            return batch_data_samples
 
         # ===================== END: LOGIC ALIGNMENT WITH LOSS FUNCTION =====================
 
@@ -5908,7 +7255,7 @@ class BEVFusion(Base3DDetector):
             )
         
         return results
-    
+
     def _attach_calib_prediction_meta(
         self,
         results,

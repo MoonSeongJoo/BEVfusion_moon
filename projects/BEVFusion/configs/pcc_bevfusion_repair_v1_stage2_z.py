@@ -27,11 +27,12 @@ _base_ = [
 model = dict(
 
     enable_selective_freezing=False,
+    calibration_mode= 'geo_oracle_gtrot',
 
     # --------------------------------------------------------
     # NEW LGPC sub-stage
     # --------------------------------------------------------
-    lgpc_train_stage='z_calib',
+    lgpc_train_stage='calib',
 
     bbox_head=dict(
         rrrf_mode='lgpc_only',
@@ -88,6 +89,17 @@ test_cfg = dict(
     type='TestLoop',
 )
 
+test_evaluator = [
+
+    dict(
+        type='CalibLCCNetMetric',
+        prefix='geo_gtrot',
+        debug=True,
+        debug_n=5,
+    ),
+]
+
+val_evaluator = test_evaluator
 
 # ============================================================
 # OPTIMIZER
@@ -148,8 +160,8 @@ default_hooks = dict(
 
 load_from = (
     'data/work_dirs/'
-    'pcc_repair_v1_lgpc_full24_ddp2/'
-    'epoch_10.pth'
+    'pcc_repair_v1_lgpc_zcalib_ddp2/'
+    'lgpc_corr_z_only_for_calib_v3.pth'
 )
 
 resume = False

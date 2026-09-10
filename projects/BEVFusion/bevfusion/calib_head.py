@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -315,6 +316,9 @@ class CalibrationCorrectionHead(BaseModule):
         local_dim: int = 32,
         point_dim: int = 64,
         global_dim: int = 64,
+        # NEW
+        rot_condition_dim: int = 16,
+        rot_condition_scale_deg: float = 10.0,
         init_cfg=None,
     ):
         super().__init__(
@@ -324,6 +328,11 @@ class CalibrationCorrectionHead(BaseModule):
         self.num_kp = num_kp
         self.in_channels = in_channels
 
+
+        self.rot_condition_dim = rot_condition_dim
+        self.rot_condition_scale_rad = math.radians(
+            rot_condition_scale_deg
+        )
         self.local_dim = local_dim
         self.point_dim = point_dim
         self.global_dim = global_dim
@@ -421,9 +430,13 @@ class CalibrationCorrectionHead(BaseModule):
         # ============================================================
 
         point_input_dim = (
-            7
-            + self.z_reliability_dim
-            + local_dim * 3
+            7                           # legacy UVZ geometry
+            + 3                         # target intrinsic-normalized ray
+            + 3                         # source camera XYZ
+            + 2                         # ray displacement
+            + self.z_reliability_dim    # 4
+            + 1                         # adaptive Z gate
+            + local_dim * 3             # 96
         )
 
 
@@ -474,16 +487,21 @@ class CalibrationCorrectionHead(BaseModule):
         #
         # ============================================================
 
-        score_input_dim = (
+        base_score_input_dim = (
             point_dim
             + self.z_reliability_dim
+            + 1   # adaptive Z gate
         )
 
+        trans_score_input_dim = (
+            base_score_input_dim
+            + self.rot_condition_dim
+        )
 
         self.rot_score_head = nn.Sequential(
 
             nn.Linear(
-                score_input_dim,
+                base_score_input_dim,
                 32,
             ),
 
@@ -495,11 +513,38 @@ class CalibrationCorrectionHead(BaseModule):
             ),
         )
 
+        # ============================================================
+        # Rotation -> Translation conditioning
+        #
+        # Translation should estimate motion after knowing the
+        # current rotation estimate.
+        #
+        # pred_rot:
+        #     [M,3]
+        #
+        # normalized / encoded:
+        #     [M,16]
+        # ============================================================
+
+        self.rot_condition_encoder = nn.Sequential(
+
+            nn.Linear(
+                3,
+                self.rot_condition_dim,
+                bias=False,
+            ),
+
+            nn.LayerNorm(
+                self.rot_condition_dim,
+            ),
+
+            nn.Mish(),
+        )
 
         self.trans_score_head = nn.Sequential(
 
             nn.Linear(
-                score_input_dim,
+                trans_score_input_dim,
                 32,
             ),
 
@@ -568,11 +613,16 @@ class CalibrationCorrectionHead(BaseModule):
             ),
         )
 
+        trans_pose_input_dim = (
+            pose_input_dim
+            + self.rot_condition_dim
+        )
+        # 128 + 16 = 144
 
         self.trans_head = nn.Sequential(
 
             nn.Linear(
-                pose_input_dim,
+                trans_pose_input_dim,
                 128,
             ),
 
@@ -661,6 +711,41 @@ class CalibrationCorrectionHead(BaseModule):
             self.trans_head[-1].bias
         )
 
+        # ============================================================
+        # Adaptive Raw-Z vs V3-Z Gate
+        #
+        # input:
+        #   Z reliability                 4
+        #   predicted Z / 80              1
+        #   raw center Z / 80             1
+        #   |pred - raw| / 80             1
+        #
+        # total = 7
+        # ============================================================
+
+        self.depth_gate = nn.Sequential(
+
+            nn.Linear(
+                7,
+                32,
+            ),
+
+            nn.Mish(),
+
+            nn.Linear(
+                32,
+                1,
+            ),
+        )
+
+        nn.init.zeros_(
+            self.depth_gate[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.depth_gate[-1].bias
+        )
+
 
     def _sample_local_feature(
         self,
@@ -729,7 +814,77 @@ class CalibrationCorrectionHead(BaseModule):
 
 
         return sampled
+    
+    # ================================================================
+    # NEW: Masked softmax
+    #
+    # CorrNet still receives Q=200.
+    #
+    # But duplicated filler queries must receive ZERO weight
+    # inside CalibHead aggregation.
+    # ================================================================
 
+    def _masked_softmax(
+        self,
+        logits,
+        valid_mask,
+    ):
+
+        # logits:
+        #     [M, Q, 1]
+        #
+        # valid_mask:
+        #     [M, Q]
+
+        logits = logits.squeeze(-1)
+
+        valid_mask = valid_mask.bool()
+
+
+        very_negative = (
+            torch.finfo(
+                logits.dtype
+            ).min
+        )
+
+
+        # Invalid/repeated slots cannot participate
+        # in softmax competition.
+        logits = logits.masked_fill(
+            ~valid_mask,
+            very_negative,
+        )
+
+
+        weights = F.softmax(
+            logits,
+            dim=1,
+        )
+
+
+        # Explicitly force repeated slots to zero.
+        weights = (
+            weights
+            * valid_mask.to(
+                dtype=weights.dtype
+            )
+        )
+
+
+        # Re-normalize over real queries only.
+        weights = (
+            weights
+            /
+            weights.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(
+                1e-8
+            )
+        )
+
+
+        return weights
 
     def forward(
         self,
@@ -737,45 +892,104 @@ class CalibrationCorrectionHead(BaseModule):
         query_input: torch.Tensor,
         corrs_pred_3d: torch.Tensor,
         z_reliability: torch.Tensor,
+        z_raw: torch.Tensor,
+        camera_intrinsics: torch.Tensor,
+        point_valid_mask: torch.Tensor,
     ):
         """
-        Returns:
-            pred_delta_6dof:
-                [M,6]
+        CalibrationCorrectionHead V2 forward.
 
-            diagnostics:
-                dict
+        Main functions
+        --------------
+        1. Preserve CorrNet fixed Q=200 input.
+        2. Exclude duplicated filler correspondences from CalibHead pooling.
+        3. Adaptively select/blend Raw-Z and ZEstimator-V3 Z.
+        4. Add K-aware geometric representation:
+             - target intrinsic-normalized ray
+             - source camera XYZ
+             - intrinsic-normalized ray displacement
+        5. Use separate rotation / translation reliability weights.
+
+        Inputs
+        ------
+        enc_out:
+            [M, C, H, W]
+
+        query_input:
+            [M, Q, 2]
+            SBS coordinates.
+            x in [0, 0.5], y in [0, 1]
+
+        corrs_pred_3d:
+            [M, Q, 3]
+            [corr_u_sbs, corr_v_sbs, z_pred]
+
+        z_reliability:
+            [M, Q, 4]
+
+        z_raw:
+            [M, Q, 1]
+
+        camera_intrinsics:
+            [M, 3, 3] or [M, 4, 4]
+
+        point_valid_mask:
+            [M, Q]
+
+        Returns
+        -------
+        pred_delta_6dof:
+            [M, 6]
+
+        diagnostics:
+            dict
         """
 
-        M, Q, _ = (
-            corrs_pred_3d.shape
-        )
+        # ============================================================
+        # 0. Shape information
+        # ============================================================
+
+        M, Q, C3 = corrs_pred_3d.shape
 
 
         # ============================================================
-        # Runtime guards
+        # 1. Runtime guards
         # ============================================================
+
+        if C3 != 3:
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'corrs_pred_3d must be [M,Q,3], '
+                f'got {corrs_pred_3d.shape}'
+            )
+
 
         if enc_out.ndim != 4:
-
             raise RuntimeError(
-                '[CalibHead V1] '
-                f'enc_out must be 4D, '
+                '[CalibHead V2] '
+                'enc_out must be [M,C,H,W], '
                 f'got {enc_out.shape}'
             )
 
 
-        if query_input.shape[:2] != (
-            M,
-            Q,
-        ):
-
+        if enc_out.shape[0] != M:
             raise RuntimeError(
-                '[CalibHead V1] '
-                'query / correspondence '
-                'shape mismatch: '
-                f'query={query_input.shape}, '
+                '[CalibHead V2] '
+                'enc_out batch mismatch: '
+                f'enc_out={enc_out.shape}, '
                 f'corr={corrs_pred_3d.shape}'
+            )
+
+
+        if (
+            query_input.shape[0] != M
+            or query_input.shape[1] != Q
+            or query_input.shape[-1] != 2
+        ):
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'query_input must be [M,Q,2], '
+                f'got {query_input.shape}'
             )
 
 
@@ -785,348 +999,618 @@ class CalibrationCorrectionHead(BaseModule):
             or z_reliability.shape[-1]
             != self.z_reliability_dim
         ):
-
             raise RuntimeError(
-                '[CalibHead V1] '
+                '[CalibHead V2] '
                 'z_reliability must be '
                 f'[M,Q,{self.z_reliability_dim}], '
                 f'got {z_reliability.shape}'
             )
 
 
+        if z_raw.ndim == 2:
+            z_raw = z_raw.unsqueeze(-1)
+
+
+        if (
+            z_raw.shape[0] != M
+            or z_raw.shape[1] != Q
+            or z_raw.shape[-1] != 1
+        ):
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'z_raw must be [M,Q,1], '
+                f'got {z_raw.shape}'
+            )
+
+
+        if camera_intrinsics.ndim != 3:
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'camera_intrinsics must be '
+                '[M,3,3] or [M,4,4], '
+                f'got {camera_intrinsics.shape}'
+            )
+
+
+        if camera_intrinsics.shape[0] != M:
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'camera intrinsic batch mismatch: '
+                f'K={camera_intrinsics.shape}, '
+                f'corr={corrs_pred_3d.shape}'
+            )
+
+
+        if (
+            camera_intrinsics.shape[-2] < 3
+            or camera_intrinsics.shape[-1] < 3
+        ):
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'camera_intrinsics must contain '
+                'at least a 3x3 intrinsic matrix, '
+                f'got {camera_intrinsics.shape}'
+            )
+
+
+        if point_valid_mask.shape != (M, Q):
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'point_valid_mask must be [M,Q], '
+                f'got {point_valid_mask.shape}'
+            )
+
+
+        point_valid_mask = point_valid_mask.bool()
+
+
         # ============================================================
-        # 1. Normalize correspondence geometry
+        # 2. Sanitize reliability
+        # ============================================================
+
+        z_reliability = torch.nan_to_num(
+            z_reliability,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+        z_reliability = z_reliability.clamp(
+            min=0.0,
+            max=1.0,
+        )
+
+
+        # ============================================================
+        # 3. Sanitize SBS coordinates
         #
-        # IMPORTANT:
+        # Important:
+        # invalid points are masked later, but NaN * 0 is still NaN.
+        # Therefore coordinates themselves must be finite here.
+        # ============================================================
+
+        query_uv_sbs = torch.nan_to_num(
+            query_input[..., :2],
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+
+        corr_uv_sbs = torch.nan_to_num(
+            corrs_pred_3d[..., :2],
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+
+        # ============================================================
+        # 4. ZEstimator prediction and raw Z
+        # ============================================================
+
+        z_pred = corrs_pred_3d[..., 2:3]
+
+
+        z_pred = torch.nan_to_num(
+            z_pred,
+            nan=0.0,
+            posinf=80.0,
+            neginf=0.0,
+        ).clamp(
+            min=0.0,
+            max=80.0,
+        )
+
+
+        z_raw = torch.nan_to_num(
+            z_raw,
+            nan=0.0,
+            posinf=80.0,
+            neginf=0.0,
+        ).clamp(
+            min=0.0,
+            max=80.0,
+        )
+
+
+        # ============================================================
+        # 5. Adaptive Raw-Z / Pred-Z Gate
         #
-        # Absolute coordinates remain [0,1].
+        # gate = 0:
+        #     Raw Z
         #
-        # du,dv remain SIGNED [-1,1].
+        # gate = 1:
+        #     ZEstimator V3 Z
+        # ============================================================
+
+        z_gap = (
+            torch.abs(
+                z_pred - z_raw
+            )
+            / 80.0
+        ).clamp(
+            min=0.0,
+            max=1.0,
+        )
+
+
+        gate_input = torch.cat(
+            [
+                z_reliability,      # 4
+                z_pred / 80.0,      # 1
+                z_raw / 80.0,       # 1
+                z_gap,              # 1
+            ],
+            dim=-1,
+        )
+        # [M,Q,7]
+
+
+        # Pure neural-network decision.
+        z_gate_learned = torch.sigmoid(
+            self.depth_gate(
+                gate_input
+            )
+        )
+        # [M,Q,1]
+
+
+        # Actual working gate.
+        z_gate = z_gate_learned
+
+
+        # ------------------------------------------------------------
+        # Current Z reliability convention
         #
-        # No more:
+        # channel 0:
+        #     neighborhood valid ratio
         #
-        #     (diff + 1) / 2
+        # channel 2:
+        #     raw center-depth valid indicator
+        # ------------------------------------------------------------
+
+        center_valid = (
+            z_reliability[..., 2:3]
+            > 0.5
+        )
+
+
+        neighbor_valid = (
+            z_reliability[..., 0:1]
+            > 1e-6
+        )
+
+
+        # Neural gate is meaningful only when:
         #
-        # Identity displacement therefore corresponds to:
+        # - correspondence itself is valid
+        # - raw Z exists
+        # - neighborhood information exists
+        learnable_gate_mask = (
+            point_valid_mask
+            & center_valid.squeeze(-1)
+            & neighbor_valid.squeeze(-1)
+        )
+
+
+        # Raw depth unavailable:
+        # force ZEstimator prediction.
+        z_gate = torch.where(
+            ~center_valid,
+            torch.ones_like(z_gate),
+            z_gate,
+        )
+
+
+        # Neighborhood unavailable but raw exists:
+        # force raw Z.
+        z_gate = torch.where(
+            center_valid & ~neighbor_valid,
+            torch.zeros_like(z_gate),
+            z_gate,
+        )
+
+
+        # ============================================================
+        # 6. Final Z used by CalibHead
+        # ============================================================
+
+        z_used = (
+            (1.0 - z_gate) * z_raw
+            + z_gate * z_pred
+        ).clamp(
+            min=0.0,
+            max=80.0,
+        )
+
+
+        z_norm = z_used / 80.0
+
+
+        # ============================================================
+        # 7. Legacy UVZ geometry
         #
-        #     du = 0
-        #     dv = 0
-        #
+        # Convert SBS coordinates back to each original camera's
+        # normalized image coordinate.
         # ============================================================
 
         query_u = (
-            query_input[
-                ...,
-                0:1
-            ]
+            query_uv_sbs[..., 0:1]
             * 2.0
         )
-        # left SBS [0,0.5] -> [0,1]
+        # [0,0.5] -> [0,1]
 
 
         query_v = (
-            query_input[
-                ...,
-                1:2
-            ]
+            query_uv_sbs[..., 1:2]
         )
 
 
         corr_u = (
             (
-                corrs_pred_3d[
-                    ...,
-                    0:1
-                ]
+                corr_uv_sbs[..., 0:1]
                 - 0.5
             )
             * 2.0
         )
-        # right SBS [0.5,1] -> [0,1]
+        # [0.5,1] -> [0,1]
 
 
         corr_v = (
-            corrs_pred_3d[
-                ...,
-                1:2
-            ]
+            corr_uv_sbs[..., 1:2]
         )
 
 
-        z_norm = (
-            corrs_pred_3d[
-                ...,
-                2:3
-            ]
-            .clamp(
-                min=0.0,
-                max=80.0,
-            )
-            / 80.0
-        )
-
-
-        du = (
-            query_u
-            - corr_u
-        )
-
-
-        dv = (
-            query_v
-            - corr_v
-        )
+        du = query_u - corr_u
+        dv = query_v - corr_v
 
 
         geom_feature = torch.cat(
-
             [
-                query_u,
-                query_v,
-
-                corr_u,
-                corr_v,
-
-                z_norm,
-
-                du,
-                dv,
+                query_u,     # 1
+                query_v,     # 1
+                corr_u,      # 1
+                corr_v,      # 1
+                z_norm,      # 1
+                du,          # 1
+                dv,          # 1
             ],
-
             dim=-1,
         )
         # [M,Q,7]
 
 
         # ============================================================
-        # 2. Sanitize Z reliability
-        #
-        # All 4 values are intended in [0,1].
-        #
+        # 8. K-aware geometry
         # ============================================================
 
-        z_reliability = torch.nan_to_num(
+        K = camera_intrinsics[..., :3, :3]
 
-            z_reliability,
-
-            nan=0.0,
-
-            posinf=1.0,
-
-            neginf=0.0,
+        K = K.to(
+            device=corrs_pred_3d.device,
+            dtype=corrs_pred_3d.dtype,
         )
 
 
-        z_reliability = (
-            z_reliability
+        fx = (
+            K[..., 0, 0]
+            .reshape(M, 1, 1)
+            .clamp_min(1e-6)
+        )
+
+
+        fy = (
+            K[..., 1, 1]
+            .reshape(M, 1, 1)
+            .clamp_min(1e-6)
+        )
+
+
+        cx = (
+            K[..., 0, 2]
+            .reshape(M, 1, 1)
+        )
+
+
+        cy = (
+            K[..., 1, 2]
+            .reshape(M, 1, 1)
+        )
+
+
+        # ============================================================
+        # 9. Original normalized image coordinates -> pixels
+        #
+        # nuScenes camera image convention currently used by PCC:
+        #
+        # W = 1600
+        # H = 900
+        # ============================================================
+
+        query_u_px = query_u * 1600.0
+        query_v_px = query_v * 900.0
+
+        corr_u_px = corr_u * 1600.0
+        corr_v_px = corr_v * 900.0
+
+
+        # ============================================================
+        # 10. Intrinsic-normalized target/source coordinates
+        #
+        # x = (u - cx) / fx = X/Z
+        # y = (v - cy) / fy = Y/Z
+        # ============================================================
+
+        query_x_cam = (
+            query_u_px - cx
+        ) / fx
+
+
+        query_y_cam = (
+            query_v_px - cy
+        ) / fy
+
+
+        corr_x_cam = (
+            corr_u_px - cx
+        ) / fx
+
+
+        corr_y_cam = (
+            corr_v_px - cy
+        ) / fy
+
+
+        # ============================================================
+        # 11. Target ray
+        #
+        # Target query has no independent depth.
+        #
+        # Keep perspective ray representation:
+        #
+        # [X/Z, Y/Z, 1]
+        #
+        # Do NOT unit-normalize here.
+        # ============================================================
+
+        target_ray = torch.cat(
+            [
+                query_x_cam,
+                query_y_cam,
+                torch.ones_like(
+                    query_x_cam
+                ),
+            ],
+            dim=-1,
+        )
+        # [M,Q,3]
+
+
+        # ============================================================
+        # 12. Source camera XYZ
+        #
+        # Assuming z_used is optical-axis camera depth:
+        #
+        # X = (u-cx)/fx * Z
+        # Y = (v-cy)/fy * Z
+        # Z = Z
+        # ============================================================
+
+        source_xyz = torch.cat(
+            [
+                corr_x_cam * z_used,
+                corr_y_cam * z_used,
+                z_used,
+            ],
+            dim=-1,
+        )
+        # [M,Q,3]
+
+
+        # Metric stabilization
+        source_xyz_norm = (
+            source_xyz
+            / 80.0
+        ).clamp(
+            min=-2.0,
+            max=2.0,
+        )
+
+
+        # ============================================================
+        # 13. Intrinsic-normalized ray displacement
+        # ============================================================
+
+        ray_delta = torch.cat(
+            [
+                query_x_cam - corr_x_cam,
+                query_y_cam - corr_y_cam,
+            ],
+            dim=-1,
+        )
+        # [M,Q,2]
+
+
+        ray_delta = (
+            ray_delta
             .clamp(
-                min=0.0,
-                max=1.0,
+                min=-2.0,
+                max=2.0,
             )
+            / 2.0
         )
 
 
         # ============================================================
-        # 3. Compress Corr feature map
-        #
-        # 312 -> 32
-        #
+        # 14. CorrNet local feature map
         # ============================================================
 
-        local_map = (
-            self.local_adaptor(
-                enc_out
-            )
+        local_map = self.local_adaptor(
+            enc_out
         )
 
 
         # ============================================================
-        # 4. Sample left-query feature
-        #
-        # query_input itself is SBS coordinate.
-        #
+        # 15. Query local feature
         # ============================================================
 
-        query_uv_sbs = (
-            query_input[
-                ...,
-                :2
-            ]
+        query_local = self._sample_local_feature(
+            local_map,
+            query_uv_sbs,
         )
-
-
-        query_local = (
-            self._sample_local_feature(
-                local_map,
-                query_uv_sbs,
-            )
-        )
-        # [M,Q,32]
+        # [M,Q,local_dim]
 
 
         # ============================================================
-        # 5. Sample right-correspondence feature
-        #
-        # corrs_pred_3d[...,0:2] is also SBS coordinate.
-        #
+        # 16. Correspondence local feature
         # ============================================================
 
-        corr_uv_sbs = (
-            corrs_pred_3d[
-                ...,
-                :2
-            ]
+        corr_local = self._sample_local_feature(
+            local_map,
+            corr_uv_sbs,
         )
-
-
-        corr_local = (
-            self._sample_local_feature(
-                local_map,
-                corr_uv_sbs,
-            )
-        )
-        # [M,Q,32]
+        # [M,Q,local_dim]
 
 
         # ============================================================
-        # 6. Corr local matching feature
+        # 17. Local matching feature
         #
-        # Preserve:
+        # query        = 32
+        # corr         = 32
+        # abs diff     = 32
         #
-        #   query semantic feature
-        #   candidate feature
-        #   discrepancy between them
-        #
+        # total        = 96
         # ============================================================
 
         local_match_feature = torch.cat(
-
             [
                 query_local,
                 corr_local,
-
                 torch.abs(
                     query_local
                     - corr_local
                 ),
             ],
-
             dim=-1,
         )
-        # [M,Q,96]
 
 
         # ============================================================
-        # 7. Build per-correspondence descriptor
+        # 18. Per-correspondence descriptor
         #
-        # 7 geometry
-        # 4 Z reliability
-        # 96 Corr local
+        # Legacy geometry                  7
+        # Target ray                       3
+        # Source XYZ                       3
+        # Ray displacement                 2
+        # Z reliability                    4
+        # Adaptive Z gate                  1
+        # Corr local matching             96
         #
-        # = 107
-        #
+        # Total                           116
         # ============================================================
 
         point_input = torch.cat(
-
             [
-                geom_feature,
-                z_reliability,
-                local_match_feature,
-            ],
+                geom_feature,            # 7
 
+                target_ray,              # 3
+                source_xyz_norm,         # 3
+                ray_delta,               # 2
+
+                z_reliability,           # 4
+                z_gate,                  # 1
+
+                local_match_feature,     # 96
+            ],
             dim=-1,
         )
-        # [M,Q,107]
+        # [M,Q,116]
 
 
-        # ============================================================
-        # 8. SAME point encoder for all correspondences
-        #
-        # ============================================================
-
-        point_feature = (
-            self.point_encoder(
-                point_input
+        # Hard guard while V2 is being validated.
+        if point_input.shape[-1] != 116:
+            raise RuntimeError(
+                '[CalibHead V2] '
+                'K-aware point descriptor must be 116D, '
+                f'got {point_input.shape}'
             )
+
+
+        # ============================================================
+        # 19. Shared point encoder
+        # ============================================================
+
+        point_feature = self.point_encoder(
+            point_input
         )
         # [M,Q,64]
 
 
         # ============================================================
-        # 9. Reliability scoring input
+        # 20. Reliability scoring descriptor
         #
-        # Directly expose Z reliability once more.
+        # point feature       64
+        # Z reliability        4
+        # adaptive Z gate      1
         #
-        # This is especially useful for Translation weights.
-        #
+        # total               69
         # ============================================================
 
         score_input = torch.cat(
-
             [
                 point_feature,
                 z_reliability,
+                z_gate,
             ],
-
             dim=-1,
         )
-        # [M,Q,68]
+        # [M,Q,69]
 
 
         # ============================================================
-        # 10. Rotation reliability
+        # 21. Rotation reliability
         # ============================================================
 
-        rot_logits = (
-            self.rot_score_head(
-                score_input
-            )
+        rot_logits = self.rot_score_head(
+            score_input
         )
         # [M,Q,1]
 
 
-        rot_weights = torch.softmax(
+        rot_weight = self._masked_softmax(
             rot_logits,
-            dim=1,
+            point_valid_mask,
         )
+        # [M,Q]
 
 
         # ============================================================
-        # 11. Translation reliability
-        # ============================================================
-
-        trans_logits = (
-            self.trans_score_head(
-                score_input
-            )
-        )
-
-
-        trans_weights = torch.softmax(
-            trans_logits,
-            dim=1,
-        )
-
-
-        # ============================================================
-        # 12. Weighted SET aggregation
-        #
-        # Point order no longer changes the result.
-        #
+        # 22. Rotation SET aggregation
         # ============================================================
 
         rot_set_feature = (
-            rot_weights
-            * point_feature
-        ).sum(
-            dim=1
-        )
-        # [M,64]
-
-
-        trans_set_feature = (
-            trans_weights
+            rot_weight.unsqueeze(-1)
             * point_feature
         ).sum(
             dim=1
@@ -1135,10 +1619,7 @@ class CalibrationCorrectionHead(BaseModule):
 
 
         # ============================================================
-        # 13. Global Corr feature
-        #
-        # Preserve current CalibHead global context.
-        #
+        # 23. Global Corr context
         # ============================================================
 
         global_feature = (
@@ -1147,97 +1628,258 @@ class CalibrationCorrectionHead(BaseModule):
             )
             .flatten(1)
         )
-        # [M,312]
 
 
-        global_feature = (
-            self.global_encoder(
-                global_feature
-            )
+        global_feature = self.global_encoder(
+            global_feature
         )
         # [M,64]
 
 
         # ============================================================
-        # 14. Separate Rotation / Translation context
+        # 24. Rotation prediction FIRST
         # ============================================================
 
         rot_feature = torch.cat(
-
             [
                 rot_set_feature,
                 global_feature,
             ],
-
             dim=-1,
         )
         # [M,128]
 
 
-        trans_feature = torch.cat(
+        pred_rot = self.rot_head(
+            rot_feature
+        )
+        # [M,3]
 
+
+        # ============================================================
+        # 25. Explicit Rotation Condition
+        #
+        # IMPORTANT:
+        #
+        # detach() intentionally prevents translation loss from
+        # modifying the Rotation Head in this first experiment.
+        #
+        # We want to test:
+        #
+        #   "Does a known/predicted rotation estimate help translation?"
+        #
+        # without destabilizing the rotation branch.
+        # ============================================================
+
+        rot_condition_input = (
+            pred_rot.detach()
+            / self.rot_condition_scale_rad
+        ).clamp(
+            min=-2.0,
+            max=2.0,
+        )
+        # [M,3]
+
+
+        rot_condition = self.rot_condition_encoder(
+            rot_condition_input
+        )
+        # [M,16]
+
+
+        # ============================================================
+        # 26. Rotation-conditioned Translation reliability
+        #
+        # Each correspondence sees the SAME camera-level rotation
+        # estimate in addition to its own local geometry.
+        # ============================================================
+
+        rot_condition_per_point = (
+            rot_condition
+            .unsqueeze(1)
+            .expand(
+                -1,
+                Q,
+                -1,
+            )
+        )
+        # [M,Q,16]
+
+
+        trans_score_input = torch.cat(
+            [
+                score_input,                  # 69
+                rot_condition_per_point,      # 16
+            ],
+            dim=-1,
+        )
+        # [M,Q,85]
+
+
+        trans_logits = self.trans_score_head(
+            trans_score_input
+        )
+        # [M,Q,1]
+
+
+        trans_weight = self._masked_softmax(
+            trans_logits,
+            point_valid_mask,
+        )
+        # [M,Q]
+
+
+        # ============================================================
+        # 27. Translation SET aggregation
+        # ============================================================
+
+        trans_set_feature = (
+            trans_weight.unsqueeze(-1)
+            * point_feature
+        ).sum(
+            dim=1
+        )
+        # [M,64]
+
+
+        # ============================================================
+        # 28. Rotation-conditioned Translation feature
+        #
+        # Translation input:
+        #
+        #   trans set feature   64
+        #   global Corr feature 64
+        #   rotation condition  16
+        #
+        # total = 144
+        # ============================================================
+
+        trans_feature = torch.cat(
             [
                 trans_set_feature,
                 global_feature,
+                rot_condition,
             ],
-
             dim=-1,
         )
-        # [M,128]
+        # [M,144]
 
 
         # ============================================================
-        # 15. Pose regression
+        # 29. Translation prediction
         # ============================================================
 
-        pred_rot = (
-            self.rot_head(
-                rot_feature
-            )
+        pred_trans = self.trans_head(
+            trans_feature
         )
         # [M,3]
 
 
-        pred_trans = (
-            self.trans_head(
-                trans_feature
-            )
-        )
-        # [M,3]
-
+        # ============================================================
+        # 30. Final 6-DoF
+        # ============================================================
 
         pred_delta_6dof = torch.cat(
-
             [
                 pred_rot,
                 pred_trans,
             ],
-
             dim=-1,
+        )
+        # [M,6]
+
+
+        # ============================================================
+        # 27. No-valid-correspondence fallback
+        #
+        # If there is no real usable correspondence:
+        #
+        #     correction = identity / zero delta
+        #
+        # Do not let global Corr feature alone hallucinate a pose.
+        # ============================================================
+
+        has_valid_point = (
+            point_valid_mask
+            .any(
+                dim=1,
+                keepdim=True,
+            )
+        )
+
+
+        pred_delta_6dof = torch.where(
+            has_valid_point,
+            pred_delta_6dof,
+            torch.zeros_like(
+                pred_delta_6dof
+            ),
         )
 
 
         # ============================================================
-        # 16. Diagnostics
-        #
-        # Initially:
-        #
-        # Q=200
-        #
-        # weight_max ~= 0.005
-        # effective_k ~= 200
-        #
-        # As reliability learning becomes selective:
-        #
-        # max_weight increases
-        # effective_k decreases
-        #
+        # 28. Diagnostics
         # ============================================================
 
         with torch.no_grad():
 
+            valid_float = point_valid_mask.to(
+                dtype=rot_weight.dtype
+            )
+
+
+            valid_count_per_sample = (
+                valid_float
+                .sum(
+                    dim=1
+                )
+            )
+
+
+            valid_count = (
+                valid_count_per_sample
+                .mean()
+            )
+
+
+            valid_ratio = (
+                valid_float
+                .mean()
+            )
+
+
+            has_valid = (
+                valid_count_per_sample
+                > 0
+            )
+
+            rot_condition_input_norm = (
+                torch.linalg.vector_norm(
+                    rot_condition_input,
+                    dim=-1,
+                )
+                .mean()
+            )
+
+            pred_rot_norm_deg = (
+                torch.linalg.vector_norm(
+                    pred_rot.detach(),
+                    dim=-1,
+                )
+                .mean()
+                * (
+                    180.0
+                    / math.pi
+                )
+            )
+
+
+            # --------------------------------------------------------
+            # Reliability weight max
+            # --------------------------------------------------------
+
             rot_weight_max = (
-                rot_weights
+                rot_weight
                 .max(
                     dim=1
                 )
@@ -1247,7 +1889,7 @@ class CalibrationCorrectionHead(BaseModule):
 
 
             trans_weight_max = (
-                trans_weights
+                trans_weight
                 .max(
                     dim=1
                 )
@@ -1256,49 +1898,439 @@ class CalibrationCorrectionHead(BaseModule):
             )
 
 
+            # --------------------------------------------------------
+            # Effective correspondence count
+            #
+            # K_eff = 1 / sum(w_i^2)
+            # --------------------------------------------------------
+
             rot_effective_k = (
                 1.0
                 /
-                (
-                    rot_weights
-                    .squeeze(-1)
-                    .pow(2)
-                    .sum(
-                        dim=1
-                    )
-                    + 1e-8
+                rot_weight
+                .pow(2)
+                .sum(
+                    dim=1
                 )
-            ).mean()
+                .clamp_min(
+                    1e-8
+                )
+            )
 
 
             trans_effective_k = (
                 1.0
                 /
-                (
-                    trans_weights
-                    .squeeze(-1)
-                    .pow(2)
-                    .sum(
-                        dim=1
-                    )
-                    + 1e-8
+                trans_weight
+                .pow(2)
+                .sum(
+                    dim=1
                 )
-            ).mean()
+                .clamp_min(
+                    1e-8
+                )
+            )
 
+
+            if has_valid.any():
+
+                rot_effective_k_mean = (
+                    rot_effective_k[
+                        has_valid
+                    ]
+                    .mean()
+                )
+
+                trans_effective_k_mean = (
+                    trans_effective_k[
+                        has_valid
+                    ]
+                    .mean()
+                )
+
+            else:
+
+                rot_effective_k_mean = (
+                    rot_weight
+                    .new_tensor(0.0)
+                )
+
+                trans_effective_k_mean = (
+                    trans_weight
+                    .new_tensor(0.0)
+                )
+
+
+            # --------------------------------------------------------
+            # Final Z gate actually used
+            # --------------------------------------------------------
+
+            z_gate_scalar = (
+                z_gate
+                .squeeze(-1)
+            )
+
+
+            z_gate_sum = (
+                z_gate_scalar
+                * valid_float
+            ).sum(
+                dim=1
+            )
+
+
+            z_gate_mean_per_sample = (
+                z_gate_sum
+                /
+                valid_count_per_sample
+                .clamp_min(
+                    1.0
+                )
+            )
+
+
+            if has_valid.any():
+
+                z_gate_mean = (
+                    z_gate_mean_per_sample[
+                        has_valid
+                    ]
+                    .mean()
+                )
+
+            else:
+
+                z_gate_mean = (
+                    z_gate
+                    .new_tensor(0.0)
+                )
+
+
+            # --------------------------------------------------------
+            # Pure learned Z gate
+            #
+            # Excludes forced gate=0 / gate=1 cases.
+            # --------------------------------------------------------
+
+            learnable_gate_float = (
+                learnable_gate_mask
+                .to(
+                    dtype=z_gate_learned.dtype
+                )
+            )
+
+
+            learnable_gate_count_per_sample = (
+                learnable_gate_float
+                .sum(
+                    dim=1
+                )
+            )
+
+
+            learnable_gate_count = (
+                learnable_gate_count_per_sample
+                .mean()
+            )
+
+
+            learned_gate_sum = (
+                z_gate_learned
+                .squeeze(-1)
+                * learnable_gate_float
+            ).sum(
+                dim=1
+            )
+
+
+            learned_gate_mean_per_sample = (
+                learned_gate_sum
+                /
+                learnable_gate_count_per_sample
+                .clamp_min(
+                    1.0
+                )
+            )
+
+
+            has_learnable_gate = (
+                learnable_gate_count_per_sample
+                > 0
+            )
+
+
+            if has_learnable_gate.any():
+
+                z_gate_learned_mean = (
+                    learned_gate_mean_per_sample[
+                        has_learnable_gate
+                    ]
+                    .mean()
+                )
+
+            else:
+
+                z_gate_learned_mean = (
+                    z_gate_learned
+                    .new_tensor(0.0)
+                )
+            
+            # ============================================================
+            # Learned gate distribution diagnostics
+            #
+            # Mean alone is insufficient:
+            #
+            #   [0.2, 0.8] -> mean = 0.5
+            #
+            # Therefore measure:
+            #
+            #   std
+            #   mean absolute deviation from 0.5
+            # ============================================================
+
+            learned_gate_values = (
+                z_gate_learned
+                .squeeze(-1)[
+                    learnable_gate_mask
+                ]
+            )
+
+
+            if learned_gate_values.numel() > 0:
+
+                z_gate_learned_std = (
+                    learned_gate_values
+                    .std(
+                        unbiased=False
+                    )
+                )
+
+
+                z_gate_learned_absdev = (
+                    torch.abs(
+                        learned_gate_values
+                        - 0.5
+                    )
+                    .mean()
+                )
+
+
+                z_gate_low_frac = (
+                    (
+                        learned_gate_values
+                        < 0.4
+                    )
+                    .float()
+                    .mean()
+                )
+
+
+                z_gate_high_frac = (
+                    (
+                        learned_gate_values
+                        > 0.6
+                    )
+                    .float()
+                    .mean()
+                )
+
+
+            else:
+
+                z_gate_learned_std = (
+                    z_gate_learned
+                    .new_tensor(0.0)
+                )
+
+                z_gate_learned_absdev = (
+                    z_gate_learned
+                    .new_tensor(0.0)
+                )
+
+                z_gate_low_frac = (
+                    z_gate_learned
+                    .new_tensor(0.0)
+                )
+
+                z_gate_high_frac = (
+                    z_gate_learned
+                    .new_tensor(0.0)
+                )
+
+
+            # --------------------------------------------------------
+            # Raw Z vs Pred Z gap
+            # --------------------------------------------------------
+
+            z_gap_meter = (
+                torch.abs(
+                    z_pred - z_raw
+                )
+                .squeeze(-1)
+            )
+
+
+            z_gap_sum = (
+                z_gap_meter
+                * valid_float
+            ).sum(
+                dim=1
+            )
+
+
+            z_gap_mean_per_sample = (
+                z_gap_sum
+                /
+                valid_count_per_sample
+                .clamp_min(
+                    1.0
+                )
+            )
+
+
+            if has_valid.any():
+
+                z_gap_mean = (
+                    z_gap_mean_per_sample[
+                        has_valid
+                    ]
+                    .mean()
+                )
+
+            else:
+
+                z_gap_mean = (
+                    z_gap_meter
+                    .new_tensor(0.0)
+                )
+
+
+            # --------------------------------------------------------
+            # K-aware ray displacement diagnostic
+            # --------------------------------------------------------
+
+            ray_delta_norm = (
+                torch.linalg.vector_norm(
+                    ray_delta,
+                    dim=-1,
+                )
+            )
+
+
+            ray_delta_sum = (
+                ray_delta_norm
+                * valid_float
+            ).sum(
+                dim=1
+            )
+
+
+            ray_delta_mean_per_sample = (
+                ray_delta_sum
+                /
+                valid_count_per_sample
+                .clamp_min(
+                    1.0
+                )
+            )
+
+
+            if has_valid.any():
+
+                ray_delta_mean = (
+                    ray_delta_mean_per_sample[
+                        has_valid
+                    ]
+                    .mean()
+                )
+
+            else:
+
+                ray_delta_mean = (
+                    ray_delta_norm
+                    .new_tensor(0.0)
+                )
+
+
+        # ============================================================
+        # 29. Diagnostic dictionary
+        # ============================================================
 
         diagnostics = {
+
+            # --------------------------------------------------------
+            # Duplicate-mask diagnostics
+            # --------------------------------------------------------
+
+            'calib_valid_count':
+                valid_count,
+
+            'calib_valid_ratio':
+                valid_ratio,
+
+
+            # --------------------------------------------------------
+            # Adaptive Z diagnostics
+            # --------------------------------------------------------
+
+            'calib_z_gate_mean':
+                z_gate_mean,
+
+            'calib_z_gate_learned_mean':
+                z_gate_learned_mean,
+
+            'calib_z_gate_learnable_count':
+                learnable_gate_count,
+
+            'calib_z_pred_raw_gap_m':
+                z_gap_mean,
+            
+            'calib_z_gate_learned_std':
+                z_gate_learned_std,
+
+            'calib_z_gate_learned_absdev':
+                z_gate_learned_absdev,
+
+            'calib_z_gate_low_frac':
+                z_gate_low_frac,
+
+            'calib_z_gate_high_frac':
+                z_gate_high_frac,
+
+            # --------------------------------------------------------
+            # K-aware geometry diagnostic
+            # --------------------------------------------------------
+
+            'calib_ray_delta_mean':
+                ray_delta_mean,
+
+
+            # --------------------------------------------------------
+            # Rotation reliability
+            # --------------------------------------------------------
 
             'calib_rot_weight_max':
                 rot_weight_max,
 
+            'calib_rot_effective_k':
+                rot_effective_k_mean,
+            
+            'calib_rot_condition_norm':
+                rot_condition_input_norm,
+
+            'calib_pred_rot_norm_deg':
+                pred_rot_norm_deg,
+
+
+            # --------------------------------------------------------
+            # Translation reliability
+            # --------------------------------------------------------
+
             'calib_trans_weight_max':
                 trans_weight_max,
 
-            'calib_rot_effective_k':
-                rot_effective_k,
-
             'calib_trans_effective_k':
-                trans_effective_k,
+                trans_effective_k_mean,
         }
 
 
@@ -1306,6 +2338,3 @@ class CalibrationCorrectionHead(BaseModule):
             pred_delta_6dof,
             diagnostics,
         )
-
-
-
