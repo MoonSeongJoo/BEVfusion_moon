@@ -76,40 +76,6 @@ class COTR(BaseModule):
             else:
                 print_log('No checkpoint path in init_cfg for COTR.', logger='current', level='WARNING')
         
-    #     self.frozen = frozen
-    #     if self.frozen:
-    #         self.freeze()
-        
-    # def freeze(self):
-    #     """Freeze all parameters of the module and set to eval mode."""
-    #     # 모듈을 평가 모드(eval)로 설정합니다. (Dropout, BatchNorm 등에 영향)
-    #     self.eval()
-    #     # 모든 파라미터를 순회하며 그래디언트 계산을 비활성화합니다.
-    #     for param in self.parameters():
-    #         param.requires_grad = False
-    
-    # def forward(self, sbs_img , query_input):
-
-    #     for i in range(6) :
-    #         # multi camera batch cotr 필요
-    #         corrs_pred , enc_out = self.corr(sbs_img, query_input)
-
-    #         # # 최종 출력 직전 배치 정규화 적용 (3D → 2D 변환)
-    #         # B, N, C = corrs_pred.shape
-    #         # corrs_pred = self.final_bn(
-    #         #     corrs_pred.view(-1, C)  # (B*N, C) 형태로 평탄화
-    #         # ).view(B, N, C)  # 원래 차원 복원
-
-    #         img_reverse_input = torch.cat([sbs_img[..., 640:], sbs_img[..., :640]], axis=-1)
-    #         ##cyclic loss pre-processing
-    #         query_reverse = corrs_pred.clone()
-    #         query_reverse[..., 0] = query_reverse[..., 0] - 0.5
-    #         cycle,_ = self.corr(img_reverse_input, query_reverse)
-    #         cycle[..., 0] = cycle[..., 0] - 0.5
-    #         mask = torch.norm(cycle - query_input, dim=-1) < 30 / 640 # 40 pixel 거리에서는 마스크 
-
-    #     return corrs_pred , cycle , mask , enc_out
-
     def forward(self, sbs_img, query_input):
 
         corrs_pred, enc_out = self.corr(
@@ -176,27 +142,6 @@ class COTR(BaseModule):
             enc_out
         )
 
-# @MODELS.register_module()
-# class CorrelationCycleLoss(nn.Module):
-#     def __init__(self, corr_weight=1.0 , cycle_weight=1.0):
-#         super().__init__()
-#         self.corr_weight = corr_weight
-#         self.cycle_weight= cycle_weight
-
-#     def forward(self, corr_pred, corr_target, cycle, queries, mask):
-#         # corr_loss = torch.nn.functional.mse_loss(corr_pred, corr_target)
-#         # Smooth L1 Loss 사용
-#         corr_loss = torch.nn.functional.smooth_l1_loss(corr_pred, corr_target)
-#         cycle_loss = torch.tensor(0.0, device=corr_loss.device)
-        
-#         if mask.sum() > 0:
-#             # cycle_loss = torch.nn.functional.mse_loss(cycle[mask], queries[mask])
-#             cycle_loss = torch.nn.functional.smooth_l1_loss(cycle[mask], queries[mask])
-#             corr_loss += cycle_loss 
-
-#         # return self.loss_weight * corr_loss
-#         return self.corr_weight * corr_loss + self.cycle_weight * cycle_loss
-    
 @MODELS.register_module()
 class CorrelationCycleLoss(nn.Module):
 
@@ -204,11 +149,63 @@ class CorrelationCycleLoss(nn.Module):
         self,
         corr_weight=1.0,
         cycle_weight=0.1,
+
+        # NEW
+        image_width=1600.0,
+        image_height=900.0,
+        huber_beta_px=32.0,
     ):
         super().__init__()
 
         self.corr_weight = corr_weight
         self.cycle_weight = cycle_weight
+
+        # =========================================================
+        # NEW:
+        # Original image geometry
+        #
+        # SBS x:
+        #   x = 0.5 + u / (2 * W)
+        #
+        # y:
+        #   y = v / H
+        #
+        # Therefore:
+        #
+        #   dx_norm = du / (2W)
+        #   dy_norm = dv / H
+        #
+        # To make the loss isotropic in PIXEL space:
+        #
+        #   dx_balanced = dx_norm * (2W/H)
+        #               = du / H
+        #
+        #   dy_balanced = dy_norm
+        #               = dv / H
+        # =========================================================
+
+        self.image_width = float(
+            image_width
+        )
+
+        self.image_height = float(
+            image_height
+        )
+
+        self.huber_beta_px = float(
+            huber_beta_px
+        )
+
+        self.x_balance_scale = (
+            2.0
+            * self.image_width
+            / self.image_height
+        )
+
+        self.huber_beta_norm = (
+            self.huber_beta_px
+            / self.image_height
+        )
 
 
     def forward(
@@ -221,9 +218,9 @@ class CorrelationCycleLoss(nn.Module):
         corr_valid_mask=None,
     ):
 
-        # ---------------------------------------------------------
-        # Direct correspondence loss
-        # ---------------------------------------------------------
+        # =========================================================
+        # 1. Valid correspondence mask
+        # =========================================================
 
         if corr_valid_mask is None:
 
@@ -234,25 +231,99 @@ class CorrelationCycleLoss(nn.Module):
             )
 
 
+        # =========================================================
+        # 2. Direct correspondence loss
+        #
+        # OLD:
+        #
+        #   smooth_l1(corr_pred, corr_target)
+        #
+        # Problem:
+        #
+        #   x uses /3200
+        #   y uses /900
+        #
+        # so the same pixel error receives a different loss scale.
+        #
+        # NEW:
+        #
+        #   pixel-balanced Huber loss
+        # =========================================================
+
         if corr_valid_mask.any():
 
+            corr_error = (
+                corr_pred
+                - corr_target
+            )
+            # [B,Q,2]
+
+
+            # -----------------------------------------------------
+            # x error:
+            #
+            # normalized dx = du / 3200
+            #
+            # multiply by 3200 / 900
+            #
+            # -> du / 900
+            #
+            # y error already:
+            #
+            # -> dv / 900
+            # -----------------------------------------------------
+
+            corr_error_balanced = torch.stack(
+                [
+                    corr_error[..., 0]
+                    * self.x_balance_scale,
+
+                    corr_error[..., 1],
+                ],
+                dim=-1,
+            )
+
+
+            valid_error = (
+                corr_error_balanced[
+                    corr_valid_mask
+                ]
+            )
+
+
             corr_match_loss = F.smooth_l1_loss(
-                corr_pred[corr_valid_mask],
-                corr_target[corr_valid_mask],
+
+                valid_error,
+
+                torch.zeros_like(
+                    valid_error
+                ),
+
+                beta=
+                    self.huber_beta_norm,
+
                 reduction='mean',
             )
 
         else:
 
-            # Keep a valid autograd graph.
+            # Keep valid autograd graph
             corr_match_loss = (
-                corr_pred.sum() * 0.0
+                corr_pred.sum()
+                * 0.0
             )
 
 
-        # ---------------------------------------------------------
-        # Cycle consistency loss
-        # ---------------------------------------------------------
+        # =========================================================
+        # 3. Cycle consistency loss
+        #
+        # Current experiment:
+        # enable_cycle=False
+        #
+        # Therefore this normally remains zero.
+        #
+        # Keep existing behavior unchanged.
+        # =========================================================
 
         valid_cycle_mask = (
             cycle_mask
@@ -263,17 +334,26 @@ class CorrelationCycleLoss(nn.Module):
         if valid_cycle_mask.any():
 
             cycle_loss = F.smooth_l1_loss(
-                cycle[valid_cycle_mask],
-                queries[valid_cycle_mask],
+                cycle[
+                    valid_cycle_mask
+                ],
+                queries[
+                    valid_cycle_mask
+                ],
                 reduction='mean',
             )
 
         else:
 
             cycle_loss = (
-                cycle.sum() * 0.0
+                cycle.sum()
+                * 0.0
             )
 
+
+        # =========================================================
+        # 4. Total Corr loss
+        # =========================================================
 
         total_loss = (
             self.corr_weight
@@ -284,7 +364,6 @@ class CorrelationCycleLoss(nn.Module):
         )
 
 
-        # diagnostics are detached so they are not counted twice
         return (
             total_loss,
             corr_match_loss.detach(),
@@ -326,24 +405,6 @@ class PointDistanceLoss(nn.Module):
         
         # 평균 손실 계산
         return (min_a_to_b.mean() + min_b_to_a.mean()) / 2.0
-    
-    # def point_distance_loss(self, points_pred, points_gt):
-    #     """
-    #     1:1 대응 포인트 거리 손실 계산
-    #     - points_a와 points_b는 (N, 3) 형태이며 동일한 개수의 포인트를 가져야 함
-    #     - 각 포인트 쌍 간의 L2 거리 평균 계산
-    #     """
-    #     if points_pred.size(0) == 0 or points_gt.size(0) == 0:
-    #         print("point_distance_loss: 입력 포인트 클라우드가 비어 있음")
-    #         return torch.tensor(0.0, device=points_pred.device)
-         
-    #     assert points_pred.size() == points_gt.size(), "포인트 개수가 일치하지 않습니다"
-    #     point_clouds_loss = torch.tensor([0.0]).to(points_pred.device)
-    #     error = (points_pred - points_gt).norm(dim=0)
-    #     error.clamp(100.)
-    #     point_clouds_loss += error.mean()
-
-    #     return point_clouds_loss/points_pred.shape[0]
     
     def point_distance_loss(self, points_pred, points_gt):
         """

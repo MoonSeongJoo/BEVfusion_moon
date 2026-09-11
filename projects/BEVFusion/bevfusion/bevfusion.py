@@ -4265,6 +4265,12 @@ class BEVFusion(Base3DDetector):
                         )
                     )
 
+                    corr_supervision_mask = (
+                        corr_valid_mask
+                        &
+                        query_unique_mask_filtered
+                    )
+
                     if stage in {
                         'corr',
                         'joint',
@@ -4298,7 +4304,7 @@ class BEVFusion(Base3DDetector):
                                 corr_mask,
 
                             corr_valid_mask=
-                                corr_valid_mask,
+                                corr_supervision_mask,
                         )
 
 
@@ -4322,7 +4328,7 @@ class BEVFusion(Base3DDetector):
                         losses[
                             'corr_valid_ratio'
                         ] = (
-                            corr_valid_mask
+                            corr_supervision_mask
                             .float()
                             .mean()
                             .detach()
@@ -4501,7 +4507,7 @@ class BEVFusion(Base3DDetector):
 
                                 corr_epe_px = (
                                     corr_epe[
-                                        corr_valid_mask
+                                        corr_supervision_mask
                                     ]
                                     .mean()
                                 )
@@ -4509,7 +4515,7 @@ class BEVFusion(Base3DDetector):
 
                                 identity_epe_px = (
                                     identity_epe[
-                                        corr_valid_mask
+                                        corr_supervision_mask
                                     ]
                                     .mean()
                                 )
@@ -4530,7 +4536,65 @@ class BEVFusion(Base3DDetector):
                                     )
                                 )
 
+                        # ============================================================
+                        # Corr deterministic evaluation cache
+                        #
+                        # Diagnostic only.
+                        # Does NOT participate in training loss.
+                        # Only populated when model.eval() is active.
+                        # ============================================================
 
+                        if not self.training:
+
+                            if corr_supervision_mask.any():
+
+                                eval_mask = (
+                                    corr_supervision_mask
+                                )
+
+                                self._corr_eval_cache = {
+
+                                    'epe_px':
+                                        corr_epe[
+                                            eval_mask
+                                        ].detach().cpu(),
+
+                                    'identity_epe_px':
+                                        identity_epe[
+                                            eval_mask
+                                        ].detach().cpu(),
+
+                                    'u_abs_px':
+                                        torch.abs(
+                                            pred_u
+                                            - gt_u
+                                        )[
+                                            eval_mask
+                                        ].detach().cpu(),
+
+                                    'v_abs_px':
+                                        torch.abs(
+                                            pred_v
+                                            - gt_v
+                                        )[
+                                            eval_mask
+                                        ].detach().cpu(),
+
+                                }
+
+                            else:
+
+                                empty = torch.empty(
+                                    0,
+                                    dtype=torch.float32,
+                                )
+
+                                self._corr_eval_cache = {
+                                    'epe_px': empty,
+                                    'identity_epe_px': empty,
+                                    'u_abs_px': empty,
+                                    'v_abs_px': empty,
+                                }
                         # ====================================================
                         # G. Correspondence recovery ratio
                         #
@@ -4592,7 +4656,7 @@ class BEVFusion(Base3DDetector):
                         losses[
                             'corr_valid_count'
                         ] = (
-                            corr_valid_mask
+                            corr_supervision_mask
                             .float()
                             .sum()
                             .detach()
@@ -4602,7 +4666,7 @@ class BEVFusion(Base3DDetector):
                             'corr_total_count'
                         ] = torch.tensor(
                             float(
-                                corr_valid_mask.numel()
+                                corr_supervision_mask.numel()
                             ),
                             device=corr_valid_mask.device,
                         )
@@ -6836,6 +6900,25 @@ class BEVFusion(Base3DDetector):
                     ),
                     'geo_D_residual_rmse': float(
                         diag_d['residual_rmse'].mean().detach().cpu()
+                    ),
+                    'geo_D_common_mae_m': float(
+                        d_common_mae.detach().cpu()
+                    ),
+
+                    'geo_D_common_l2_m': float(
+                        d_common_l2.detach().cpu()
+                    ),
+
+                    'geo_D_common_valid_count': float(
+                        diag_d_common[
+                            'valid_count'
+                        ].float().mean().detach().cpu()
+                    ),
+
+                    'geo_D_common_residual_rmse': float(
+                        diag_d_common[
+                            'residual_rmse'
+                        ].mean().detach().cpu()
                     ),
                 }
 
