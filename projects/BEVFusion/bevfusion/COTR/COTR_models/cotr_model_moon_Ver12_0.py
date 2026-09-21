@@ -17,7 +17,7 @@ from .position_encoding_moon import NerfPositionalEncoding, MLP
 
 class COTR(nn.Module):
 
-    def __init__(self, backbone, transformer, sine_type='lin_sine'):
+    def __init__(self, backbone, transformer, sine_type='lin_sine',return_local_layer2=False,):
         super().__init__()
         self.transformer = transformer
         hidden_dim = transformer.d_model
@@ -27,15 +27,78 @@ class COTR(nn.Module):
         self.query_proj = NerfPositionalEncoding(hidden_dim // 4, sine_type) # uv points 대응할때 
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
+        self.return_local_layer2 = (
+            return_local_layer2
+        )
 
     def forward(self, samples: NestedTensor, queries):
 #         print ("sampels_shape" , samples.shape)
         # print ("queries_shape1" , queries.shape)
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
-        features, pos = self.backbone(samples)
+            features, pos = (
+                self.backbone(
+                    samples
+                )
+            )
 
-        src, mask = features[-1].decompose()
+            if self.return_local_layer2:
+
+                if len(features) != 2:
+
+                    raise RuntimeError(
+                        '[COTR] Expected layer2 + layer3 '
+                        f'but got {len(features)} features.'
+                    )
+
+
+                # ========================================================
+                # High-resolution local feature
+                #
+                # Expected:
+                # [B,512,24,160]
+                # ========================================================
+
+                local_feature = (
+                    features[0].tensors
+                )
+
+
+                # ========================================================
+                # ORIGINAL coarse COTR feature
+                #
+                # Expected:
+                # layer3 [B,1024,12,80]
+                # ========================================================
+
+                coarse_feature = (
+                    features[1]
+                )
+
+
+                coarse_pos = (
+                    pos[1]
+                )
+
+
+            else:
+
+                local_feature = None
+
+                coarse_feature = (
+                    features[-1]
+                )
+
+                coarse_pos = (
+                    pos[-1]
+                )
+
+
+            src, mask = (
+                coarse_feature.decompose()
+            )
+
+            assert mask is not None
         assert mask is not None
 
         _b, _q, _ = queries.shape
@@ -48,20 +111,38 @@ class COTR(nn.Module):
         # queries_clone = queries.clone().detach()
         queries_clone = queries.clone()
         tr_input= self.input_proj(src)
-        # hs  = self.transformer(tr_input, mask, queries, pos[-1])[0]
-        hs , enc_out = self.transformer(tr_input, mask, queries_clone, pos[-1])
+        hs, enc_out = self.transformer(
+            tr_input,
+            mask,
+            queries_clone,
+            coarse_pos,
+        )
         outputs_corr = self.corr_embed(hs)[-1]
         corr_out = outputs_corr
-        return corr_out , enc_out
-
+        return (
+            corr_out,
+            enc_out,
+            local_feature,
+        )
 
 def build(args):
     
     backbone = build_backbone(args)
     transformer = build_transformer(args)
     model = COTR(
+
         backbone,
+
         transformer,
-        sine_type=args.position_embedding,
+
+        sine_type=
+            args.position_embedding,
+
+        return_local_layer2=
+            getattr(
+                args,
+                'return_local_layer2',
+                False,
+            ),
     )
     return model

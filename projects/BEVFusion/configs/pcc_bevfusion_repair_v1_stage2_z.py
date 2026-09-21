@@ -161,7 +161,7 @@ default_hooks = dict(
 load_from = (
     'data/work_dirs/'
     'pcc_repair_v1_lgpc_zcalib_ddp2/'
-    'lgpc_corr_z_only_for_calib_v3.pth'
+    'epoch_4.pth'
 )
 
 resume = False

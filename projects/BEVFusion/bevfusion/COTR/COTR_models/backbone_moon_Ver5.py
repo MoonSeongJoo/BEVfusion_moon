@@ -58,17 +58,62 @@ class FrozenBatchNorm2d(torch.nn.Module):
 
 class BackboneBase(nn.Module):
 
-    def __init__(self, backbone: nn.Module, train_backbone: bool, num_channels: int, return_interm_layers: bool, layer='layer3'):
+    def __init__(
+        self,
+        backbone,
+        train_backbone,
+        num_channels,
+        return_interm_layers,
+        layer='layer3',
+        return_local_layer2=False,
+    ):
+
         super().__init__()
+
         for name, parameter in backbone.named_parameters():
-            if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
+
+            if (
+                not train_backbone
+                or (
+                    'layer2' not in name
+                    and 'layer3' not in name
+                    and 'layer4' not in name
+                )
+            ):
                 parameter.requires_grad_(False)
-                #print(f'freeze {name}')
-        if return_interm_layers:
-            return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+
+
+        if return_local_layer2:
+
+            # IMPORTANT:
+            # layer2 = local high-resolution feature
+            # layer3 = original COTR feature
+            return_layers = {
+                'layer2': '0',
+                'layer3': '1',
+            }
+
+        elif return_interm_layers:
+
+            return_layers = {
+                'layer1': '0',
+                'layer2': '1',
+                'layer3': '2',
+                'layer4': '3',
+            }
+
         else:
-            return_layers = {layer: "0"}
-        self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
+
+            return_layers = {
+                layer: '0'
+            }
+
+
+        self.body = IntermediateLayerGetter(
+            backbone,
+            return_layers=return_layers,
+        )
+
         self.num_channels = num_channels
 
     def forward_raw(self, x):
@@ -107,11 +152,12 @@ class Backbone(BackboneBase):
                  return_interm_layers: bool,
                  dilation: bool,
                  layer='layer3',
-                 num_channels=1024):
+                 num_channels=1024,
+                 return_local_layer2=False,):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             pretrained=True, norm_layer=FrozenBatchNorm2d)
-        super().__init__(backbone, train_backbone, num_channels, return_interm_layers, layer)
+        super().__init__(backbone, train_backbone, num_channels, return_interm_layers, layer, return_local_layer2,)
 
 
 class Joiner(nn.Sequential):
@@ -132,12 +178,65 @@ class Joiner(nn.Sequential):
 
 
 def build_backbone(args):
-    position_embedding = build_position_encoding(args)
-    if hasattr(args, 'lr_backbone'): # checking args object in 'lr_backbone' member
-        train_backbone = args.lr_backbone > 0
+
+    position_embedding = (
+        build_position_encoding(
+            args
+        )
+    )
+
+
+    if hasattr(
+        args,
+        'lr_backbone'
+    ):
+
+        train_backbone = (
+            args.lr_backbone > 0
+        )
+
     else:
+
         train_backbone = False
-    backbone = Backbone(args.backbone, train_backbone, False, args.dilation, layer=args.layer, num_channels=args.dim_feedforward)
-    model = Joiner(backbone, position_embedding)
-    model.num_channels = backbone.num_channels
+
+
+    return_local_layer2 = getattr(
+        args,
+        'return_local_layer2',
+        False,
+    )
+
+
+    backbone = Backbone(
+
+        args.backbone,
+
+        train_backbone,
+
+        False,
+
+        args.dilation,
+
+        layer=
+            args.layer,
+
+        num_channels=
+            args.dim_feedforward,
+
+        return_local_layer2=
+            return_local_layer2,
+    )
+
+
+    model = Joiner(
+        backbone,
+        position_embedding,
+    )
+
+
+    model.num_channels = (
+        backbone.num_channels
+    )
+
+
     return model

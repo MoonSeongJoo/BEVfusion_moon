@@ -12,6 +12,7 @@ from .utils import (BBoxBEVL1Cost, HeuristicAssigner3D, HungarianAssigner3D,
 from .my_collate import custom_collate
 from .custom_data_preprocessor import CustomDet3DDataPreprocessor
 from .cotr import COTR
+from .corr_refiner import LocalCorrRefinementHead
 from .zestimator import ZEstimator
 from .calib_head import CalibrationCorrectionHead
 
@@ -22,5 +23,5 @@ __all__ = [
     'BEVLoadMultiViewImageFromFiles', 'BEVFusionSparseEncoder',
     'TransformerDecoderLayer', 'BEVFusionRandomFlip3D',
     'BEVFusionGlobalRotScaleTrans' ,'custom_collate', 'CustomDet3DDataPreprocessor','COTR'
-    ,'ZEstimator' ,'CalibrationCorrectionHead'
+    ,'ZEstimator' ,'CalibrationCorrectionHead' ,'LocalCorrRefinementHead'
 ]

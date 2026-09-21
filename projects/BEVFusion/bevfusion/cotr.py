@@ -6,28 +6,42 @@ from .COTR.COTR_models.cotr_model_moon_Ver12_0 import build
 from mmdet3d.registry import MODELS
 from mmengine.model import BaseModule 
 from mmengine.runner import load_checkpoint 
-from mmengine import print_log             
+from mmengine import print_log
+from .corr_refiner import (
+    LocalCorrRefinementHead
+)             
 
 @MODELS.register_module()
 class COTR(BaseModule):
     # __init__ 시그니처를 cfg 파일로부터 파라미터를 받도록 수정합니다.
     def __init__(self,
-                 num_kp=200,
-                 max_corrs=1000,
-                 dim_feedforward=1024,
-                 backbone='resnet50',
-                 hidden_dim=312,
-                 dilation=False,
-                 dropout=0.1,
-                 nheads=8,
-                 layer='layer3',
-                 enc_layers=6,
-                 dec_layers=6,
-                 position_embedding='lin_sine',
-                 load_weights_freeze=False, # cfg에서 받을 수 있도록 추가
-                 enable_cycle=False,
+                num_kp=200,
+                max_corrs=1000,
+                dim_feedforward=1024,
+                backbone='resnet50',
+                hidden_dim=312,
+                dilation=False,
+                dropout=0.1,
+                nheads=8,
+                layer='layer3',
+                enc_layers=6,
+                dec_layers=6,
+                position_embedding='lin_sine',
+                load_weights_freeze=False, # cfg에서 받을 수 있도록 추가
+                enable_cycle=False,
                 #  frozen=False,  # <--- ✨ 1. frozen 인자를 추가합니다 (기본값 False).
-                 init_cfg=None): # mmdet3d의 표준 가중치 초기화를 위해 init_cfg를 받습니다.
+                # ============================================================
+                # Local Corr Refinement
+                # ============================================================
+                enable_local_refine=False,
+                local_refine_in_channels=512,
+                local_refine_proj_dim=64,
+                local_refine_hidden_dim=128,
+                local_refine_radius_px=64.0,
+                local_refine_grid_size=5,
+                local_refine_temperature=1.0,
+                local_refine_candidate_loss_weight=0.01,
+                init_cfg=None): # mmdet3d의 표준 가중치 초기화를 위해 init_cfg를 받습니다.
         # super() 호출 시 init_cfg를 전달해야 Pretrained 가중치 로딩이 동작합니다.
         super(COTR, self).__init__(init_cfg)
         self.num_kp = num_kp
@@ -35,6 +49,24 @@ class COTR(BaseModule):
         self.enable_cycle = (
             enable_cycle
         )
+        self.enable_local_refine = (
+            enable_local_refine
+        )
+
+        self.local_refine_candidate_loss_weight = float(
+            local_refine_candidate_loss_weight
+        )
+
+        if (
+            self.enable_cycle
+            and self.enable_local_refine
+        ):
+
+            raise ValueError(
+                'R2 pilot does not support '
+                'enable_cycle=True together with '
+                'enable_local_refine=True.'
+            )
 
         # __init__ 함수 내에서 build 함수에 전달할 설정 딕셔너리를 동적으로 생성합니다.
         cotr_config = {
@@ -50,6 +82,7 @@ class COTR(BaseModule):
             "dec_layers": dec_layers,
             "position_embedding": position_embedding,
             "load_weights_freeze": load_weights_freeze,
+            "return_local_layer2":self.enable_local_refine,
             # init_cfg를 통해 가중치 경로를 전달받습니다.
             "load_weights_path": self.init_cfg.get('checkpoint') if self.init_cfg else None,
             # 아래 파라미터들은 모델 빌드에 직접 필요하지 않을 수 있으나 호환성을 위해 유지
@@ -58,6 +91,48 @@ class COTR(BaseModule):
 
         ##### CORR network #######
         self.corr = build(easydict.EasyDict(cotr_config))
+
+        # ============================================================
+        # Local Corr Refinement Head
+        # ============================================================
+
+        if self.enable_local_refine:
+
+            self.local_refiner = (
+                LocalCorrRefinementHead(
+
+                    in_channels=
+                        local_refine_in_channels,
+
+                    proj_dim=
+                        local_refine_proj_dim,
+
+                    hidden_dim=
+                        local_refine_hidden_dim,
+
+                    radius_px=
+                        local_refine_radius_px,
+
+                    grid_size=
+                        local_refine_grid_size,
+
+                    image_width=
+                        1600.0,
+
+                    image_height=
+                        900.0,
+
+                    temperature=
+                        local_refine_temperature,
+                )
+            )
+
+        else:
+
+            self.local_refiner = None
+
+        # Logging-only cache.
+        self.last_refine_diag = None
 
         # --- ✨ 2. 가중치 수동 로드 로직 추가 ---
         if self.init_cfg and self.init_cfg['type'] == 'Pretrained':
@@ -76,16 +151,188 @@ class COTR(BaseModule):
             else:
                 print_log('No checkpoint path in init_cfg for COTR.', logger='current', level='WARNING')
         
-    def forward(self, sbs_img, query_input):
+    def forward(
+        self,
+        sbs_img,
+        query_input,
+    ):
 
-        corrs_pred, enc_out = self.corr(
-            sbs_img,
-            query_input
-        )
         # ============================================================
-        # Direct correspondence only
+        # 1. ORIGINAL COTR coarse correspondence
         #
-        # When cycle is disabled, avoid the SECOND Transformer forward.
+        # coarse_corr:
+        #     [B,Q,2]
+        #
+        # enc_out:
+        #     [B,312,12,80]
+        #
+        # local_feature:
+        #     None
+        #       or
+        #     [B,512,24,160]
+        # ============================================================
+
+        (
+            coarse_corr,
+            enc_out,
+            local_feature,
+        ) = self.corr(
+            sbs_img,
+            query_input,
+        )
+
+
+        # ============================================================
+        # 2. Optional Local Refinement
+        # ============================================================
+
+        if self.enable_local_refine:
+
+            if local_feature is None:
+
+                raise RuntimeError(
+                    '[LocalCorrRefine] '
+                    'enable_local_refine=True '
+                    'but local_feature is None.'
+                )
+
+
+            if (
+                local_feature.shape[1]
+                != 512
+            ):
+
+                raise RuntimeError(
+                    '[LocalCorrRefine] '
+                    'expected layer2 C=512, '
+                    f'actual={local_feature.shape}'
+                )
+
+
+            # ========================================================
+            # CRITICAL:
+            #
+            # detach BOTH inputs from original COTR.
+            #
+            # Local refinement loss must NEVER change:
+            #
+            # - ResNet backbone
+            # - COTR Transformer
+            # - coarse corr_embed
+            # - enc_out used by ZEstimator
+            # ========================================================
+
+            (
+                refined_corr,
+                refine_diag,
+                refine_train_aux,
+            ) = self.local_refiner(
+
+                local_feature=
+                    local_feature.detach(),
+
+                query_input=
+                    query_input.detach(),
+
+                coarse_corr=
+                    coarse_corr.detach(),
+            )
+
+
+            corrs_pred = (
+                refined_corr
+            )
+
+
+            # ============================================================
+            # Logging-only cache
+            #
+            # Everything here is detached.
+            # ============================================================
+
+            self.last_refine_diag = {
+
+                'coarse_corr':
+                    coarse_corr.detach(),
+
+                'delta_px':
+                    refine_diag[
+                        'delta_px'
+                    ],
+
+                'soft_offset_px':
+                    refine_diag[
+                        'soft_offset_px'
+                    ],
+
+                'baseline_offset_px':
+                    refine_diag[
+                        'baseline_offset_px'
+                    ],
+
+                'max_weight':
+                    refine_diag[
+                        'max_weight'
+                    ],
+
+                'candidate_valid_ratio':
+                    refine_diag[
+                        'candidate_valid_ratio'
+                    ],
+
+                'candidate_entropy_norm':
+                    refine_diag[
+                        'candidate_entropy_norm'
+                    ],
+            }
+
+
+            # ============================================================
+            # TRAINING auxiliary cache
+            #
+            # CRITICAL:
+            #
+            # score_logits retains gradient.
+            #
+            # BEVFusion will immediately consume this tensor to build:
+            #
+            #     loss_refine_candidate
+            # ============================================================
+
+            self.last_refine_train_aux = {
+
+                'score_logits':
+                    refine_train_aux[
+                        'score_logits'
+                    ],
+
+                'candidate_valid':
+                    refine_train_aux[
+                        'candidate_valid'
+                    ],
+
+                'candidate_offsets_px':
+                    refine_train_aux[
+                        'candidate_offsets_px'
+                    ],
+
+                'coarse_corr':
+                    coarse_corr.detach(),
+            }
+
+
+        else:
+
+            corrs_pred = (
+                coarse_corr
+            )
+
+            self.last_refine_diag = None
+            self.last_refine_train_aux = None
+
+
+        # ============================================================
+        # 3. Cycle OFF
         # ============================================================
 
         if not self.enable_cycle:
@@ -94,12 +341,23 @@ class COTR(BaseModule):
                 query_input
             )
 
+
             mask = torch.zeros(
+
                 query_input.shape[:-1],
+
                 dtype=torch.bool,
-                device=query_input.device,
+
+                device=
+                    query_input.device,
             )
 
+
+            # IMPORTANT:
+            #
+            # enc_out is ORIGINAL COTR enc_out.
+            #
+            # Local refiner NEVER modifies it.
             return (
                 corrs_pred,
                 cycle,
@@ -107,39 +365,78 @@ class COTR(BaseModule):
                 enc_out,
             )
 
+
+        # ============================================================
+        # Existing cycle path
+        #
+        # R2 pilot does not enter here.
+        # ============================================================
+
         img_reverse_input = torch.cat(
             [
-                sbs_img[..., 640:],
-                sbs_img[..., :640]
+                sbs_img[
+                    ...,
+                    640:
+                ],
+
+                sbs_img[
+                    ...,
+                    :640
+                ],
             ],
-            dim=-1
+            dim=-1,
         )
 
-        query_reverse = corrs_pred.clone()
-        query_reverse[..., 0] -= 0.5
 
-        cycle, _ = self.corr(
+        query_reverse = (
+            coarse_corr.clone()
+        )
+
+
+        query_reverse[
+            ...,
+            0
+        ] -= 0.5
+
+
+        (
+            cycle,
+            _,
+            _,
+        ) = self.corr(
             img_reverse_input,
-            query_reverse
+            query_reverse,
         )
 
-        # Do not modify network output in-place.
-        cycle_aligned = cycle.clone()
-        cycle_aligned[..., 0] -= 0.5
+
+        cycle_aligned = (
+            cycle.clone()
+        )
+
+
+        cycle_aligned[
+            ...,
+            0
+        ] -= 0.5
+
 
         mask = (
+
             torch.norm(
-                cycle_aligned - query_input,
-                dim=-1
+                cycle_aligned
+                - query_input,
+                dim=-1,
             )
+
             < 30 / 640
         )
+
 
         return (
             corrs_pred,
             cycle_aligned,
             mask,
-            enc_out
+            enc_out,
         )
 
 @MODELS.register_module()

@@ -239,6 +239,7 @@ class BEVFusion(Base3DDetector):
 
         valid_lgpc_train_stages = {
             'corr',
+            'corr_refine',
             'z',
             'calib',
             'z_calib',
@@ -509,6 +510,62 @@ class BEVFusion(Base3DDetector):
             train_corr,
         )
 
+        # ============================================================
+        # Corr Local Refinement stage
+        #
+        # Entire existing COTR:
+        #     FROZEN
+        #
+        # New LocalRefiner:
+        #     TRAIN
+        # ============================================================
+
+        if stage == 'corr_refine':
+
+            if (
+                not getattr(
+                    self.corr,
+                    'enable_local_refine',
+                    False,
+                )
+            ):
+
+                raise RuntimeError(
+                    'lgpc_train_stage="corr_refine" '
+                    'requires '
+                    'corr.enable_local_refine=True'
+                )
+
+
+            if self.corr.local_refiner is None:
+
+                raise RuntimeError(
+                    'LocalCorrRefiner was not built.'
+                )
+
+
+            # First freeze EVERYTHING in Corr wrapper.
+            for p in self.corr.parameters():
+
+                p.requires_grad = False
+
+
+            # Then enable ONLY LocalRefiner.
+            for p in (
+                self.corr
+                .local_refiner
+                .parameters()
+            ):
+
+                p.requires_grad = True
+
+
+            # Base COTR remains deterministic.
+            self.corr.eval()
+
+            # Only new head is train mode.
+            self.corr.local_refiner.train()
+
         self._set_lgpc_module_trainable(
             'z_estimator',
             train_z,
@@ -545,6 +602,16 @@ class BEVFusion(Base3DDetector):
             f'CalibHead   = '
             f'{"TRAIN" if train_calib else "FROZEN"}'
         )
+
+        if stage == 'corr_refine':
+
+            print(
+                'Base CorrNet = FROZEN'
+            )
+
+            print(
+                'LocalRefiner = TRAIN'
+            )
 
         print(
             '=========================================\n'
@@ -680,6 +747,32 @@ class BEVFusion(Base3DDetector):
             self.z_estimator.eval()
             self.calib_head.eval()
 
+        elif stage == 'corr_refine':
+
+            # ========================================================
+            # Base COTR deterministic
+            # ========================================================
+
+            self.corr.eval()
+
+
+            # ========================================================
+            # Only local residual head trains
+            # ========================================================
+
+            if self.corr.local_refiner is None:
+
+                raise RuntimeError(
+                    '[corr_refine] '
+                    'local_refiner is None.'
+                )
+
+            self.corr.local_refiner.train()
+
+            # Frozen downstream modules
+            self.z_estimator.eval()
+
+            self.calib_head.eval()
 
         elif stage == 'z':
 
@@ -4166,6 +4259,7 @@ class BEVFusion(Base3DDetector):
 
                 if stage in {
                     'corr',
+                    'corr_refine',
                     'joint',
                 }:
 
@@ -4238,6 +4332,7 @@ class BEVFusion(Base3DDetector):
 
                 if stage in {
                     'corr',
+                    'corr_refine',
                     'z',
                     'z_calib',   # <<< NEW
                     'joint',
@@ -4273,6 +4368,7 @@ class BEVFusion(Base3DDetector):
 
                     if stage in {
                         'corr',
+                        'corr_refine',
                         'joint',
                     }:
                         if self.corr_loss is None:
@@ -4333,6 +4429,571 @@ class BEVFusion(Base3DDetector):
                             .mean()
                             .detach()
                         )
+
+                        # ============================================================
+                        # R2.1:
+                        # Direct Local Candidate Supervision
+                        #
+                        # IMPORTANT:
+                        #
+                        # This block MUST stay outside torch.no_grad().
+                        #
+                        # score_logits must retain autograd graph.
+                        # ============================================================
+
+                        if stage == 'corr_refine':
+
+                            refine_train_aux = getattr(
+                                self.corr,
+                                'last_refine_train_aux',
+                                None,
+                            )
+
+
+                            if refine_train_aux is None:
+
+                                raise RuntimeError(
+                                    '[R2.1 corr_refine] '
+                                    'last_refine_train_aux is None.'
+                                )
+
+
+                            score_logits = (
+                                refine_train_aux[
+                                    'score_logits'
+                                ]
+                            )
+
+                            candidate_valid = (
+                                refine_train_aux[
+                                    'candidate_valid'
+                                ]
+                            )
+
+                            candidate_offsets_px = (
+                                refine_train_aux[
+                                    'candidate_offsets_px'
+                                ]
+                            )
+
+                            coarse_corr_for_refine = (
+                                refine_train_aux[
+                                    'coarse_corr'
+                                ]
+                            )
+
+
+                            # ========================================================
+                            # Shape:
+                            #
+                            # score_logits:
+                            #     [A,Q,K]
+                            #
+                            # candidate_valid:
+                            #     [A,Q,K]
+                            #
+                            # candidate_offsets_px:
+                            #     [K,2]
+                            # ========================================================
+
+                            A_refine, Q_refine, K_refine = (
+                                score_logits.shape
+                            )
+
+
+                            if K_refine != (
+                                candidate_offsets_px.shape[0]
+                            ):
+
+                                raise RuntimeError(
+                                    '[R2.1] candidate K mismatch: '
+                                    f'logits={K_refine}, '
+                                    f'offsets={candidate_offsets_px.shape[0]}'
+                                )
+
+
+                            # ========================================================
+                            # 1. Coarse Corr -> original pixels
+                            # ========================================================
+
+                            coarse_u_for_candidate = (
+
+                                (
+                                    coarse_corr_for_refine[
+                                        ...,
+                                        0
+                                    ]
+                                    - 0.5
+                                )
+
+                                * 2.0
+                                * 1600.0
+                            )
+
+
+                            coarse_v_for_candidate = (
+
+                                coarse_corr_for_refine[
+                                    ...,
+                                    1
+                                ]
+
+                                * 900.0
+                            )
+
+
+                            # ========================================================
+                            # 2. GT Corr -> original pixels
+                            # ========================================================
+
+                            gt_u_for_candidate = (
+
+                                (
+                                    corr_target_active[
+                                        ...,
+                                        0
+                                    ]
+                                    - 0.5
+                                )
+
+                                * 2.0
+                                * 1600.0
+                            )
+
+
+                            gt_v_for_candidate = (
+
+                                corr_target_active[
+                                    ...,
+                                    1
+                                ]
+
+                                * 900.0
+                            )
+
+
+                            # ========================================================
+                            # 3. GT residual from current coarse Corr
+                            #
+                            # Example:
+                            #
+                            # coarse:
+                            #     (500,300)
+                            #
+                            # GT:
+                            #     (532,268)
+                            #
+                            # GT residual:
+                            #     (+32,-32)
+                            # ========================================================
+
+                            gt_delta_u_px = (
+
+                                gt_u_for_candidate
+                                - coarse_u_for_candidate
+                            )
+
+
+                            gt_delta_v_px = (
+
+                                gt_v_for_candidate
+                                - coarse_v_for_candidate
+                            )
+
+
+                            gt_delta_px = torch.stack(
+
+                                [
+                                    gt_delta_u_px,
+                                    gt_delta_v_px,
+                                ],
+
+                                dim=-1,
+                            )
+
+                            # [A,Q,2]
+
+
+                            # ========================================================
+                            # 4. Only directly supervise candidates if GT is
+                            #    INSIDE the ±radius local search window.
+                            #
+                            # We do NOT force a +120px GT residual into the +64px
+                            # boundary class.
+                            # ========================================================
+
+                            refine_radius_px = float(
+                                self.corr.local_refiner.radius_px
+                            )
+
+
+                            gt_delta_finite = (
+                                torch.isfinite(
+                                    gt_delta_px
+                                ).all(
+                                    dim=-1
+                                )
+                            )
+
+
+                            gt_inside_local_window = (
+
+                                (
+                                    torch.abs(
+                                        gt_delta_u_px
+                                    )
+                                    <= refine_radius_px
+                                )
+
+                                &
+
+                                (
+                                    torch.abs(
+                                        gt_delta_v_px
+                                    )
+                                    <= refine_radius_px
+                                )
+                            )
+
+
+                            any_candidate_valid = (
+                                candidate_valid.any(
+                                    dim=-1
+                                )
+                            )
+
+
+                            candidate_supervision_mask = (
+
+                                corr_supervision_mask
+
+                                & gt_delta_finite
+
+                                & gt_inside_local_window
+
+                                & any_candidate_valid
+                            )
+
+
+                            # ========================================================
+                            # 5. Find nearest VALID local candidate
+                            # ========================================================
+
+                            offsets = (
+                                candidate_offsets_px
+                                .to(
+                                    device=gt_delta_px.device,
+                                    dtype=gt_delta_px.dtype,
+                                )
+                            )
+
+
+                            candidate_diff = (
+
+                                gt_delta_px.unsqueeze(2)
+
+                                -
+
+                                offsets.view(
+                                    1,
+                                    1,
+                                    K_refine,
+                                    2,
+                                )
+                            )
+
+
+                            candidate_dist2 = (
+
+                                candidate_diff ** 2
+
+                            ).sum(
+                                dim=-1
+                            )
+
+                            # [A,Q,K]
+
+
+                            candidate_dist2 = (
+                                candidate_dist2.masked_fill(
+                                    ~candidate_valid,
+                                    float('inf'),
+                                )
+                            )
+
+
+                            candidate_target_idx = (
+                                candidate_dist2.argmin(
+                                    dim=-1
+                                )
+                            )
+
+                            # [A,Q]
+
+
+                            # ========================================================
+                            # 6. Candidate classification loss
+                            # ========================================================
+
+                            if candidate_supervision_mask.any():
+
+                                candidate_ce_raw = F.cross_entropy(
+
+                                    score_logits[
+                                        candidate_supervision_mask
+                                    ],
+
+                                    candidate_target_idx[
+                                        candidate_supervision_mask
+                                    ],
+
+                                    reduction='mean',
+                                )
+
+
+                                # ----------------------------------------------------
+                                # Normalize:
+                                #
+                                # uniform 25-way CE:
+                                #
+                                # CE = log(25)
+                                #
+                                # normalized CE = 1.0
+                                # ----------------------------------------------------
+
+                                candidate_ce_norm = (
+
+                                    candidate_ce_raw
+
+                                    / math.log(
+                                        float(
+                                            K_refine
+                                        )
+                                    )
+                                )
+
+
+                                candidate_loss_weight = float(
+                                    getattr(
+                                        self.corr,
+                                        'local_refine_candidate_loss_weight',
+                                        0.01,
+                                    )
+                                )
+
+
+                                losses[
+                                    'loss_refine_candidate'
+                                ] = (
+
+                                    candidate_ce_norm
+
+                                    * candidate_loss_weight
+                                )
+
+
+                                # ====================================================
+                                # Candidate accuracy
+                                # ====================================================
+
+                                candidate_pred_idx = (
+
+                                    score_logits.argmax(
+                                        dim=-1
+                                    )
+                                )
+
+
+                                candidate_acc = (
+
+                                    (
+                                        candidate_pred_idx[
+                                            candidate_supervision_mask
+                                        ]
+
+                                        ==
+
+                                        candidate_target_idx[
+                                            candidate_supervision_mask
+                                        ]
+                                    )
+                                    .float()
+                                    .mean()
+                                )
+
+
+                                # ====================================================
+                                # Candidate quantization error
+                                #
+                                # How far is GT residual from its nearest 5x5 candidate?
+                                # ====================================================
+
+                                nearest_dist2 = (
+
+                                    candidate_dist2.gather(
+
+                                        dim=-1,
+
+                                        index=
+                                            candidate_target_idx
+                                            .unsqueeze(-1),
+
+                                    )
+                                    .squeeze(-1)
+                                )
+
+
+                                candidate_quant_error_px = (
+
+                                    torch.sqrt(
+                                        nearest_dist2[
+                                            candidate_supervision_mask
+                                        ].clamp_min(0.0)
+                                    )
+                                    .mean()
+                                )
+
+
+                            else:
+
+                                # ----------------------------------------------------
+                                # Keep valid graph even for empty candidate batch.
+                                # ----------------------------------------------------
+
+                                candidate_ce_raw = (
+                                    score_logits.sum()
+                                    * 0.0
+                                )
+
+
+                                candidate_ce_norm = (
+                                    candidate_ce_raw
+                                )
+
+
+                                losses[
+                                    'loss_refine_candidate'
+                                ] = (
+                                    candidate_ce_raw
+                                )
+
+
+                                candidate_acc = (
+                                    score_logits
+                                    .new_tensor(0.0)
+                                )
+
+
+                                candidate_quant_error_px = (
+                                    score_logits
+                                    .new_tensor(0.0)
+                                )
+
+
+                            # ========================================================
+                            # 7. Diagnostic ratios
+                            # ========================================================
+
+                            num_corr_supervised = (
+
+                                corr_supervision_mask
+                                .float()
+                                .sum()
+                            )
+
+
+                            num_inside_window = (
+
+                                (
+                                    corr_supervision_mask
+                                    & gt_inside_local_window
+                                )
+                                .float()
+                                .sum()
+                            )
+
+
+                            num_candidate_supervised = (
+
+                                candidate_supervision_mask
+                                .float()
+                                .sum()
+                            )
+
+
+                            refine_gt_in_window_ratio = (
+
+                                num_inside_window
+
+                                / num_corr_supervised.clamp_min(
+                                    1.0
+                                )
+                            )
+
+
+                            refine_candidate_supervision_ratio = (
+
+                                num_candidate_supervised
+
+                                / num_corr_supervised.clamp_min(
+                                    1.0
+                                )
+                            )
+
+
+                            # ========================================================
+                            # Logging only
+                            # ========================================================
+
+                            losses[
+                                'refine_candidate_ce_raw'
+                            ] = (
+                                candidate_ce_raw.detach()
+                            )
+
+
+                            losses[
+                                'refine_candidate_ce_norm'
+                            ] = (
+                                candidate_ce_norm.detach()
+                            )
+
+
+                            losses[
+                                'refine_candidate_acc'
+                            ] = (
+                                candidate_acc.detach()
+                            )
+
+
+                            losses[
+                                'refine_candidate_quant_error_px'
+                            ] = (
+                                candidate_quant_error_px.detach()
+                            )
+
+
+                            losses[
+                                'refine_gt_in_window_ratio'
+                            ] = (
+                                refine_gt_in_window_ratio.detach()
+                            )
+
+
+                            losses[
+                                'refine_candidate_supervision_ratio'
+                            ] = (
+                                refine_candidate_supervision_ratio.detach()
+                            )
+
+
+                            # ========================================================
+                            # Release module-side graph reference.
+                            #
+                            # losses now hold the graph needed for backward.
+                            # ========================================================
+
+                            self.corr.last_refine_train_aux = None
 
 
                         # ========================================================
@@ -4503,7 +5164,7 @@ class BEVFusion(Base3DDetector):
                             # Otherwise the comparison is not fair.
                             # ====================================================
 
-                            if corr_valid_mask.any():
+                            if corr_supervision_mask.any():
 
                                 corr_epe_px = (
                                     corr_epe[
@@ -4595,6 +5256,338 @@ class BEVFusion(Base3DDetector):
                                     'u_abs_px': empty,
                                     'v_abs_px': empty,
                                 }
+                        
+                        # ============================================================
+                        # Local Corr Refiner diagnostics
+                        # ============================================================
+
+                        if stage == 'corr_refine':
+
+                            refine_diag = getattr(
+                                self.corr,
+                                'last_refine_diag',
+                                None,
+                            )
+
+
+                            if refine_diag is None:
+
+                                raise RuntimeError(
+                                    '[corr_refine] '
+                                    'last_refine_diag is None.'
+                                )
+
+
+                            coarse_corr_diag = (
+                                refine_diag[
+                                    'coarse_corr'
+                                ]
+                            )
+
+
+                            # ========================================================
+                            # Coarse prediction -> original pixel
+                            # ========================================================
+
+                            coarse_u_px = (
+
+                                (
+                                    coarse_corr_diag[
+                                        ...,
+                                        0
+                                    ]
+                                    - 0.5
+                                )
+
+                                * 2.0
+                                * 1600.0
+                            )
+
+
+                            coarse_v_px = (
+
+                                coarse_corr_diag[
+                                    ...,
+                                    1
+                                ]
+
+                                * 900.0
+                            )
+
+
+                            # ========================================================
+                            # Coarse EPE
+                            # ========================================================
+
+                            coarse_epe = torch.sqrt(
+
+                                (
+                                    coarse_u_px
+                                    - gt_u
+                                ) ** 2
+
+                                +
+
+                                (
+                                    coarse_v_px
+                                    - gt_v
+                                ) ** 2
+                            )
+
+
+                            if corr_supervision_mask.any():
+
+                                coarse_corr_epe_px = (
+
+                                    coarse_epe[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+
+                                coarse_corr_u_mae_px = (
+
+                                    torch.abs(
+                                        coarse_u_px
+                                        - gt_u
+                                    )[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+
+                                coarse_corr_v_mae_px = (
+
+                                    torch.abs(
+                                        coarse_v_px
+                                        - gt_v
+                                    )[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+                                refined_corr_u_mae_px = (
+
+                                    torch.abs(
+                                        pred_u
+                                        - gt_u
+                                    )[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+                                refined_corr_v_mae_px = (
+
+                                    torch.abs(
+                                        pred_v
+                                        - gt_v
+                                    )[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+
+                                delta_px_diag = (
+                                    refine_diag[
+                                        'delta_px'
+                                    ]
+                                )
+
+
+                                refine_delta_mag_px = (
+
+                                    torch.linalg.vector_norm(
+                                        delta_px_diag,
+                                        dim=-1,
+                                    )[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+
+                                refine_delta_u_abs_px = (
+
+                                    torch.abs(
+                                        delta_px_diag[
+                                            ...,
+                                            0
+                                        ]
+                                    )[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+
+                                refine_delta_v_abs_px = (
+
+                                    torch.abs(
+                                        delta_px_diag[
+                                            ...,
+                                            1
+                                        ]
+                                    )[
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+
+                                refine_max_weight = (
+
+                                    refine_diag[
+                                        'max_weight'
+                                    ][
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+                                refine_candidate_entropy = (
+
+                                    refine_diag[
+                                        'candidate_entropy_norm'
+                                    ][
+                                        corr_supervision_mask
+                                    ]
+                                    .mean()
+                                )
+
+                            else:
+
+                                zero_diag = (
+                                    raw_corrs_active.sum()
+                                    * 0.0
+                                )
+
+
+                                coarse_corr_epe_px = (
+                                    zero_diag
+                                )
+
+                                coarse_corr_u_mae_px = (
+                                    zero_diag
+                                )
+
+                                coarse_corr_v_mae_px = (
+                                    zero_diag
+                                )
+
+                                refine_delta_mag_px = (
+                                    zero_diag
+                                )
+
+                                refine_delta_u_abs_px = (
+                                    zero_diag
+                                )
+
+                                refine_delta_v_abs_px = (
+                                    zero_diag
+                                )
+
+                                refine_max_weight = (
+                                    zero_diag
+                                )
+
+
+                            # ========================================================
+                            # Logging only
+                            #
+                            # IMPORTANT:
+                            # Do NOT put "loss" in these names.
+                            # ========================================================
+
+                            losses[
+                                'coarse_corr_epe_px'
+                            ] = (
+                                coarse_corr_epe_px.detach()
+                            )
+
+
+                            # Current corr_epe_px is refined output EPE.
+                            losses[
+                                'refined_corr_epe_px'
+                            ] = (
+                                corr_epe_px.detach()
+                            )
+
+
+                            losses[
+                                'refine_epe_gain_px'
+                            ] = (
+
+                                (
+                                    coarse_corr_epe_px
+                                    - corr_epe_px
+                                )
+                                .detach()
+                            )
+
+                            losses[
+                                'refined_corr_u_mae_px'
+                            ] = (
+                                refined_corr_u_mae_px.detach()
+                            )
+
+                            losses[
+                                'refined_corr_v_mae_px'
+                            ] = (
+                                refined_corr_v_mae_px.detach()
+                            )
+
+                            losses[
+                                'coarse_corr_u_mae_px'
+                            ] = (
+                                coarse_corr_u_mae_px.detach()
+                            )
+
+
+                            losses[
+                                'coarse_corr_v_mae_px'
+                            ] = (
+                                coarse_corr_v_mae_px.detach()
+                            )
+
+
+                            losses[
+                                'refine_delta_mag_px'
+                            ] = (
+                                refine_delta_mag_px.detach()
+                            )
+
+
+                            losses[
+                                'refine_delta_u_abs_px'
+                            ] = (
+                                refine_delta_u_abs_px.detach()
+                            )
+
+
+                            losses[
+                                'refine_delta_v_abs_px'
+                            ] = (
+                                refine_delta_v_abs_px.detach()
+                            )
+
+
+                            losses[
+                                'refine_max_weight'
+                            ] = (
+                                refine_max_weight.detach()
+                            )
+
+                            losses[
+                                'refine_candidate_entropy'
+                            ] = (
+                                refine_candidate_entropy.detach()
+                            )
+
                         # ====================================================
                         # G. Correspondence recovery ratio
                         #
@@ -4684,7 +5677,10 @@ class BEVFusion(Base3DDetector):
 
                 if (
                     self.is_lgpc_stage1
-                    and stage == 'corr'
+                    and stage in {
+                        'corr',
+                        'corr_refine',
+                    }
                 ):
 
                     return losses
