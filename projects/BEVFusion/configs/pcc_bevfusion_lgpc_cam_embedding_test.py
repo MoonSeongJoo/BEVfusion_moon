@@ -74,6 +74,11 @@ model = dict(
         # Must match the trained checkpoint.
         # ====================================================
         camera_pose_dim=16,
+        # ====================================================
+        # Z source ablation
+        # learned / raw_fallback / pred_only
+        # ====================================================
+        z_gate_mode='learned',
 
         init_cfg=None,
     ),

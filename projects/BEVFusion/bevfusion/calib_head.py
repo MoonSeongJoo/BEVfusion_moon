@@ -458,6 +458,20 @@ class CalibrationCorrectionHead(BaseModule):
         rot_condition_dim: int = 16,
         rot_condition_scale_deg: float = 10.0,
         camera_pose_dim: int = 16,
+        # ========================================================
+        # NEW: Z source ablation
+        #
+        # learned:
+        #   current adaptive gate
+        #
+        # raw_fallback:
+        #   raw Z if available,
+        #   otherwise ZEstimator prediction
+        #
+        # pred_only:
+        #   always ZEstimator prediction
+        # ========================================================
+        z_gate_mode: str = 'learned',
         init_cfg=None,
     ):
         super().__init__(
@@ -467,6 +481,26 @@ class CalibrationCorrectionHead(BaseModule):
         self.num_kp = num_kp
         self.in_channels = in_channels
         self.camera_pose_dim = camera_pose_dim
+
+        self.z_gate_mode = z_gate_mode
+
+        valid_z_gate_modes = {
+            'learned',
+            'raw_fallback',
+            'pred_only',
+        }
+
+        if self.z_gate_mode not in valid_z_gate_modes:
+            raise ValueError(
+                f'Unsupported z_gate_mode='
+                f'{self.z_gate_mode}. '
+                f'Valid={valid_z_gate_modes}'
+            )
+
+        print(
+            '[CalibrationCorrectionHead] '
+            f'z_gate_mode = {self.z_gate_mode}'
+        )
 
         self.rot_condition_dim = rot_condition_dim
         self.rot_condition_scale_rad = math.radians(
@@ -1390,11 +1424,6 @@ class CalibrationCorrectionHead(BaseModule):
         )
         # [M,Q,1]
 
-
-        # Actual working gate.
-        z_gate = z_gate_learned
-
-
         # ------------------------------------------------------------
         # Current Z reliability convention
         #
@@ -1428,23 +1457,110 @@ class CalibrationCorrectionHead(BaseModule):
             & neighbor_valid.squeeze(-1)
         )
 
+        # ============================================================
+        # Z SOURCE ABLATION
+        # ============================================================
 
-        # Raw depth unavailable:
-        # force ZEstimator prediction.
-        z_gate = torch.where(
-            ~center_valid,
-            torch.ones_like(z_gate),
-            z_gate,
-        )
+        if self.z_gate_mode == 'learned':
+
+            # --------------------------------------------------------
+            # A. CURRENT BASELINE
+            #
+            # Neural adaptive blend:
+            #
+            #   z_used =
+            #       (1-gate) * raw
+            #       + gate * pred
+            #
+            # Safety override:
+            #
+            # raw unavailable:
+            #     -> predicted Z
+            #
+            # neighborhood unavailable but raw exists:
+            #     -> raw Z
+            # --------------------------------------------------------
+
+            z_gate = z_gate_learned
 
 
-        # Neighborhood unavailable but raw exists:
-        # force raw Z.
-        z_gate = torch.where(
-            center_valid & ~neighbor_valid,
-            torch.zeros_like(z_gate),
-            z_gate,
-        )
+            # Raw Z unavailable
+            # => use ZEstimator prediction.
+            z_gate = torch.where(
+                ~center_valid,
+                torch.ones_like(
+                    z_gate
+                ),
+                z_gate,
+            )
+
+
+            # Raw exists but no neighborhood information
+            # => preserve raw LiDAR depth.
+            z_gate = torch.where(
+                (
+                    center_valid
+                    & ~neighbor_valid
+                ),
+                torch.zeros_like(
+                    z_gate
+                ),
+                z_gate,
+            )
+
+
+        elif self.z_gate_mode == 'raw_fallback':
+
+            # --------------------------------------------------------
+            # B. RAW-FIRST / PRED-FALLBACK
+            #
+            # raw valid:
+            #     gate = 0 -> RAW Z
+            #
+            # raw invalid:
+            #     gate = 1 -> PRED Z
+            #
+            # NOTE:
+            # neighborhood validity does NOT matter here.
+            # --------------------------------------------------------
+
+            z_gate = torch.where(
+                center_valid,
+
+                torch.zeros_like(
+                    z_gate_learned
+                ),
+
+                torch.ones_like(
+                    z_gate_learned
+                ),
+            )
+
+
+        elif self.z_gate_mode == 'pred_only':
+
+            # --------------------------------------------------------
+            # C. PREDICTED-Z ONLY
+            #
+            # Always use ZEstimator output.
+            #
+            # gate = 1
+            # --------------------------------------------------------
+
+            z_gate = torch.ones_like(
+                z_gate_learned
+            )
+
+
+        else:
+
+            # Should already be caught in __init__,
+            # but keep runtime guard.
+            raise RuntimeError(
+                f'Unknown z_gate_mode: '
+                f'{self.z_gate_mode}'
+            )
+ 
 
 
         # ============================================================
@@ -2528,7 +2644,46 @@ class CalibrationCorrectionHead(BaseModule):
                     ray_delta_norm
                     .new_tensor(0.0)
                 )
+            
+            # ============================================================
+            # Z gate mode verification
+            # ============================================================
 
+            valid_mask_float = (
+                point_valid_mask
+                .float()
+            )
+
+            valid_count_for_source = (
+                valid_mask_float
+                .sum()
+                .clamp_min(1.0)
+            )
+
+
+            z_used_pred_fraction = (
+                (
+                    z_gate.squeeze(-1)
+                    * valid_mask_float
+                )
+                .sum()
+                /
+                valid_count_for_source
+            )
+
+
+            z_used_raw_fraction = (
+                (
+                    (
+                        1.0
+                        - z_gate.squeeze(-1)
+                    )
+                    * valid_mask_float
+                )
+                .sum()
+                /
+                valid_count_for_source
+            )
 
         # ============================================================
         # 29. Diagnostic dictionary
@@ -2609,6 +2764,12 @@ class CalibrationCorrectionHead(BaseModule):
 
             'calib_trans_effective_k':
                 trans_effective_k_mean,
+
+            'calib_z_used_raw_fraction':
+                z_used_raw_fraction,
+
+            'calib_z_used_pred_fraction':
+                z_used_pred_fraction,
         }
 
 
