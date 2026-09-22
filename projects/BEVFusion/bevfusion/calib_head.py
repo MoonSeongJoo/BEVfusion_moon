@@ -252,6 +252,144 @@ def correct_camera_proposals(det_xyz_norm, pred_delta_rot, pred_delta_trans, pc_
 
     return det_xyz_corrected_norm
 
+def correct_camera_proposals_per_camera(
+    det_xyz_norm,
+    pred_delta_rot,
+    pred_delta_trans,
+    pc_range_tensor,
+):
+    """
+    Camera-aware Stage-2 correction.
+
+    Args
+    ----
+    det_xyz_norm:
+        [B, N_cam * Q, 3]
+
+    pred_delta_rot:
+        [B, N_cam, 3]
+
+    pred_delta_trans:
+        [B, N_cam, 3]
+
+    Returns
+    -------
+    corrected:
+        [B, N_cam * Q, 3]
+    """
+
+    B, N_total, _ = det_xyz_norm.shape
+
+    B2, N_cam, _ = pred_delta_rot.shape
+
+    if B != B2:
+        raise RuntimeError(
+            f'Batch mismatch: xyz={B}, rot={B2}'
+        )
+
+    if N_total % N_cam != 0:
+        raise RuntimeError(
+            f'N_total={N_total} is not divisible '
+            f'by N_cam={N_cam}'
+        )
+
+    Q = N_total // N_cam
+
+
+    # ============================================================
+    # 1. Restore camera dimension
+    # ============================================================
+
+    det_xyz_cam = det_xyz_norm.reshape(
+        B,
+        N_cam,
+        Q,
+        3,
+    )
+
+
+    # ============================================================
+    # 2. [0,1] -> metric LiDAR coordinate
+    # ============================================================
+
+    pc_range_tensor = pc_range_tensor.to(
+        device=det_xyz_norm.device,
+        dtype=det_xyz_norm.dtype,
+    )
+
+    pc_min = pc_range_tensor[:3]
+    pc_max = pc_range_tensor[3:]
+
+    pc_dims = pc_max - pc_min
+
+
+    det_xyz_metric = (
+        det_xyz_cam
+        * pc_dims.view(1, 1, 1, 3)
+        + pc_min.view(1, 1, 1, 3)
+    )
+
+
+    # ============================================================
+    # 3. Stage-2 error transform
+    #
+    # Delta2 = [R2, t2]
+    #
+    # We need:
+    #
+    # X_corrected = inv(Delta2) X
+    #
+    #             = R2^T (X - t2)
+    # ============================================================
+
+    R2 = axis_angle_to_matrix(
+        pred_delta_rot
+    )
+    # [B,Ncam,3,3]
+
+
+    R2_inv = R2.transpose(
+        -1,
+        -2,
+    )
+
+
+    centered = (
+        det_xyz_metric
+        - pred_delta_trans.unsqueeze(2)
+    )
+
+
+    corrected_metric = torch.einsum(
+        'bcij,bcqj->bcqi',
+        R2_inv,
+        centered,
+    )
+
+
+    # ============================================================
+    # 4. metric -> normalized
+    # ============================================================
+
+    corrected_norm = (
+        corrected_metric
+        - pc_min.view(1, 1, 1, 3)
+    ) / pc_dims.view(1, 1, 1, 3)
+
+
+    # Keep existing downstream assumption.
+    corrected_norm = corrected_norm.clamp(
+        0.0,
+        1.0,
+    )
+
+
+    return corrected_norm.reshape(
+        B,
+        N_total,
+        3,
+    )
+
 @MODELS.register_module()
 class CalibrationCorrectionHead(BaseModule):
     """
@@ -319,6 +457,7 @@ class CalibrationCorrectionHead(BaseModule):
         # NEW
         rot_condition_dim: int = 16,
         rot_condition_scale_deg: float = 10.0,
+        camera_pose_dim: int = 16,
         init_cfg=None,
     ):
         super().__init__(
@@ -327,7 +466,7 @@ class CalibrationCorrectionHead(BaseModule):
 
         self.num_kp = num_kp
         self.in_channels = in_channels
-
+        self.camera_pose_dim = camera_pose_dim
 
         self.rot_condition_dim = rot_condition_dim
         self.rot_condition_scale_rad = math.radians(
@@ -395,6 +534,45 @@ class CalibrationCorrectionHead(BaseModule):
             nn.Mish(),
         )
 
+        # ============================================================
+        # NEW: Camera-pose conditioning
+        #
+        # Input:
+        #     first two columns of camera-to-LiDAR rotation
+        #     -> continuous 6D rotation representation
+        #
+        # 6D -> 32D -> 16D
+        #
+        # Purpose:
+        #     tell the shared CalibHead which camera orientation
+        #     the current correspondence set belongs to.
+        # ============================================================
+
+        self.camera_pose_encoder = nn.Sequential(
+
+            nn.Linear(
+                6,
+                32,
+            ),
+
+            nn.LayerNorm(
+                32,
+            ),
+
+            nn.Mish(),
+
+
+            nn.Linear(
+                32,
+                camera_pose_dim,
+            ),
+
+            nn.LayerNorm(
+                camera_pose_dim,
+            ),
+
+            nn.Mish(),
+        )
 
         # ============================================================
         # 3. Per-point input
@@ -437,8 +615,8 @@ class CalibrationCorrectionHead(BaseModule):
             + self.z_reliability_dim    # 4
             + 1                         # adaptive Z gate
             + local_dim * 3             # 96
+            + self.camera_pose_dim
         )
-
 
         # ============================================================
         # 4. Shared per-point encoder
@@ -574,6 +752,7 @@ class CalibrationCorrectionHead(BaseModule):
         pose_input_dim = (
             point_dim
             + global_dim
+            + self.camera_pose_dim
         )
 
 
@@ -617,7 +796,7 @@ class CalibrationCorrectionHead(BaseModule):
             pose_input_dim
             + self.rot_condition_dim
         )
-        # 128 + 16 = 144
+        # 144 + 16 = 160
 
         self.trans_head = nn.Sequential(
 
@@ -894,6 +1073,7 @@ class CalibrationCorrectionHead(BaseModule):
         z_reliability: torch.Tensor,
         z_raw: torch.Tensor,
         camera_intrinsics: torch.Tensor,
+        camera2lidar_context: torch.Tensor,
         point_valid_mask: torch.Tensor,
     ):
         """
@@ -1058,6 +1238,41 @@ class CalibrationCorrectionHead(BaseModule):
                 '[CalibHead V2] '
                 'point_valid_mask must be [M,Q], '
                 f'got {point_valid_mask.shape}'
+            )
+        
+        # ============================================================
+        # Camera-pose context guard
+        # ============================================================
+
+        if camera2lidar_context.ndim != 3:
+
+            raise RuntimeError(
+                '[CalibHead V3] '
+                'camera2lidar_context must be [M,4,4], '
+                f'got {camera2lidar_context.shape}'
+            )
+
+
+        if camera2lidar_context.shape[0] != M:
+
+            raise RuntimeError(
+                '[CalibHead V3] '
+                'camera-pose batch mismatch: '
+                f'pose={camera2lidar_context.shape}, '
+                f'corr={corrs_pred_3d.shape}'
+            )
+
+
+        if (
+            camera2lidar_context.shape[-2] < 3
+            or camera2lidar_context.shape[-1] < 3
+        ):
+
+            raise RuntimeError(
+                '[CalibHead V3] '
+                'camera2lidar_context must contain '
+                'a valid 3x3 rotation matrix, '
+                f'got {camera2lidar_context.shape}'
             )
 
 
@@ -1338,6 +1553,54 @@ class CalibrationCorrectionHead(BaseModule):
             .reshape(M, 1, 1)
         )
 
+        # ============================================================
+        # NEW: Camera orientation representation
+        #
+        # camera2lidar_context:
+        #     [M,4,4]
+        #
+        # R_cam2lidar:
+        #     [M,3,3]
+        #
+        # 6D representation:
+        #     first two rotation columns
+        #
+        #     [r1_x, r1_y, r1_z,
+        #      r2_x, r2_y, r2_z]
+        #
+        # This preserves orientation continuously and avoids
+        # Euler-angle discontinuity.
+        # ============================================================
+
+        R_cam2lidar = (
+            camera2lidar_context[
+                ...,
+                :3,
+                :3,
+            ]
+            .to(
+                device=corrs_pred_3d.device,
+                dtype=corrs_pred_3d.dtype,
+            )
+        )
+
+
+        camera_rot_6d = torch.cat(
+            [
+                R_cam2lidar[..., :, 0],
+                R_cam2lidar[..., :, 1],
+            ],
+            dim=-1,
+        )
+        # [M,6]
+
+
+        camera_pose_feature = (
+            self.camera_pose_encoder(
+                camera_rot_6d
+            )
+        )
+        # [M,16]
 
         # ============================================================
         # 9. Original normalized image coordinates -> pixels
@@ -1530,6 +1793,17 @@ class CalibrationCorrectionHead(BaseModule):
         # Total                           116
         # ============================================================
 
+        camera_pose_per_point = (
+            camera_pose_feature
+            .unsqueeze(1)
+            .expand(
+                -1,
+                Q,
+                -1,
+            )
+        )
+        # [M,Q,16]
+
         point_input = torch.cat(
             [
                 geom_feature,            # 7
@@ -1542,6 +1816,7 @@ class CalibrationCorrectionHead(BaseModule):
                 z_gate,                  # 1
 
                 local_match_feature,     # 96
+                camera_pose_per_point,      # 16
             ],
             dim=-1,
         )
@@ -1549,10 +1824,12 @@ class CalibrationCorrectionHead(BaseModule):
 
 
         # Hard guard while V2 is being validated.
-        if point_input.shape[-1] != 116:
+        if point_input.shape[-1] != 132:
+
             raise RuntimeError(
-                '[CalibHead V2] '
-                'K-aware point descriptor must be 116D, '
+                '[CalibHead V3] '
+                'camera-conditioned point descriptor '
+                'must be 132D, '
                 f'got {point_input.shape}'
             )
 
@@ -1635,7 +1912,6 @@ class CalibrationCorrectionHead(BaseModule):
         )
         # [M,64]
 
-
         # ============================================================
         # 24. Rotation prediction FIRST
         # ============================================================
@@ -1644,6 +1920,7 @@ class CalibrationCorrectionHead(BaseModule):
             [
                 rot_set_feature,
                 global_feature,
+                camera_pose_feature,      # 16
             ],
             dim=-1,
         )
@@ -1758,6 +2035,7 @@ class CalibrationCorrectionHead(BaseModule):
             [
                 trans_set_feature,
                 global_feature,
+                camera_pose_feature,      # 16
                 rot_condition,
             ],
             dim=-1,

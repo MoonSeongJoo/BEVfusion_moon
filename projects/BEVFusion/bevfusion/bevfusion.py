@@ -244,6 +244,10 @@ class BEVFusion(Base3DDetector):
             'calib',
             'z_calib',
             'joint',
+            'rrrf',
+            'rrrf_v2_geo',   # V2 SE(3) geometry training
+            'rrrf_v2',       # V2 SE(3) + refined attention
+            'rrrf_full',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -252,7 +256,18 @@ class BEVFusion(Base3DDetector):
                 f'Unknown lgpc_train_stage='
                 f'{self.lgpc_train_stage}'
             )
+        
+        self.rrrf_training_stages = {
+            'rrrf',
+            'rrrf_v2_geo',
+            'rrrf_v2',
+            'rrrf_full',
+        }
 
+        self.is_rrrf_training_stage = (
+            self.lgpc_train_stage
+            in self.rrrf_training_stages
+        )
 
         print(
             '[BEVFusion] LGPC train stage = '
@@ -275,7 +290,7 @@ class BEVFusion(Base3DDetector):
         self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
 
         # ============================================================
-        # Configure LGPC Stage-1 after ALL modules are constructed.
+        # Configure training stage after ALL modules are constructed.
         # ============================================================
 
         if self.is_lgpc_stage1:
@@ -284,11 +299,55 @@ class BEVFusion(Base3DDetector):
 
                 raise RuntimeError(
                     'LGPC Stage-1 must use '
-                    'enable_selective_freezing=False. '
-                    'Legacy _freeze_modules() freezes CorrNet.'
+                    'enable_selective_freezing=False.'
                 )
 
             self._configure_lgpc_substage()
+
+
+        # ============================================================
+        # NEW:
+        # RRRF / RRRF V2 training configuration
+        # ============================================================
+
+        elif self.is_rrrf_training_stage:
+
+            if enable_selective_freezing:
+
+                raise RuntimeError(
+                    'RRRF training must use '
+                    'enable_selective_freezing=False. '
+                    'Dedicated RRRF freeze policy is used.'
+                )
+
+            rrrf_mode = getattr(
+                self.bbox_head,
+                'rrrf_mode',
+                None,
+            )
+
+
+            # --------------------------------------------------------
+            # V2 stages must use V2 head.
+            # --------------------------------------------------------
+
+            if self.lgpc_train_stage in {
+                'rrrf_v2_geo',
+                'rrrf_v2',
+                'rrrf_full',
+            }:
+
+                if rrrf_mode != 'residual_se3_v2':
+
+                    raise RuntimeError(
+                        'RRRF V2 training requires '
+                        'bbox_head.rrrf_mode='
+                        '"residual_se3_v2". '
+                        f'Current={rrrf_mode}'
+                    )
+
+
+            self._configure_rrrf_stage()
 
         # =====================================================================
         # ✨ START: Code added for selective module freezing
@@ -326,7 +385,7 @@ class BEVFusion(Base3DDetector):
         self.training_step = 0
         # self.pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
         self.pc_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
-
+    
     def _build_calib_z_reliability(
         self,
         z_output,
@@ -659,7 +718,376 @@ class BEVFusion(Base3DDetector):
         else:
 
             module.eval()
-    
+
+    def _configure_rrrf_stage(self):
+        """
+        Configure trainability for RRRF / RRRF V2 stages.
+
+        rrrf_v2_geo:
+            LGPC            FROZEN
+            BEVFusion       FROZEN
+            coarse fusion   TRAIN
+            V2 residual SE3 TRAIN
+            refined fusion  FROZEN
+
+        rrrf_v2:
+            LGPC            FROZEN
+            BEVFusion       FROZEN
+            coarse fusion   TRAIN
+            V2 residual SE3 TRAIN
+            refined fusion  TRAIN
+
+        rrrf_full:
+            LGPC            FROZEN
+            2D detector     FROZEN
+            V2 RRRF         TRAIN
+            BEVFusion       TRAIN
+        """
+
+        stage = self.lgpc_train_stage
+
+
+        # ============================================================
+        # Helper
+        # ============================================================
+
+        def freeze(module):
+
+            if module is None:
+                return
+
+            for p in module.parameters():
+                p.requires_grad = False
+
+            module.eval()
+
+
+        def trainable(module):
+
+            if module is None:
+                return
+
+            for p in module.parameters():
+                p.requires_grad = True
+
+            module.train()
+
+
+        # ============================================================
+        # 1. Always fixed:
+        # pretrained 2D query generator
+        # ============================================================
+
+        for module in [
+            self.img_backbone,
+            self.img_neck,
+            self.img_bbox_head,
+        ]:
+
+            freeze(module)
+
+
+        # ============================================================
+        # 2. Always fixed:
+        # completed Stage-1 LGPC
+        # ============================================================
+
+        for module in [
+            self.corr,
+            self.z_estimator,
+            self.calib_head,
+        ]:
+
+            freeze(module)
+
+
+        # ============================================================
+        # 3. First freeze entire downstream PCC/BEVFusion
+        #
+        # We selectively reopen only what each stage needs.
+        # ============================================================
+
+        for module in [
+
+            self.pts_voxel_encoder,
+            self.pts_middle_encoder,
+            self.pts_backbone,
+            self.pts_neck,
+
+            self.view_transform,
+            self.fusion_layer,
+
+            self.bbox_head,
+            self.feat_projector,
+
+        ]:
+
+            freeze(module)
+
+
+        # ============================================================
+        # 4. Common RRRF front-end
+        #
+        # Camera feature projector
+        # +
+        # Stage-1 coarse cross attention
+        # ============================================================
+
+        trainable(
+            self.feat_projector
+        )
+
+
+        coarse_rrrf_modules = [
+
+            self.bbox_head.fusion_cross_attention,
+            self.bbox_head.fusion_ffn,
+            self.bbox_head.fusion_norm1,
+            self.bbox_head.fusion_norm2,
+
+            self.bbox_head.camera_proposal_pos_embedding,
+            self.bbox_head.bev_query_pos_embedding,
+        ]
+
+
+        for module in coarse_rrrf_modules:
+
+            trainable(module)
+
+
+        # ============================================================
+        # 5. RRRF V2 residual SE(3) branch
+        # ============================================================
+
+        if stage in {
+            'rrrf_v2_geo',
+            'rrrf_v2',
+            'rrrf_full',
+        }:
+
+            required_v2_modules = [
+
+                'residual_cam_attention_v2',
+                'residual_cam_norm_v2',
+
+                'residual_cam_pos_embedding_v2',
+                'residual_query_pos_embedding_v2',
+
+                'residual_stage1_pose_embedding_v2',
+                'residual_camera_id_embedding_v2',
+
+                'residual_calibration_predictor_v2',
+            ]
+
+
+            for name in required_v2_modules:
+
+                module = getattr(
+                    self.bbox_head,
+                    name,
+                    None,
+                )
+
+                if module is None:
+
+                    raise RuntimeError(
+                        '[RRRF V2] Missing module: '
+                        f'bbox_head.{name}'
+                    )
+
+                trainable(module)
+
+
+        # ============================================================
+        # 6. Legacy V1 residual predictor
+        #
+        # Only used if legacy stage='rrrf'.
+        # ============================================================
+
+        elif stage == 'rrrf':
+
+            if (
+                getattr(
+                    self.bbox_head,
+                    'rrrf_mode',
+                    None,
+                )
+                == 'residual_se3'
+            ):
+
+                trainable(
+                    self.bbox_head.calibration_predictor
+                )
+
+
+        # ============================================================
+        # 7. Refined fusion
+        #
+        # NOT enabled in geometry-only stage.
+        # ============================================================
+
+        if stage in {
+            'rrrf_v2',
+            'rrrf_full',
+            'rrrf',
+        }:
+
+            refined_modules = [
+
+                self.bbox_head.refined_attention,
+                self.bbox_head.refined_ffn,
+                self.bbox_head.refined_norm1,
+                self.bbox_head.refined_norm2,
+
+                self.bbox_head.refined_fusion_aux_head,
+            ]
+
+
+            for module in refined_modules:
+
+                trainable(module)
+
+
+        # ============================================================
+        # 8. Full downstream BEVFusion fine-tuning
+        # ============================================================
+
+        if stage == 'rrrf_full':
+
+            for module in [
+
+                self.pts_voxel_encoder,
+                self.pts_middle_encoder,
+                self.pts_backbone,
+                self.pts_neck,
+
+                self.view_transform,
+                self.fusion_layer,
+
+            ]:
+
+                trainable(module)
+
+
+            # Full detection head needs to train.
+            #
+            # NOTE:
+            # this re-enables every bbox_head parameter.
+            trainable(
+                self.bbox_head
+            )
+
+
+            # --------------------------------------------------------
+            # But legacy V1 residual predictor must remain frozen
+            # when V2 is active.
+            # --------------------------------------------------------
+
+            if (
+                getattr(
+                    self.bbox_head,
+                    'rrrf_mode',
+                    None,
+                )
+                == 'residual_se3_v2'
+            ):
+
+                legacy_predictor = getattr(
+                    self.bbox_head,
+                    'calibration_predictor',
+                    None,
+                )
+
+                freeze(
+                    legacy_predictor
+                )
+
+
+        # ============================================================
+        # 9. Debug print
+        # ============================================================
+
+        print(
+            '\n'
+            '=========================================\n'
+            '[RRRF TRAINING CONFIG]\n'
+            '========================================='
+        )
+
+        print(
+            f'stage = {stage}'
+        )
+
+        debug_modules = [
+
+            ('img_backbone',
+            self.img_backbone),
+
+            ('img_neck',
+            self.img_neck),
+
+            ('img_bbox_head',
+            self.img_bbox_head),
+
+            ('corr',
+            self.corr),
+
+            ('z_estimator',
+            self.z_estimator),
+
+            ('calib_head',
+            self.calib_head),
+
+            ('pts_middle_encoder',
+            self.pts_middle_encoder),
+
+            ('pts_backbone',
+            self.pts_backbone),
+
+            ('pts_neck',
+            self.pts_neck),
+
+            ('view_transform',
+            self.view_transform),
+
+            ('fusion_layer',
+            self.fusion_layer),
+
+            ('bbox_head',
+            self.bbox_head),
+
+            ('feat_projector',
+            self.feat_projector),
+        ]
+
+
+        for name, module in debug_modules:
+
+            if module is None:
+                continue
+
+            total = sum(
+                p.numel()
+                for p in module.parameters()
+            )
+
+            n_trainable = sum(
+                p.numel()
+                for p in module.parameters()
+                if p.requires_grad
+            )
+
+            print(
+                f'{name:<24}'
+                f'{n_trainable:>12,d} / '
+                f'{total:>12,d}'
+            )
+
+
+        print(
+            '=========================================\n'
+        )
+        
     def train(self, mode: bool = True):
         """
         Override nn.Module.train() so that LGPC staged training
@@ -680,6 +1108,307 @@ class BEVFusion(Base3DDetector):
         # Nothing else is needed.
         # ------------------------------------------------------------
         if not mode:
+            return self
+        
+        # ============================================================
+        # RRRF / RRRF V2 train/eval mode restoration
+        #
+        # MMEngine calls model.train() every epoch.
+        # Frozen modules must be explicitly restored to eval().
+        # ============================================================
+
+        if getattr(
+            self,
+            'is_rrrf_training_stage',
+            False,
+        ):
+
+            stage = self.lgpc_train_stage
+
+
+            # --------------------------------------------------------
+            # Always frozen
+            # --------------------------------------------------------
+
+            for module in [
+
+                self.img_backbone,
+                self.img_neck,
+                self.img_bbox_head,
+
+                self.corr,
+                self.z_estimator,
+                self.calib_head,
+
+            ]:
+
+                if module is not None:
+
+                    module.eval()
+
+
+            # --------------------------------------------------------
+            # BEVFusion body is frozen except full stage.
+            # --------------------------------------------------------
+
+            if stage != 'rrrf_full':
+
+                for module in [
+
+                    self.pts_voxel_encoder,
+                    self.pts_middle_encoder,
+                    self.pts_backbone,
+                    self.pts_neck,
+
+                    self.view_transform,
+                    self.fusion_layer,
+
+                ]:
+
+                    if module is not None:
+
+                        module.eval()
+
+
+            # --------------------------------------------------------
+            # bbox_head:
+            # first set frozen parent mode.
+            #
+            # Submodules needed below are then restored to train().
+            # --------------------------------------------------------
+
+            if stage != 'rrrf_full':
+
+                self.bbox_head.eval()
+
+
+            # ========================================================
+            # Coarse RRRF
+            # ========================================================
+
+            self.feat_projector.train()
+
+
+            for module in [
+
+                self.bbox_head.fusion_cross_attention,
+                self.bbox_head.fusion_ffn,
+                self.bbox_head.fusion_norm1,
+                self.bbox_head.fusion_norm2,
+
+                self.bbox_head.camera_proposal_pos_embedding,
+                self.bbox_head.bev_query_pos_embedding,
+
+            ]:
+
+                module.train()
+
+
+            # ========================================================
+            # V2 geometry branch
+            # ========================================================
+
+            if stage in {
+                'rrrf_v2_geo',
+                'rrrf_v2',
+                'rrrf_full',
+            }:
+
+                for name in [
+
+                    'residual_cam_attention_v2',
+                    'residual_cam_norm_v2',
+
+                    'residual_cam_pos_embedding_v2',
+                    'residual_query_pos_embedding_v2',
+
+                    'residual_stage1_pose_embedding_v2',
+                    'residual_camera_id_embedding_v2',
+
+                    'residual_calibration_predictor_v2',
+
+                ]:
+
+                    module = getattr(
+                        self.bbox_head,
+                        name
+                    )
+
+                    module.train()
+
+
+            # ========================================================
+            # Refined fusion
+            # ========================================================
+
+            if stage in {
+                'rrrf',
+                'rrrf_v2',
+                'rrrf_full',
+            }:
+
+                for module in [
+
+                    self.bbox_head.refined_attention,
+                    self.bbox_head.refined_ffn,
+                    self.bbox_head.refined_norm1,
+                    self.bbox_head.refined_norm2,
+
+                    self.bbox_head.refined_fusion_aux_head,
+
+                ]:
+
+                    module.train()
+
+
+            # ========================================================
+            # Full downstream
+            # ========================================================
+
+            if stage == 'rrrf_full':
+
+                for module in [
+
+                    self.pts_voxel_encoder,
+                    self.pts_middle_encoder,
+                    self.pts_backbone,
+                    self.pts_neck,
+
+                    self.view_transform,
+                    self.fusion_layer,
+
+                ]:
+
+                    if module is not None:
+                        module.train()
+
+
+                self.bbox_head.train()
+
+
+                # Legacy V1 residual predictor stays frozen/eval.
+                if (
+                    getattr(
+                        self.bbox_head,
+                        'rrrf_mode',
+                        None,
+                    )
+                    == 'residual_se3_v2'
+                ):
+
+                    legacy_predictor = getattr(
+                        self.bbox_head,
+                        'calibration_predictor',
+                        None,
+                    )
+
+                    if legacy_predictor is not None:
+
+                        legacy_predictor.eval()
+
+
+            return self
+
+        # ------------------------------------------------------------
+        # RRRF training
+        # ------------------------------------------------------------
+
+        if self.lgpc_train_stage in {
+            'rrrf',
+            'rrrf_full',
+        }:
+
+            # ========================================================
+            # Always fixed
+            # ========================================================
+
+            for module in [
+                self.img_backbone,
+                self.img_neck,
+                self.img_bbox_head,
+
+                self.corr,
+                self.z_estimator,
+                self.calib_head,
+            ]:
+
+                if module is not None:
+                    module.eval()
+
+
+            # ========================================================
+            # RRRF-only warm-up
+            # ========================================================
+
+            if self.lgpc_train_stage == 'rrrf':
+
+                # First keep full bbox head frozen/eval.
+                self.bbox_head.eval()
+
+                for module in [
+                    self.pts_voxel_encoder,
+                    self.pts_middle_encoder,
+                    self.pts_backbone,
+                    self.pts_neck,
+                    self.view_transform,
+                    self.fusion_layer,
+                ]:
+
+                    if module is not None:
+                        module.eval()
+
+
+                # ----------------------------------------------------
+                # But RRRF submodules must stay train mode.
+                # ----------------------------------------------------
+
+                self.feat_projector.train()
+
+                for module in [
+
+                    self.bbox_head.fusion_cross_attention,
+                    self.bbox_head.fusion_ffn,
+                    self.bbox_head.fusion_norm1,
+                    self.bbox_head.fusion_norm2,
+
+                    self.bbox_head.camera_proposal_pos_embedding,
+                    self.bbox_head.bev_query_pos_embedding,
+
+                    self.bbox_head.refined_attention,
+                    self.bbox_head.refined_ffn,
+                    self.bbox_head.refined_norm1,
+                    self.bbox_head.refined_norm2,
+
+                    self.bbox_head.refined_fusion_aux_head,
+
+                ]:
+
+                    module.train()
+                
+                # ========================================================
+                # Legacy Stage-2 SE(3) only
+                # ========================================================
+
+                if (
+                    getattr(
+                        self.bbox_head,
+                        'rrrf_mode',
+                        None,
+                    )
+                    == 'residual_se3'
+                ):
+
+                    self.bbox_head.calibration_predictor.train()
+
+
+            # ========================================================
+            # RRRF full
+            #
+            # super().train(True) already set the downstream modules
+            # to train mode. Only fixed modules above are restored
+            # to eval mode.
+            # ========================================================
+
             return self
 
         # ------------------------------------------------------------
@@ -820,7 +1549,7 @@ class BEVFusion(Base3DDetector):
 
 
         return self
-    
+        
     def _freeze_stage1_2d_detector(self):
         """
         Stage-1 LGPC training:
@@ -1897,7 +2626,15 @@ class BEVFusion(Base3DDetector):
             # 3. 설정에 따라 Ground Truth로 2D 탐지 결과를 보강
             # if self.train_cfg.get('complement_2d_gt', -1) > 0:
             # self.training 조건을 추가하여 학습 모드일 때만 이 블록이 실행되도록 합니다.
-            if self.training and not self.is_lgpc_stage1 and self.train_cfg.get('complement_2d_gt', -1) > 0:
+            if (
+                self.training
+                and not self.is_lgpc_stage1
+                and not self.is_rrrf_training_stage
+                and self.train_cfg.get(
+                    'complement_2d_gt',
+                    -1
+                ) > 0
+            ):
                 gt_bboxes_list = [sample.gt_instances.bboxes for sample in reshaped_data_samples]
                 gt_labels_list = [sample.gt_instances.labels for sample in reshaped_data_samples]
                 
@@ -3900,7 +4637,6 @@ class BEVFusion(Base3DDetector):
                 = inv(Delta_pred) @ T_broken
         """
         corrected_camera2lidar = torch.matmul(correction_matrix,broken_camera2lidar)
-        
         # --- 3. 행렬 추출 및 역변환 ---
         # T_Cam->Lidar (corrected_camera2lidar) 에서 R, t 추출
         corrected_camera2lidar_rots = corrected_camera2lidar[..., :3, :3]
@@ -3940,6 +4676,51 @@ class BEVFusion(Base3DDetector):
         
             target_device = batch_inputs_dict['imgs'].device
             batch_input_metas = [item.metainfo for item in batch_data_samples]
+
+            # ============================================================
+            # DEBUG:
+            # Check frozen Stage-1 module mode during RRRF training.
+            #
+            # IMPORTANT:
+            # requires_grad=False is NOT enough.
+            #
+            # During RRRF:
+            #   CorrNet
+            #   ZEstimator
+            #   CalibHead
+            #   2D detector
+            #
+            # must also remain in eval() mode.
+            # ============================================================
+
+            if (
+                self.is_rrrf_training_stage
+                and not hasattr(
+                    self,
+                    '_rrrf_mode_check_done'
+                )
+            ):
+
+                print(
+                    '\n'
+                    '=========================================\n'
+                    '[RRRF FROZEN MODULE MODE CHECK]\n'
+                    f'img_backbone.training = '
+                    f'{self.img_backbone.training}\n'
+                    f'img_neck.training     = '
+                    f'{self.img_neck.training}\n'
+                    f'img_bbox_head.training= '
+                    f'{self.img_bbox_head.training}\n'
+                    f'corr.training         = '
+                    f'{self.corr.training}\n'
+                    f'z_estimator.training  = '
+                    f'{self.z_estimator.training}\n'
+                    f'calib_head.training   = '
+                    f'{self.calib_head.training}\n'
+                    '=========================================\n'
+                )
+
+                self._rrrf_mode_check_done = True
             # batch_data_samples에서 직접 Calibration 관련 텐서를 가져옵니다.
             broken_camera2lidar = torch.stack([s.broken_camera2lidar for s in batch_data_samples]).to(target_device)
             broken_camera_intrinsics = torch.stack([s.broken_camera_intrinsics for s in batch_data_samples]).to(target_device)
@@ -3956,7 +4737,10 @@ class BEVFusion(Base3DDetector):
             #   no gradient through 2D detector
             # ============================================================
 
-            if self.is_lgpc_stage1:
+            if (
+                self.is_lgpc_stage1
+                or self.is_rrrf_training_stage
+            ):
 
                 with torch.no_grad():
 
@@ -3999,16 +4783,20 @@ class BEVFusion(Base3DDetector):
             losses = dict()
 
             # ============================================================
-            # 2D detector
+            # 2D Detector Loss
             #
-            # Stage-1 LGPC:
-            #   pretrained 2D detector is used ONLY to generate
-            #   object-center queries.
+            # LGPC / RRRF training:
+            #   2D detector is used only as a fixed query generator.
+            #   Do NOT optimize the 2D detector.
             #
-            #   Do NOT optimize it.
+            # Other full-joint stages:
+            #   2D detector loss may be enabled.
             # ============================================================
 
-            if not self.is_lgpc_stage1:
+            if (
+                not self.is_lgpc_stage1
+                and not self.is_rrrf_training_stage
+            ):
 
                 if self.img_bbox_head is not None:
 
@@ -4022,6 +4810,7 @@ class BEVFusion(Base3DDetector):
                         losses[
                             f'img_{k}'
                         ] = v
+
 
             detections_2d = self._generate_and_process_2d_dets(
                 reshaped_img_feats, 
@@ -4229,6 +5018,23 @@ class BEVFusion(Base3DDetector):
                         active_cam_indices,
                     ]
                 )
+
+                # ============================================================
+                # NEW: runtime-safe camera-pose conditioning
+                #
+                # IMPORTANT:
+                # Use BROKEN/current extrinsic, not clean GT extrinsic.
+                #
+                # Shape:
+                #     [NumActive,4,4]
+                # ============================================================
+
+                camera2lidar_context_active = (
+                    broken_camera2lidar[
+                        0,
+                        active_cam_indices,
+                    ]
+                )
                 
                 # ============================================================
                 # LGPC internal training stage
@@ -4241,10 +5047,7 @@ class BEVFusion(Base3DDetector):
                 # Non-Stage1 PCC always behaves as joint.
                 # ============================================================
 
-                if self.is_lgpc_stage1:
-                    stage = self.lgpc_train_stage
-                else:
-                    stage = 'joint'
+                stage = self.lgpc_train_stage
 
 
                 # ============================================================
@@ -6680,35 +7483,39 @@ class BEVFusion(Base3DDetector):
                 # ============================================================
                 # 13. CalibHead V1
                 # ============================================================
-                (
-                    pred_delta_6dof_active,
-                    calib_diag,
-                ) = self.calib_head(
+                if self.is_rrrf_training_stage:
 
-                    enc_out=
-                        enc_out_active_4d,
+                    with torch.no_grad():
 
-                    query_input=
-                        query_input_filtered,
+                        (
+                            pred_delta_6dof_active,
+                            calib_diag,
+                        ) = self.calib_head(
+                            enc_out=enc_out_active_4d,
+                            query_input=query_input_filtered,
+                            corrs_pred_3d=corrs_3d_active,
+                            z_reliability=z_reliability_active,
+                            z_raw=z_raw_for_calib,
+                            camera_intrinsics=camera_intrinsics_active,
+                            camera2lidar_context=(camera2lidar_context_active),
+                            point_valid_mask=calib_point_valid_mask,
+                        )
 
-                    corrs_pred_3d=
-                        corrs_3d_active,
+                else:
 
-                    z_reliability=
-                        z_reliability_active,
-
-                    # NEW: Adaptive Z Gate
-                    z_raw=
-                        z_raw_for_calib,
-
-                    # NEW: K-aware geometry
-                    camera_intrinsics=
-                        camera_intrinsics_active,
-
-                    # Duplicate / invalid Corr exclusion
-                    point_valid_mask=
-                        calib_point_valid_mask,
-                )
+                    (
+                        pred_delta_6dof_active,
+                        calib_diag,
+                    ) = self.calib_head(
+                        enc_out=enc_out_active_4d,
+                        query_input=query_input_filtered,
+                        corrs_pred_3d=corrs_3d_active,
+                        z_reliability=z_reliability_active,
+                        z_raw=z_raw_for_calib,
+                        camera_intrinsics=camera_intrinsics_active,
+                        camera2lidar_context=(camera2lidar_context_active),
+                        point_valid_mask=calib_point_valid_mask,
+                    )
 
                 # ============================================================
                 # 14. CalibHead diagnostics
@@ -6823,27 +7630,28 @@ class BEVFusion(Base3DDetector):
                 # calib / joint only reach this point.
                 # ============================================================
 
-                losses[
-                    'loss_calib_rot'
-                ] = (
-                    identity_matrix_loss(
-                        R_pred_calib,
-                        R_gt_calib,
-                    )
-                    * 100.0
-                )
+                if stage in {
+                    'calib',
+                    'z_calib',
+                    'joint',
+                }:
 
-
-                losses[
-                    'loss_calib_trans'
-                ] = (
-                    F.smooth_l1_loss(
-                        pred_trans_filtered,
-                        gt_trans_filtered,
-                        reduction='mean',
+                    losses['loss_calib_rot'] = (
+                        identity_matrix_loss(
+                            R_pred_calib,
+                            R_gt_calib,
+                        )
+                        * 100.0
                     )
-                    * 50.0
-                )
+
+                    losses['loss_calib_trans'] = (
+                        F.smooth_l1_loss(
+                            pred_trans_filtered,
+                            gt_trans_filtered,
+                            reduction='mean',
+                        )
+                        * 25.0
+                    )
 
                 # ============================================================
                 # Physical Calib diagnostics
@@ -7056,6 +7864,405 @@ class BEVFusion(Base3DDetector):
                                     batch_input_metas=batch_input_metas,
                                     corrected_calib=corrected_calib_dict,
                                     precomputed_img_feats=img_feats)
+            
+            stage1_active_cam_mask = torch.zeros(
+                (
+                    B,
+                    N,
+                ),
+                dtype=torch.bool,
+                device=target_device,
+            )
+
+            stage1_active_cam_mask[
+                :,
+                active_cam_indices,
+            ] = True
+
+            # ============================================================
+            # DEBUG:
+            # Same-batch Stage-1 consistency check
+            #
+            # Compare:
+            #
+            # A) parameter-space:
+            #       Delta1_pred vs Delta_GT
+            #
+            # B) physical-space:
+            #       inv(Delta1_pred) @ T_broken
+            #       vs
+            #       T_clean
+            #
+            # These rotation errors should be almost identical
+            # if convention / camera ordering is correct.
+            # ============================================================
+
+            if (
+                self.is_rrrf_training_stage
+                and not hasattr(
+                    self,
+                    '_rrrf_s1_consistency_debug_count'
+                )
+            ):
+                self._rrrf_s1_consistency_debug_count = 0
+
+
+            if (
+                self.is_rrrf_training_stage
+                and self._rrrf_s1_consistency_debug_count < 20
+            ):
+
+                with torch.no_grad():
+
+                    # ====================================================
+                    # 1. PARAMETER-SPACE Stage1 error
+                    #
+                    # pred_delta_rot:
+                    #     [B, Ncam, 3]
+                    #
+                    # gt_delta_rot:
+                    #     [B, Ncam, 3]
+                    # ====================================================
+
+                    R_pred1 = axis_angle_to_matrix(
+                        pred_delta_rot
+                    )
+
+                    R_gt = axis_angle_to_matrix(
+                        gt_delta_rot
+                    )
+
+                    # ============================================================
+                    # 0. BROKEN baseline on the SAME batch
+                    #
+                    # GT delta itself represents:
+                    #
+                    #     T_broken = Delta_GT @ T_clean
+                    #
+                    # Therefore "no correction" prediction is Identity.
+                    # ============================================================
+
+                    B_dbg, N_dbg = gt_delta_rot.shape[:2]
+
+                    R_identity = torch.eye(
+                        3,
+                        device=target_device,
+                        dtype=R_gt.dtype,
+                    ).view(
+                        1, 1, 3, 3
+                    ).expand(
+                        B_dbg,
+                        N_dbg,
+                        3,
+                        3,
+                    )
+
+
+                    R_broken_err = (
+                        R_identity.transpose(-1, -2)
+                        @ R_gt
+                    )
+
+
+                    trace_broken = (
+                        R_broken_err[..., 0, 0]
+                        + R_broken_err[..., 1, 1]
+                        + R_broken_err[..., 2, 2]
+                    )
+
+
+                    cos_broken = (
+                        (trace_broken - 1.0)
+                        * 0.5
+                    ).clamp(
+                        -1.0,
+                        1.0,
+                    )
+
+
+                    broken_rot_deg = torch.rad2deg(
+                        torch.acos(
+                            cos_broken
+                        )
+                    )
+
+
+                    broken_trans_m = torch.linalg.norm(
+                        gt_delta_trans,
+                        dim=-1,
+                    )
+
+
+                    # relative rotation:
+                    #
+                    # R_pred^T @ R_gt
+                    R_param_err = (
+                        R_pred1.transpose(
+                            -1,
+                            -2
+                        )
+                        @ R_gt
+                    )
+
+
+                    trace_param = (
+                        R_param_err[..., 0, 0]
+                        + R_param_err[..., 1, 1]
+                        + R_param_err[..., 2, 2]
+                    )
+
+
+                    cos_param = (
+                        (trace_param - 1.0)
+                        * 0.5
+                    ).clamp(
+                        -1.0,
+                        1.0
+                    )
+
+
+                    param_rot_deg = torch.rad2deg(
+                        torch.acos(
+                            cos_param
+                        )
+                    )
+                    # [B,Ncam]
+
+
+                    param_trans_m = torch.linalg.norm(
+                        pred_delta_trans
+                        - gt_delta_trans,
+                        dim=-1,
+                    )
+                    # [B,Ncam]
+
+
+                    # ====================================================
+                    # 2. PHYSICAL Stage1 error
+                    #
+                    # corrected_calib_dict was produced by:
+                    #
+                    # inv(Delta1_pred) @ T_broken
+                    # ====================================================
+
+                    T_stage1 = corrected_calib_dict[
+                        'cam2lidar'
+                    ]
+                    # [B,Ncam,4,4]
+
+
+                    T_clean = original_camera2lidar
+                    # [B,Ncam,4,4]
+
+
+                    # ----------------------------------------------------
+                    # Residual physical transform
+                    #
+                    # perfect:
+                    # T_stage1 == T_clean
+                    #
+                    # E = T_stage1 @ inv(T_clean)
+                    # ----------------------------------------------------
+
+                    E_phys = (
+                        T_stage1
+                        @ torch.linalg.inv(
+                            T_clean
+                        )
+                    )
+
+
+                    R_phys_err = E_phys[
+                        ...,
+                        :3,
+                        :3
+                    ]
+
+
+                    trace_phys = (
+                        R_phys_err[..., 0, 0]
+                        + R_phys_err[..., 1, 1]
+                        + R_phys_err[..., 2, 2]
+                    )
+
+
+                    cos_phys = (
+                        (trace_phys - 1.0)
+                        * 0.5
+                    ).clamp(
+                        -1.0,
+                        1.0
+                    )
+
+
+                    phys_rot_deg = torch.rad2deg(
+                        torch.acos(
+                            cos_phys
+                        )
+                    )
+
+
+                    phys_trans_m = torch.linalg.norm(
+                        E_phys[
+                            ...,
+                            :3,
+                            3
+                        ],
+                        dim=-1,
+                    )
+
+
+                    # ====================================================
+                    # 3. ACTIVE CAMERA statistics
+                    # ====================================================
+
+                    mask = stage1_active_cam_mask.bool()
+
+                    broken_rot_active = (
+                        broken_rot_deg[
+                            mask
+                        ].mean()
+                    )
+
+                    broken_trans_active = (
+                        broken_trans_m[
+                            mask
+                        ].mean()
+                    )
+
+
+                    broken_rot_all = (
+                        broken_rot_deg.mean()
+                    )
+
+                    broken_trans_all = (
+                        broken_trans_m.mean()
+                    )
+
+                    if mask.any():
+
+                        param_rot_active = (
+                            param_rot_deg[
+                                mask
+                            ].mean()
+                        )
+
+                        param_trans_active = (
+                            param_trans_m[
+                                mask
+                            ].mean()
+                        )
+
+
+                        phys_rot_active = (
+                            phys_rot_deg[ 
+                                mask
+                            ].mean()
+                        )
+
+                        phys_trans_active = (
+                            phys_trans_m[
+                                mask
+                            ].mean()
+                        )
+
+                    else:
+
+                        param_rot_active = torch.tensor(
+                            float('nan'),
+                            device=target_device,
+                        )
+
+                        param_trans_active = torch.tensor(
+                            float('nan'),
+                            device=target_device,
+                        )
+
+                        phys_rot_active = torch.tensor(
+                            float('nan'),
+                            device=target_device,
+                        )
+
+                        phys_trans_active = torch.tensor(
+                            float('nan'),
+                            device=target_device,
+                        )
+
+
+                    # ====================================================
+                    # 4. ALL CAMERA statistics
+                    # ====================================================
+
+                    param_rot_all = (
+                        param_rot_deg.mean()
+                    )
+
+                    param_trans_all = (
+                        param_trans_m.mean()
+                    )
+
+
+                    phys_rot_all = (
+                        phys_rot_deg.mean()
+                    )
+
+                    phys_trans_all = (
+                        phys_trans_m.mean()
+                    )
+
+                    # ============================================================
+                    # Stage-1 recovery gain
+                    #
+                    # positive:
+                    #     Stage-1 improves BROKEN calibration
+                    #
+                    # negative:
+                    #     Stage-1 makes calibration worse
+                    # ============================================================
+
+                    rot_gain_dbg = (
+                        broken_rot_active
+                        - phys_rot_active
+                    )
+
+                    trans_gain_dbg = (
+                        broken_trans_active
+                        - phys_trans_active
+                    )
+
+
+                    # ====================================================
+                    # 5. Print
+                    # ====================================================
+
+                    print(
+                        "\n"
+                        "=========================================\n"
+                        "[RRRF SAME-BATCH S1 RECOVERY CHECK]\n"
+                        "-----------------------------------------\n"
+                        f"BROKEN rot ACTIVE   = {broken_rot_active.item():.6f} deg\n"
+                        f"STAGE1 rot ACTIVE   = {phys_rot_active.item():.6f} deg\n"
+                        f"ROT gain            = {rot_gain_dbg.item():.6f} deg\n"
+                        "-----------------------------------------\n"
+                        f"BROKEN trans ACTIVE = {broken_trans_active.item():.6f} m\n"
+                        f"STAGE1 trans ACTIVE = {phys_trans_active.item():.6f} m\n"
+                        f"TRANS gain          = {trans_gain_dbg.item():.6f} m\n"
+                        "-----------------------------------------\n"
+                        f"PARAM rot ACTIVE    = {param_rot_active.item():.6f} deg\n"
+                        f"PHYS rot ACTIVE     = {phys_rot_active.item():.6f} deg\n"
+                        f"PARAM trans ACTIVE  = {param_trans_active.item():.6f} m\n"
+                        f"PHYS trans ACTIVE   = {phys_trans_active.item():.6f} m\n"
+                        f"num_active          = {mask.sum().item()} / {mask.numel()}\n"
+                        "=========================================\n"
+                    )
+
+                self._rrrf_s1_consistency_debug_count += 1
+
+            camera_proposal_valid_mask = (
+                query_unique_mask
+                .unsqueeze(0)
+            )
+            # [B=1, Ncam, Q]
 
             if self.with_bbox_head:
                 bbox_loss = self.bbox_head.loss(
@@ -7066,14 +8273,71 @@ class BEVFusion(Base3DDetector):
                                 pred_delta_rot=pred_delta_rot,
                                 pred_delta_trans=pred_delta_trans,
                                 gt_delta_rot=gt_delta_rot,
-                                gt_delta_trans=gt_delta_trans
+                                gt_delta_trans=gt_delta_trans,
+                                stage1_active_cam_mask=stage1_active_cam_mask,
+                                camera_proposal_valid_mask= camera_proposal_valid_mask,
                             )
             
             # --- ✨ 2. 손실과 예측값 분리 ---
             # 시각화를 위해 예측값을 별도 변수로 빼내고, 딕셔너리에서 제거
             pred_delta_rot_batch = bbox_loss.pop('pred_delta_rot')
             pred_delta_trans_batch = bbox_loss.pop('pred_delta_trans')
+            # ============================================================
+            # RRRF V2 Geometry-only clean logging
+            #
+            # Keep ONLY:
+            #
+            #   Optimization:
+            #       loss_calib_rot_pred
+            #       loss_calib_trans_pred
+            #
+            #   RRRF physical diagnostics:
+            #       Stage1
+            #       Final
+            #       Gain
+            #
+            # Everything else is discarded from RRRF V2 GEO logs.
+            # ============================================================
 
+            if (
+                self.lgpc_train_stage
+                == 'rrrf_v2_geo'
+            ):
+
+                keep_rrrf_v2_keys = {
+
+                    # ----------------------------------------
+                    # optimization losses
+                    # ----------------------------------------
+                    'loss_calib_rot_pred',
+                    'loss_calib_trans_pred',
+
+                    # ----------------------------------------
+                    # rotation diagnostic
+                    # ----------------------------------------
+                    'rrrf_v2_s1_rot_err_deg',
+                    'rrrf_v2_final_rot_err_deg',
+                    'rrrf_v2_rot_gain_deg',
+
+                    # ----------------------------------------
+                    # translation diagnostic
+                    # ----------------------------------------
+                    'rrrf_v2_s1_trans_err_m',
+                    'rrrf_v2_final_trans_err_m',
+                    'rrrf_v2_trans_gain_m',
+                }
+
+
+                bbox_loss = {
+
+                    key: value
+
+                    for key, value
+                    in bbox_loss.items()
+
+                    if key in keep_rrrf_v2_keys
+                } 
+            
             losses.update(bbox_loss)
 
             # # --- 4. ✨ VERIFICATION 2: 2nd Stage 시각적 검증 ---
@@ -7429,6 +8693,23 @@ class BEVFusion(Base3DDetector):
 
             camera_intrinsics_filtered = (
                 broken_camera_intrinsics[
+                    0,
+                    active_cam_indices,
+                ]
+            )
+
+            # ============================================================
+            # NEW: Camera-pose conditioning for inference
+            #
+            # IMPORTANT:
+            # Use current/broken extrinsic, NOT clean GT extrinsic.
+            #
+            # Shape:
+            #     [NumActive, 4, 4]
+            # ============================================================
+
+            camera2lidar_context_filtered = (
+                broken_camera2lidar[
                     0,
                     active_cam_indices,
                 ]
@@ -7924,46 +9205,46 @@ class BEVFusion(Base3DDetector):
                     self._geo_oracle_debug_count = 0
 
                 if self._geo_oracle_debug_count < 200:
-                    print(
-                        '\n'
-                        '=====================================================\n'
-                        '[GEO ORACLE 2x2 BOTTLENECK MATRIX]\n'
-                        '=====================================================\n'
-                        '\n'
-                        '[A] GT Corr + GT Z + GT Rotation\n'
-                        f'MAE      = {a_mae.item():.6f} m\n'
-                        f'L2       = {a_l2.item():.6f} m\n'
-                        f'valid    = {diag_a["valid_count"].float().mean().item():.2f}\n'
-                        f'residual = {diag_a["residual_rmse"].mean().item():.6f}\n'
-                        '\n'
-                        '[B] Pred Corr + GT Z + GT Rotation\n'
-                        f'MAE      = {b_mae.item():.6f} m\n'
-                        f'L2       = {b_l2.item():.6f} m\n'
-                        f'valid    = {diag_b["valid_count"].float().mean().item():.2f}\n'
-                        f'residual = {diag_b["residual_rmse"].mean().item():.6f}\n'
-                        '\n'
-                        '[C] GT Corr + Pred Z@GT-Corr + GT Rotation\n'
-                        f'MAE      = {c_mae.item():.6f} m\n'
-                        f'L2       = {c_l2.item():.6f} m\n'
-                        f'valid    = {diag_c["valid_count"].float().mean().item():.2f}\n'
-                        f'residual = {diag_c["residual_rmse"].mean().item():.6f}\n'
-                        '\n'
-                        '[D] Pred Corr + Pred Z@Pred-Corr + GT Rotation\n'
-                        f'MAE      = {d_mae.item():.6f} m\n'
-                        f'L2       = {d_l2.item():.6f} m\n'
-                        f'valid    = {diag_d["valid_count"].float().mean().item():.2f}\n'
-                        f'residual = {diag_d["residual_rmse"].mean().item():.6f}\n'
-                        '\n'
-                        '[D-common] Pred Corr + Pred Z + GT-R '
-                        'on A/B/C common mask\n'
-                        f'MAE      = {d_common_mae.item():.6f} m\n'
-                        f'L2       = {d_common_l2.item():.6f} m\n'
-                        f'valid    = '
-                        f'{diag_d_common["valid_count"].float().mean().item():.2f}\n'
-                        f'residual = '
-                        f'{diag_d_common["residual_rmse"].mean().item():.6f}\n'
-                        '=====================================================\n'
-                    )
+                    # print(
+                    #     '\n'
+                    #     '=====================================================\n'
+                    #     '[GEO ORACLE 2x2 BOTTLENECK MATRIX]\n'
+                    #     '=====================================================\n'
+                    #     '\n'
+                    #     '[A] GT Corr + GT Z + GT Rotation\n'
+                    #     f'MAE      = {a_mae.item():.6f} m\n'
+                    #     f'L2       = {a_l2.item():.6f} m\n'
+                    #     f'valid    = {diag_a["valid_count"].float().mean().item():.2f}\n'
+                    #     f'residual = {diag_a["residual_rmse"].mean().item():.6f}\n'
+                    #     '\n'
+                    #     '[B] Pred Corr + GT Z + GT Rotation\n'
+                    #     f'MAE      = {b_mae.item():.6f} m\n'
+                    #     f'L2       = {b_l2.item():.6f} m\n'
+                    #     f'valid    = {diag_b["valid_count"].float().mean().item():.2f}\n'
+                    #     f'residual = {diag_b["residual_rmse"].mean().item():.6f}\n'
+                    #     '\n'
+                    #     '[C] GT Corr + Pred Z@GT-Corr + GT Rotation\n'
+                    #     f'MAE      = {c_mae.item():.6f} m\n'
+                    #     f'L2       = {c_l2.item():.6f} m\n'
+                    #     f'valid    = {diag_c["valid_count"].float().mean().item():.2f}\n'
+                    #     f'residual = {diag_c["residual_rmse"].mean().item():.6f}\n'
+                    #     '\n'
+                    #     '[D] Pred Corr + Pred Z@Pred-Corr + GT Rotation\n'
+                    #     f'MAE      = {d_mae.item():.6f} m\n'
+                    #     f'L2       = {d_l2.item():.6f} m\n'
+                    #     f'valid    = {diag_d["valid_count"].float().mean().item():.2f}\n'
+                    #     f'residual = {diag_d["residual_rmse"].mean().item():.6f}\n'
+                    #     '\n'
+                    #     '[D-common] Pred Corr + Pred Z + GT-R '
+                    #     'on A/B/C common mask\n'
+                    #     f'MAE      = {d_common_mae.item():.6f} m\n'
+                    #     f'L2       = {d_common_l2.item():.6f} m\n'
+                    #     f'valid    = '
+                    #     f'{diag_d_common["valid_count"].float().mean().item():.2f}\n'
+                    #     f'residual = '
+                    #     f'{diag_d_common["residual_rmse"].mean().item():.6f}\n'
+                    #     '=====================================================\n'
+                    # )
 
                     self._geo_oracle_debug_count += 1
 
@@ -7988,6 +9269,7 @@ class BEVFusion(Base3DDetector):
                     z_reliability=z_reliability_filtered,
                     z_raw=z_raw_for_calib,
                     camera_intrinsics=camera_intrinsics_filtered,
+                    camera2lidar_context=(camera2lidar_context_filtered),
                     point_valid_mask=calib_point_valid_mask,
                 )
 
@@ -8256,7 +9538,27 @@ class BEVFusion(Base3DDetector):
         
         # results_list_3d = self.bbox_head.predict(
         #     feats, det_xyz_proc, det_feat_proc, batch_input_metas)
-        
+
+        stage1_active_cam_mask = torch.zeros(
+            (
+                B,
+                N,
+            ),
+            dtype=torch.bool,
+            device=target_device,
+        )
+
+        stage1_active_cam_mask[
+            :,
+            active_cam_indices,
+        ] = True
+
+        camera_proposal_valid_mask = (
+            query_unique_mask
+            .unsqueeze(0)
+        )
+        # [B=1, Ncam, Q]
+                
         results_list_3d = self.bbox_head.predict(
             feats,
             det_xyz_proc,
@@ -8265,6 +9567,18 @@ class BEVFusion(Base3DDetector):
 
             lidar_query_feats=
                 lidar_query_feats,
+            
+            stage1_pred_delta_rot=
+                pred_delta_rot,
+
+            stage1_pred_delta_trans=
+                pred_delta_trans,
+
+            stage1_active_cam_mask=
+                stage1_active_cam_mask,
+
+            camera_proposal_valid_mask=
+                camera_proposal_valid_mask,
         )
         
         results = self.add_pred_to_datasample(batch_data_samples,

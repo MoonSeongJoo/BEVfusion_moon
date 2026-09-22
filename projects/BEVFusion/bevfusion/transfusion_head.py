@@ -1,5 +1,6 @@
 # modify from https://github.com/mit-han-lab/bevfusion
 import copy
+import math
 from typing import Any, Dict, Optional, Tuple,List
 from collections.abc import Mapping
 
@@ -20,7 +21,7 @@ from mmdet3d.models.layers import nms_bev
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
 from .imageprocessing_unit import visualize_full_pipeline_enhanced,project_points_to_image,visualize_calibration_effect
-from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,quaternion_to_matrix,identity_matrix_loss
+from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,correct_camera_proposals_per_camera,quaternion_to_matrix,identity_matrix_loss
 from mmengine.evaluator import BaseMetric
 from mmdet3d.registry import METRICS
 
@@ -58,6 +59,25 @@ def _mean_any_shape_to_3(t: torch.Tensor) -> torch.Tensor:
     t = t.reshape(-1, 3)
     return t.mean(dim=0)
 
+def _to_cam3(x):
+
+    t = _to_tensor(x)
+
+    if t is None:
+        return None
+
+    if t.shape[-1] != 3:
+        raise RuntimeError(
+            f'Expected [...,3], got {t.shape}'
+        )
+
+    if t.ndim == 1:
+        t = t.unsqueeze(0)
+
+    return t.reshape(
+        -1,
+        3,
+    )
 
 def axis_angle_to_matrix(aa: torch.Tensor) -> torch.Tensor:
     """aa: (...,3) axis-angle -> (...,3,3)"""
@@ -175,9 +195,14 @@ class CalibRecoveryMetric(BaseMetric):
         gt_rot_t = _to_tensor(gt_rot)
         gt_trans_t = _to_tensor(gt_trans)
         if gt_rot_t is not None:
-            gt_rot_t = _mean_any_shape_to_3(gt_rot_t)
+            gt_rot_t = _to_cam3(
+                gt_rot_t
+            )
+
         if gt_trans_t is not None:
-            gt_trans_t = _mean_any_shape_to_3(gt_trans_t)
+            gt_trans_t = _to_cam3(
+                gt_trans_t
+            )
         return gt_rot_t, gt_trans_t
 
     def _get_stage1_from_pred(self, pred_sample) -> (Optional[torch.Tensor], Optional[torch.Tensor]):
@@ -197,10 +222,11 @@ class CalibRecoveryMetric(BaseMetric):
         r = _to_tensor(pred1_rot)
         t = _to_tensor(pred1_trans)
         if r is not None:
-            r = _mean_any_shape_to_3(r)
+            r = _to_cam3(r)
         if t is not None:
-            t = _mean_any_shape_to_3(t)
+            t = _to_cam3(t)
         return r, t
+    
 
     def _get_stage2_from_pred(self, pred_sample) -> (Optional[torch.Tensor], Optional[torch.Tensor]):
         meta = _get_metainfo(pred_sample)
@@ -219,112 +245,515 @@ class CalibRecoveryMetric(BaseMetric):
         r = _to_tensor(pred2_rot)
         t = _to_tensor(pred2_trans)
         if r is not None:
-            r = _mean_any_shape_to_3(r)
+
+            r = _to_cam3(
+                r
+            )
+
+
         if t is not None:
-            t = _mean_any_shape_to_3(t)
+
+            t = _to_cam3(
+                t
+            )
         return r, t
+    
+    def _match_camera_count(
+        self,
+        x,
+        ncam,
+    ):
 
-    def process(self, data_batch, data_samples):
-        logger = MMLogger.get_current_instance()
+        if x is None:
+            return None
 
-        # GT는 data_batch에서, pred는 data_samples에서 꺼낸다
+
+        # Legacy V1:
+        # one scene-global residual
+        # -> broadcast only for compatibility.
+        if (
+            x.shape[0] == 1
+            and ncam > 1
+        ):
+
+            x = x.repeat(
+                ncam,
+                1,
+            )
+
+
+        if x.shape[0] != ncam:
+
+            return None
+
+
+        return x
+
+    def process(
+        self,
+        data_batch,
+        data_samples,
+    ):
+
+        logger = (
+            MMLogger.get_current_instance()
+        )
+
+
+        # ========================================================
+        # 1. GT source
+        # ========================================================
+
         gt_list = None
-        if isinstance(data_batch, dict) and 'data_samples' in data_batch:
-            gt_list = data_batch['data_samples']
+
+        if (
+            isinstance(
+                data_batch,
+                dict,
+            )
+            and 'data_samples'
+            in data_batch
+        ):
+
+            gt_list = data_batch[
+                'data_samples'
+            ]
+
 
         if gt_list is None:
-            # 이 경우는 dataloader가 GT를 안 주는 구조 (test set / format_only 등)
-            self._skip['no_data_batch_gt_list'] += len(data_samples)
+
+            self._skip[
+                'no_data_batch_gt_list'
+            ] += len(
+                data_samples
+            )
+
             return
 
-        for gt_s, pred_s in zip(gt_list, data_samples):
-            self._skip['total'] += 1
 
-            gt_rot_t, gt_trans_t = self._get_gt_from_batch(gt_s)
-            if gt_rot_t is None or gt_trans_t is None:
-                self._skip['no_gt'] += 1
+        # ========================================================
+        # 2. Sample loop
+        # ========================================================
+
+        for gt_s, pred_s in zip(
+            gt_list,
+            data_samples,
+        ):
+
+            self._skip[
+                'total'
+            ] += 1
+
+
+            gt_rot_t, gt_trans_t = (
+                self._get_gt_from_batch(
+                    gt_s
+                )
+            )
+
+
+            if (
+                gt_rot_t is None
+                or gt_trans_t is None
+            ):
+
+                self._skip[
+                    'no_gt'
+                ] += 1
+
                 continue
 
-            pred1_rot_t, pred1_trans_t = self._get_stage1_from_pred(pred_s)
-            pred2_rot_t, pred2_trans_t = self._get_stage2_from_pred(pred_s)
 
-            has_s1 = (pred1_rot_t is not None) and (pred1_trans_t is not None)
-            has_s2 = (pred2_rot_t is not None) and (pred2_trans_t is not None)
+            ncam = gt_rot_t.shape[0]
+
+
+            # ----------------------------------------------------
+            # Stage-1
+            # ----------------------------------------------------
+
+            pred1_rot_t, pred1_trans_t = (
+                self._get_stage1_from_pred(
+                    pred_s
+                )
+            )
+
+
+            pred1_rot_t = (
+                self._match_camera_count(
+                    pred1_rot_t,
+                    ncam,
+                )
+            )
+
+
+            pred1_trans_t = (
+                self._match_camera_count(
+                    pred1_trans_t,
+                    ncam,
+                )
+            )
+
+
+            has_s1 = (
+                pred1_rot_t is not None
+                and pred1_trans_t is not None
+            )
+
 
             if not has_s1:
-                self._skip['no_stage1'] += 1
-                pred1_rot_t = torch.zeros_like(gt_rot_t)
-                pred1_trans_t = torch.zeros_like(gt_trans_t)
+
+                self._skip[
+                    'no_stage1'
+                ] += 1
+
+                pred1_rot_t = (
+                    torch.zeros_like(
+                        gt_rot_t
+                    )
+                )
+
+                pred1_trans_t = (
+                    torch.zeros_like(
+                        gt_trans_t
+                    )
+                )
+
+
+            # ----------------------------------------------------
+            # Stage-2
+            # ----------------------------------------------------
+
+            pred2_rot_t, pred2_trans_t = (
+                self._get_stage2_from_pred(
+                    pred_s
+                )
+            )
+
+
+            pred2_rot_t = (
+                self._match_camera_count(
+                    pred2_rot_t,
+                    ncam,
+                )
+            )
+
+
+            pred2_trans_t = (
+                self._match_camera_count(
+                    pred2_trans_t,
+                    ncam,
+                )
+            )
+
+
+            has_s2 = (
+                pred2_rot_t is not None
+                and pred2_trans_t is not None
+            )
+
 
             if not has_s2:
-                self._skip['no_stage2'] += 1
-                pred2_rot_t = torch.zeros_like(gt_rot_t)
-                pred2_trans_t = torch.zeros_like(gt_trans_t)
 
-            # rotations
-            R_gt = axis_angle_to_matrix(gt_rot_t[None])          # (1,3,3)
-            R1   = axis_angle_to_matrix(pred1_rot_t[None])       # (1,3,3)
-            R2   = axis_angle_to_matrix(pred2_rot_t[None])       # (1,3,3)
-            R0   = torch.eye(3, device=R_gt.device, dtype=R_gt.dtype)[None]  # (1,3,3)
+                self._skip[
+                    'no_stage2'
+                ] += 1
 
-            # ✅ residual target for stage2 (s2가 맞춰야 하는 남은 오차)
-            R_res = R_gt @ R1.transpose(-1, -2)   # (1,3,3)
-
-            # final compose (s2@ s1)
-            R_total = R2 @ R1
-
-            # translations
-            t0 = torch.zeros_like(gt_trans_t)
-            t1 = pred1_trans_t
-            t2 = pred2_trans_t
-            t_total = t1 + t2
-
-            # ✅ residual target for stage2 translation
-            t_res = gt_trans_t - t1
-
-            # ---- metrics ----
-            rot_before = geodesic_rot_error_deg(R0, R_gt)[0].item()
-            rot_s1     = geodesic_rot_error_deg(R1, R_gt)[0].item()
-
-            # ✅ s2 "단독" 평가는 R2 vs R_res (잔여 오차를 얼마나 잘 맞추는지)
-            rot_s2     = geodesic_rot_error_deg(R2, R_res)[0].item() if has_s2 else float('nan')
-
-            rot_final  = geodesic_rot_error_deg(R_total, R_gt)[0].item()
-
-            trans_before = torch.norm(t0 - gt_trans_t, p=2).item()
-            trans_s1     = torch.norm(t1 - gt_trans_t, p=2).item()
-            trans_s2     = torch.norm(t2 - t_res, p=2).item() if has_s2 else float('nan')
-            trans_final  = torch.norm(t_total - gt_trans_t, p=2).item()
-
-            self.results.append(dict(
-                rot_before_deg=rot_before,
-                rot_s1_deg=rot_s1,
-                rot_s2_deg=rot_s2,          # ✅ 추가
-                rot_final_deg=rot_final,
-                trans_before_m=trans_before,
-                trans_s1_m=trans_s1,
-                trans_s2_m=trans_s2,        # ✅ 추가
-                trans_final_m=trans_final,
-                has_s2=float(has_s2),       # ✅ NaN 평균낼 때 유용 (옵션)
-            ))
-            self._skip['appended'] += 1
-
-            if self.debug and is_main_process() and self._dbg_printed < self.debug_n:
-                pm = _get_metainfo(pred_s)
-                gm = _get_metainfo(gt_s)
-                s1_ok = ('pred_delta_rot_1st' in pm) or ('stage1_pred_delta_rot' in pm)
-                s2_ok = (
-                            ('pred_delta_rot_2nd' in pm) or
-                            ('stage2_pred_delta_rot' in pm) or
-                            ('pred_delta_rot' in pm)   # ✅ 너의 기존 stage2 저장 키까지 포함
+                pred2_rot_t = (
+                    torch.zeros_like(
+                        gt_rot_t
                     )
+                )
+
+                pred2_trans_t = (
+                    torch.zeros_like(
+                        gt_trans_t
+                    )
+                )
+
+
+            # ========================================================
+            # 3. Geometry
+            # ========================================================
+
+            R_gt = axis_angle_to_matrix(
+                gt_rot_t
+            )
+
+            R1 = axis_angle_to_matrix(
+                pred1_rot_t
+            )
+
+            R2 = axis_angle_to_matrix(
+                pred2_rot_t
+            )
+
+
+            # Identity = "before correction"
+            R0 = torch.eye(
+                3,
+                dtype=R_gt.dtype,
+                device=R_gt.device,
+            ).unsqueeze(0).repeat(
+                ncam,
+                1,
+                1,
+            )
+
+
+            t0 = torch.zeros_like(
+                gt_trans_t
+            )
+
+
+            # ========================================================
+            # 4. Correct residual target
+            #
+            # Delta2_GT =
+            #     inv(Delta1) @ Delta_GT
+            # ========================================================
+
+            R_res = (
+                R1.transpose(
+                    -1,
+                    -2,
+                )
+                @ R_gt
+            )
+
+
+            t_res = torch.einsum(
+                'cij,cj->ci',
+
+                R1.transpose(
+                    -1,
+                    -2,
+                ),
+
+                (
+                    gt_trans_t
+                    - pred1_trans_t
+                ),
+            )
+
+
+            # ========================================================
+            # 5. Correct final composition
+            #
+            # Delta_total =
+            #     Delta1 @ Delta2
+            # ========================================================
+
+            R_total = (
+                R1
+                @ R2
+            )
+
+
+            t_total = (
+                pred1_trans_t
+                +
+                torch.einsum(
+                    'cij,cj->ci',
+
+                    R1,
+
+                    pred2_trans_t,
+                )
+            )
+
+
+            # ========================================================
+            # 6. Per-camera errors
+            # ========================================================
+
+            rot_before = (
+                geodesic_rot_error_deg(
+                    R0,
+                    R_gt,
+                )
+            )
+
+
+            rot_s1 = (
+                geodesic_rot_error_deg(
+                    R1,
+                    R_gt,
+                )
+            )
+
+
+            rot_s2 = (
+                geodesic_rot_error_deg(
+                    R2,
+                    R_res,
+                )
+            )
+
+
+            rot_final = (
+                geodesic_rot_error_deg(
+                    R_total,
+                    R_gt,
+                )
+            )
+
+
+            trans_before = (
+                torch.linalg.norm(
+                    t0
+                    - gt_trans_t,
+                    dim=-1,
+                )
+            )
+
+
+            trans_s1 = (
+                torch.linalg.norm(
+                    pred1_trans_t
+                    - gt_trans_t,
+                    dim=-1,
+                )
+            )
+
+
+            trans_s2 = (
+                torch.linalg.norm(
+                    pred2_trans_t
+                    - t_res,
+                    dim=-1,
+                )
+            )
+
+
+            trans_final = (
+                torch.linalg.norm(
+                    t_total
+                    - gt_trans_t,
+                    dim=-1,
+                )
+            )
+
+
+            # ========================================================
+            # 7. Store EACH camera independently
+            # ========================================================
+
+            for cam_idx in range(
+                ncam
+            ):
+
+                self.results.append({
+
+                    'rot_before_deg':
+                        float(
+                            rot_before[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                    'rot_s1_deg':
+                        float(
+                            rot_s1[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                    'rot_s2_deg':
+                        (
+                            float(
+                                rot_s2[
+                                    cam_idx
+                                ].detach().cpu()
+                            )
+                            if has_s2
+                            else float('nan')
+                        ),
+
+                    'rot_final_deg':
+                        float(
+                            rot_final[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                    'trans_before_m':
+                        float(
+                            trans_before[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                    'trans_s1_m':
+                        float(
+                            trans_s1[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                    'trans_s2_m':
+                        (
+                            float(
+                                trans_s2[
+                                    cam_idx
+                                ].detach().cpu()
+                            )
+                            if has_s2
+                            else float('nan')
+                        ),
+
+                    'trans_final_m':
+                        float(
+                            trans_final[
+                                cam_idx
+                            ].detach().cpu()
+                        ),
+
+                    'has_s2':
+                        float(
+                            has_s2
+                        ),
+                })
+
+
+            self._skip[
+                'appended'
+            ] += ncam
+
+
+            # ========================================================
+            # 8. Debug
+            # ========================================================
+
+            if (
+                self.debug
+                and is_main_process()
+                and self._dbg_printed
+                < self.debug_n
+            ):
 
                 logger.info(
-                    f"[CalibRecoveryMetric] sample_idx={gm.get('sample_idx', None)} "
-                    f"GT(meta) keys has rot/trans={('gt_delta_rot' in gm)}/{('gt_delta_trans' in gm)} | "
-                    f"PRED(meta) has s1={s1_ok}, "
-                    f"s2={s2_ok}"
+
+                    '[CalibRecoveryMetric] '
+                    f'ncam={ncam} '
+                    f'has_s1={has_s1} '
+                    f'has_s2={has_s2} | '
+
+                    f'Rot '
+                    f'{rot_before.mean().item():.4f} '
+                    f'-> '
+                    f'{rot_s1.mean().item():.4f} '
+                    f'-> '
+                    f'{rot_final.mean().item():.4f} deg | '
+
+                    f'Trans '
+                    f'{trans_before.mean().item():.4f} '
+                    f'-> '
+                    f'{trans_s1.mean().item():.4f} '
+                    f'-> '
+                    f'{trans_final.mean().item():.4f} m'
                 )
+
+
                 self._dbg_printed += 1
 
     def compute_metrics(self, results):
@@ -1730,8 +2159,10 @@ class TransFusionHead(nn.Module):
         ),
 
         # NEW
-        rrrf_mode='residual_se3',
         query_source='fused',
+        rrrf_mode='residual_se3_v2',
+        rrrf_num_cams=6,
+        rrrf_detach_geometry=True,
 
         train_cfg=None,
         test_cfg=None,
@@ -1750,9 +2181,12 @@ class TransFusionHead(nn.Module):
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.rrrf_mode = rrrf_mode
+        self.rrrf_num_cams = rrrf_num_cams
+        self.rrrf_detach_geometry = rrrf_detach_geometry
 
         assert self.rrrf_mode in [
             'residual_se3',
+            'residual_se3_v2',    # NEW
             'feature_refine',
             'lgpc_only'
         ], f'Unknown RRRF mode: {self.rrrf_mode}'
@@ -1875,6 +2309,83 @@ class TransFusionHead(nn.Module):
             nn.Linear(calibration_hidden_dim, 6),  # (rot 3 + trans 3)
         )
 
+        # ============================================================
+        # RRRF V2 : Camera-aware Residual SE(3)
+        # ============================================================
+
+        self.residual_cam_attention_v2 = nn.MultiheadAttention(
+            embed_dim=hidden_channel,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True,
+        )
+
+        self.residual_cam_norm_v2 = nn.LayerNorm(
+            hidden_channel
+        )
+
+        # Dedicated positional embedding.
+        # Do NOT share with coarse/refined fusion.
+        self.residual_cam_pos_embedding_v2 = nn.Sequential(
+            nn.Linear(3, hidden_channel),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channel, hidden_channel),
+        )
+
+        self.residual_query_pos_embedding_v2 = nn.Sequential(
+            nn.Linear(2, hidden_channel),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channel, hidden_channel),
+        )
+
+        # Stage-1 prediction itself is useful context.
+        self.residual_stage1_pose_embedding_v2 = nn.Sequential(
+            nn.Linear(6, hidden_channel),
+            nn.LayerNorm(hidden_channel),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channel, hidden_channel),
+        )
+
+        # Explicit camera identity.
+        self.residual_camera_id_embedding_v2 = nn.Embedding(
+            self.rrrf_num_cams,
+            hidden_channel,
+        )
+
+        # Inputs:
+        #
+        # camera-aware context  C
+        # global coarse context C
+        # stage1 pose context   C
+        # camera ID context     C
+        #
+        # total = 4C
+        self.residual_calibration_predictor_v2 = nn.Sequential(
+
+            nn.Linear(
+                hidden_channel * 4,
+                256,
+            ),
+
+            nn.LayerNorm(256),
+
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                256,
+                128,
+            ),
+
+            nn.LayerNorm(128),
+
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                128,
+                6,
+            ),
+        )
+
         # Stage-2 SE(3) regressor is not trained in feature_refine/lgpc_only mode.
         if self.rrrf_mode != 'residual_se3':
             for param in self.calibration_predictor.parameters():
@@ -1949,6 +2460,13 @@ class TransFusionHead(nn.Module):
 
         self.init_weights()
         self._init_assigner_sampler()
+        nn.init.zeros_(
+            self.residual_calibration_predictor_v2[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.residual_calibration_predictor_v2[-1].bias
+        )
 
         # Position Embedding for Cross-Attention, which is re-used during training # noqa: E501
         x_size = self.test_cfg['grid_size'][0] // self.test_cfg[
@@ -2003,7 +2521,327 @@ class TransFusionHead(nn.Module):
                 build_assigner(res) for res in self.train_cfg.assigner
             ]
 
-    def forward_single(self, inputs,det_xyz, det_feats, metas,batch_gt_instances_3d,lidar_query_inputs=None,):
+    def _predict_residual_se3_v2(
+        self,
+        coarse_fused_query_feat,
+        query_pos,
+        det_xyz,
+        det_feats,
+        stage1_pred_delta_rot,
+        stage1_pred_delta_trans,
+        camera_proposal_valid_mask=None,
+        active_cam_mask=None,
+    ):
+
+        """
+        Returns
+        -------
+        pred_delta_6dof:
+            [B, N_cam, 6]
+        """
+
+        B, C, N_query = (
+            coarse_fused_query_feat.shape
+        )
+
+        _, N_total, C_cam = (
+            det_feats.shape
+        )
+
+        N_cam = (
+            stage1_pred_delta_rot.shape[1]
+        )
+
+
+        if N_cam != self.rrrf_num_cams:
+
+            raise RuntimeError(
+                f'Expected {self.rrrf_num_cams} cameras, '
+                f'got {N_cam}'
+            )
+
+
+        if N_total % N_cam != 0:
+
+            raise RuntimeError(
+                f'Proposal count {N_total} cannot be '
+                f'split into {N_cam} cameras.'
+            )
+
+
+        Q = N_total // N_cam
+
+
+        # ============================================================
+        # 1. Restore camera dimension
+        # ============================================================
+
+        cam_feat = det_feats.reshape(
+            B,
+            N_cam,
+            Q,
+            C,
+        )
+
+
+        cam_xyz = det_xyz.reshape(
+            B,
+            N_cam,
+            Q,
+            3,
+        )
+
+
+        # ============================================================
+        # 2. Camera proposal positional feature
+        # ============================================================
+
+        cam_pos = (
+            self.residual_cam_pos_embedding_v2(
+                cam_xyz
+            )
+        )
+
+
+        # ============================================================
+        # 3. Coarse query used as geometric/context reference
+        # ============================================================
+
+        coarse_query = (
+            coarse_fused_query_feat
+            .permute(0, 2, 1)
+            .contiguous()
+        )
+        # [B,Nquery,C]
+
+
+        query_pos_v2 = (
+            self.residual_query_pos_embedding_v2(
+                query_pos
+            )
+        )
+
+
+        residual_query = (
+            coarse_query
+            + query_pos_v2
+        )
+
+
+        # Repeat query independently for each camera.
+        residual_query = (
+            residual_query
+            .unsqueeze(1)
+            .expand(
+                B,
+                N_cam,
+                N_query,
+                C,
+            )
+            .reshape(
+                B * N_cam,
+                N_query,
+                C,
+            )
+        )
+
+
+        cam_key = (
+            cam_feat
+            + cam_pos
+        ).reshape(
+            B * N_cam,
+            Q,
+            C,
+        )
+
+
+        cam_value = cam_feat.reshape(
+            B * N_cam,
+            Q,
+            C,
+        )
+
+
+        # ============================================================
+        # 4. Ignore repeated filler proposals
+        # ============================================================
+
+        key_padding_mask = None
+
+        if camera_proposal_valid_mask is not None:
+
+            valid_mask = (
+                camera_proposal_valid_mask
+                .bool()
+                .clone()
+            )
+
+            # MultiheadAttention cannot handle a row
+            # where every key is masked.
+            empty_cam = ~valid_mask.any(
+                dim=-1
+            )
+
+            if empty_cam.any():
+                valid_mask[
+                    empty_cam,
+                    0,
+                ] = True
+
+
+            key_padding_mask = (
+                ~valid_mask
+            ).reshape(
+                B * N_cam,
+                Q,
+            )
+
+
+        # ============================================================
+        # 5. Per-camera residual evidence
+        # ============================================================
+
+        residual_attn, _ = (
+            self.residual_cam_attention_v2(
+                query=residual_query,
+                key=cam_key,
+                value=cam_value,
+                key_padding_mask=
+                    key_padding_mask,
+            )
+        )
+
+
+        residual_attn = (
+            self.residual_cam_norm_v2(
+                residual_query
+                + residual_attn
+            )
+        )
+
+
+        # Pool BEV queries,
+        # NOT cameras.
+        cam_context = (
+            residual_attn
+            .mean(dim=1)
+            .reshape(
+                B,
+                N_cam,
+                C,
+            )
+        )
+
+
+        # ============================================================
+        # 6. Global coarse context
+        # ============================================================
+
+        global_context = (
+            coarse_fused_query_feat
+            .mean(dim=-1)
+            .unsqueeze(1)
+            .expand(
+                B,
+                N_cam,
+                C,
+            )
+        )
+
+
+        # ============================================================
+        # 7. Stage-1 correction context
+        # ============================================================
+
+        stage1_pose = torch.cat(
+            [
+                stage1_pred_delta_rot.detach(),
+                stage1_pred_delta_trans.detach(),
+            ],
+            dim=-1,
+        )
+
+
+        stage1_context = (
+            self.residual_stage1_pose_embedding_v2(
+                stage1_pose
+            )
+        )
+
+
+        # ============================================================
+        # 8. Camera identity
+        # ============================================================
+
+        camera_ids = torch.arange(
+            N_cam,
+            device=det_feats.device,
+        )
+
+
+        camera_context = (
+            self.residual_camera_id_embedding_v2(
+                camera_ids
+            )
+            .unsqueeze(0)
+            .expand(
+                B,
+                N_cam,
+                C,
+            )
+        )
+
+
+        # ============================================================
+        # 9. Final per-camera residual predictor
+        # ============================================================
+
+        residual_input = torch.cat(
+            [
+                cam_context,
+                global_context,
+                stage1_context,
+                camera_context,
+            ],
+            dim=-1,
+        )
+
+
+        pred_delta_6dof = (
+            self.residual_calibration_predictor_v2(
+                residual_input
+            )
+        )
+        # [B,Ncam,6]
+
+
+        if active_cam_mask is not None:
+
+            pred_delta_6dof = (
+                pred_delta_6dof
+                * active_cam_mask
+                .unsqueeze(-1)
+                .to(pred_delta_6dof.dtype)
+            )
+
+
+        return pred_delta_6dof
+
+    def forward_single(
+        self,
+        inputs,
+        det_xyz,
+        det_feats,
+        metas,
+        batch_gt_instances_3d,
+        lidar_query_inputs=None,
+
+        stage1_pred_delta_rot=None,
+        stage1_pred_delta_trans=None,
+        stage1_active_cam_mask=None,
+        camera_proposal_valid_mask=None,
+    ):
         """Forward function for CenterPoint.
         Args:
             inputs (torch.Tensor): Input feature map with the shape of
@@ -2202,6 +3040,7 @@ class TransFusionHead(nn.Module):
         refined_query_feat = lidar_only_query_feat      # 카메라 없으면 이게 최종 입력
         pred_delta_rot = torch.zeros(batch_size, 3, device=fusion_feat.device) # 기본값 0
         pred_delta_trans = torch.zeros(batch_size, 3, device=fusion_feat.device) # 기본값 0
+
  
         # --- 2. 카메라 정보 퓨전 (있을 경우) ---
         if det_xyz is not None and det_feats is not None:
@@ -2296,6 +3135,9 @@ class TransFusionHead(nn.Module):
             #   No Stage-2 refinement.
             # ============================================================
 
+            pred_delta_rot = None
+            pred_delta_trans = None
+
             if self.rrrf_mode == 'residual_se3':
 
                 # --------------------------------------------------------
@@ -2328,6 +3170,115 @@ class TransFusionHead(nn.Module):
                         det_xyz_corrected_norm
                     )
 
+            elif self.rrrf_mode == 'residual_se3_v2':
+
+                if (
+                    stage1_pred_delta_rot is None
+                    or stage1_pred_delta_trans is None
+                ):
+
+                    raise RuntimeError(
+                        '[RRRF V2] Stage-1 prediction is required.'
+                    )
+
+
+                # ========================================================
+                # Camera-aware residual prediction
+                # ========================================================
+
+                pred_delta_6dof = (
+                    self._predict_residual_se3_v2(
+
+                        coarse_fused_query_feat=
+                            coarse_fused_query_feat,
+
+                        query_pos=
+                            query_pos,
+
+                        det_xyz=
+                            det_xyz,
+
+                        det_feats=
+                            det_feats,
+
+                        stage1_pred_delta_rot=
+                            stage1_pred_delta_rot,
+
+                        stage1_pred_delta_trans=
+                            stage1_pred_delta_trans,
+
+                        camera_proposal_valid_mask=
+                            camera_proposal_valid_mask,
+
+                        active_cam_mask=
+                            stage1_active_cam_mask,
+                    )
+                )
+
+
+                pred_delta_rot = (
+                    pred_delta_6dof[
+                        ...,
+                        :3
+                    ]
+                )
+
+                pred_delta_trans = (
+                    pred_delta_6dof[
+                        ...,
+                        3:
+                    ]
+                )
+
+
+                # ========================================================
+                # At first, block detection gradient from corrupting SE(3).
+                # ========================================================
+
+                if self.rrrf_detach_geometry:
+
+                    geom_rot = (
+                        pred_delta_rot.detach()
+                    )
+
+                    geom_trans = (
+                        pred_delta_trans.detach()
+                    )
+
+                else:
+
+                    geom_rot = pred_delta_rot
+                    geom_trans = pred_delta_trans
+
+
+                pc_range_tensor = torch.tensor(
+                    self.train_cfg[
+                        'point_cloud_range'
+                    ],
+                    device=det_xyz.device,
+                    dtype=det_xyz.dtype,
+                )
+
+
+                det_xyz_corrected_norm = (
+                    correct_camera_proposals_per_camera(
+
+                        det_xyz,
+
+                        geom_rot,
+
+                        geom_trans,
+
+                        pc_range_tensor,
+                    )
+                )
+
+
+                cam_proposal_pos_embed_refined = (
+                    self.camera_proposal_pos_embedding(
+                        det_xyz_corrected_norm
+                    )
+                )
 
             elif self.rrrf_mode == 'feature_refine':
 
@@ -2373,6 +3324,7 @@ class TransFusionHead(nn.Module):
             # ------------------------------------------------------------
             if self.rrrf_mode in [
                 'residual_se3',
+                'residual_se3_v2',
                 'feature_refine'
             ]:
 
@@ -2515,7 +3467,8 @@ class TransFusionHead(nn.Module):
     #     assert len(res) == 1, 'only support one level features.'
     #     return res
     
-    def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None,lidar_query_feats=None,):
+    def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None,lidar_query_feats=None,
+                stage1_pred_delta_rot=None,stage1_pred_delta_trans=None,stage1_active_cam_mask=None,camera_proposal_valid_mask=None,):
         if isinstance(feats, torch.Tensor):
             feats = [feats]
 
@@ -2543,21 +3496,93 @@ class TransFusionHead(nn.Module):
 
         assert len(lidar_query_feats) == len(feats)
         # multi_apply 호출 시에도 순서만 맞춰주면 됩니다.
-        res = multi_apply(self.forward_single, feats, [det_xyz], [det_feats], [metas],[batch_gt_instances_3d],lidar_query_feats,)
+        res = multi_apply(
+
+            self.forward_single,
+
+            feats,
+
+            [det_xyz],
+            [det_feats],
+            [metas],
+            [batch_gt_instances_3d],
+
+            lidar_query_feats,
+
+            [stage1_pred_delta_rot],
+            [stage1_pred_delta_trans],
+            [stage1_active_cam_mask],
+            [camera_proposal_valid_mask],
+        )
         
         assert len(res) == 1, 'only support one level features.'
         # return res
         return res
 
-    # def predict(self, batch_feats, batch_input_metas):
-    #     preds_dicts = self(batch_feats, batch_input_metas)
+    # def predict(self, batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=None,):
+    #     # self()는 forward를 호출. 이제 모든 인자를 올바르게 전달합니다.
+    #     preds_dicts = self(batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=lidar_query_feats)
     #     res = self.predict_by_feat(preds_dicts, batch_input_metas)
     #     return res
+    
+    def predict(
+        self,
+        batch_feats,
+        det_xyz,
+        det_feats,
+        batch_input_metas,
+        lidar_query_feats=None,
 
-    def predict(self, batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=None,):
-        # self()는 forward를 호출. 이제 모든 인자를 올바르게 전달합니다.
-        preds_dicts = self(batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=lidar_query_feats)
-        res = self.predict_by_feat(preds_dicts, batch_input_metas)
+        stage1_pred_delta_rot=None,
+        stage1_pred_delta_trans=None,
+        stage1_active_cam_mask=None,
+        camera_proposal_valid_mask=None,
+    ):
+
+        preds_dicts = self(
+            batch_feats,
+            det_xyz,
+            det_feats,
+            batch_input_metas,
+
+            lidar_query_feats=
+                lidar_query_feats,
+
+            stage1_pred_delta_rot=
+                stage1_pred_delta_rot,
+
+            stage1_pred_delta_trans=
+                stage1_pred_delta_trans,
+
+            stage1_active_cam_mask=
+                stage1_active_cam_mask,
+
+            camera_proposal_valid_mask=
+                camera_proposal_valid_mask,
+        )
+
+
+        # Store active mask for predict_by_feat / metrics.
+        if stage1_active_cam_mask is not None:
+
+            for b in range(
+                len(batch_input_metas)
+            ):
+
+                batch_input_metas[b][
+                    'stage1_active_cam_mask'
+                ] = (
+                    stage1_active_cam_mask[b]
+                    .detach()
+                    .cpu()
+                )
+
+
+        res = self.predict_by_feat(
+            preds_dicts,
+            batch_input_metas,
+        )
+
         return res
 
     def predict_by_feat(self,
@@ -2716,7 +3741,10 @@ class TransFusionHead(nn.Module):
                 # active = metas[i].get('stage1_active_cam_indices', None)
                 # # ================================================================================
 
-                if self.rrrf_mode == 'residual_se3':
+                if self.rrrf_mode in {
+                    'residual_se3',
+                    'residual_se3_v2',
+                }:
 
                     pred_rot = preds_dict[0].get(
                         'pred_delta_rot',
@@ -2729,109 +3757,449 @@ class TransFusionHead(nn.Module):
                     )
 
                 else:
-
                     # No explicit Stage-2 calibration prediction
                     pred_rot = None
                     pred_trans = None
-                # ===================== [NEW] 캘리브레이션 예측값도 같이 저장 =====================
-                # preds_dict[0]는 dict, batch 차원은 i
-                # 수정 (OK): metainfo로 저장 (길이 체크 없음)
-                if pred_rot is not None and pred_trans is not None:
-                    # temp_instances.set_metainfo(dict(
-                    #     pred_delta_rot=pred_rot[i].detach().cpu(),
-                    #     pred_delta_trans=pred_trans[i].detach().cpu(),
-                    # ))
-                    metas[i]['pred_delta_rot_2nd'] = pred_rot[i].detach().cpu()
-                    metas[i]['pred_delta_trans_2nd'] = pred_trans[i].detach().cpu()
-                # ===============================================================================
+                
+                meta_payload = {}
+                # ============================================================
+                # Calibration metadata
+                #
+                # IMPORTANT:
+                #   V1 = scene-global residual
+                #   V2 = per-camera residual
+                #
+                # Keep these two paths completely separate.
+                # ============================================================
 
-                # ===================== [COMPLETE] stage1   stage2(잔차) 합성 & 저장 =====================
                 def _as_cpu_tensor(x):
+
                     if x is None:
                         return None
+
                     if torch.is_tensor(x):
                         return x.detach().cpu()
-                    return torch.tensor(x).detach().cpu()
 
-                # --- stage1 읽기 (카메라별) ---
-                stage1_rot_cam = _as_cpu_tensor(metas[i].get('stage1_pred_delta_rot', None))      # (N_cam,3)
-                stage1_trans_cam = _as_cpu_tensor(metas[i].get('stage1_pred_delta_trans', None))  # (N_cam,3)
-                active = metas[i].get('stage1_active_cam_indices', None)
-                active_mask = metas[i].get('stage1_active_cam_mask', None)
-                active = _as_cpu_tensor(active) if active is not None else None
-                active_mask = _as_cpu_tensor(active_mask).bool() if active_mask is not None else None
+                    return torch.as_tensor(
+                        x
+                    ).detach().cpu()
 
-                # --- stage2 읽기 (residual, 배치별 1개) ---
-                pred2_rot = _as_cpu_tensor(pred_rot[i]) if pred_rot is not None else None         # (3,)
-                pred2_trans = _as_cpu_tensor(pred_trans[i]) if pred_trans is not None else None   # (3,)
 
-                # --- stage1 mean 계산 (active만 평균내는 게 물리적으로 가장 정확) ---
-                stage1_rot_mean = None
-                stage1_trans_mean = None
-                if stage1_rot_cam is not None and stage1_trans_cam is not None:
-                    if active_mask is not None and active_mask.any():
-                        stage1_rot_mean = stage1_rot_cam[active_mask].mean(dim=0)     # (3,)
-                        stage1_trans_mean = stage1_trans_cam[active_mask].mean(dim=0) # (3,)
-                    elif active is not None and active.numel() > 0:
-                        act_idx = active.long().view(-1)
-                        stage1_rot_mean = stage1_rot_cam[act_idx].mean(dim=0)
-                        stage1_trans_mean = stage1_trans_cam[act_idx].mean(dim=0)
-                    else:
-                        # active 정보 없으면 전체 평균(차선책)
-                        stage1_rot_mean = stage1_rot_cam.mean(dim=0)
-                        stage1_trans_mean = stage1_trans_cam.mean(dim=0)
+                # ============================================================
+                # 1. Read Stage-2 prediction
+                # ============================================================
 
-                    # metric 호환 alias도 metas에 같이 심어둠 (선택이지만 추천)
-                    metas[i]['pred_delta_rot_1st'] = stage1_rot_cam
-                    metas[i]['pred_delta_trans_1st'] = stage1_trans_cam
+                pred_rot_all = None
+                pred_trans_all = None
 
-                # --- 최종 합성 (R_total = R2@R1, t_total = t1 t2) ---
-                total_R = None
-                total_t = None
-                if (stage1_rot_mean is not None) and (pred2_rot is not None):
-                    R1 = axis_angle_to_matrix(stage1_rot_mean[None].float())   # (1,3,3)
-                    R2 = axis_angle_to_matrix(pred2_rot[None].float())         # (1,3,3)
-                    total_R = (R2 @ R1).squeeze(0)                              # (3,3)
-                if (stage1_trans_mean is not None) and (pred2_trans is not None):
-                    total_t = (stage1_trans_mean.float() + pred2_trans.float()) # (3,)
+                if self.rrrf_mode in {
+                    'residual_se3',
+                    'residual_se3_v2',
+                }:
 
-                # --- 저장(InstanceData.metainfo): stage2 residual   stage1   total ---
-                meta_payload = {}
-                if pred2_rot is not None and pred2_trans is not None:
-                    meta_payload.update(dict(
-                        # ✅ metric이 찾는 키들 (권장)
-                        pred_delta_rot_2nd=pred2_rot,
-                        pred_delta_trans_2nd=pred2_trans,
-                        stage2_pred_delta_rot=pred2_rot,
-                        stage2_pred_delta_trans=pred2_trans,
+                    pred_rot_all = preds_dict[0].get(
+                        'pred_delta_rot',
+                        None,
+                    )
 
-                        # ✅ 기존 호환 (너 코드/다른 모듈이 쓰는 키)
-                        pred_delta_rot=pred2_rot,
-                        pred_delta_trans=pred2_trans,
-                    ))
-                if stage1_rot_cam is not None and stage1_trans_cam is not None:
-                    meta_payload.update(dict(
-                        stage1_pred_delta_rot=stage1_rot_cam,       # (N_cam,3)
-                        stage1_pred_delta_trans=stage1_trans_cam,
-                        stage1_pred_delta_rot_mean=stage1_rot_mean,  # (3,)
-                        stage1_pred_delta_trans_mean=stage1_trans_mean,
-                    ))
+                    pred_trans_all = preds_dict[0].get(
+                        'pred_delta_trans',
+                        None,
+                    )
+
+
+                # ============================================================
+                # 2. Read Stage-1 LGPC prediction
+                #    Always per-camera:
+                #
+                #    [Ncam, 3]
+                # ============================================================
+
+                stage1_rot_cam = _as_cpu_tensor(
+                    metas[i].get(
+                        'stage1_pred_delta_rot',
+                        None,
+                    )
+                )
+
+                stage1_trans_cam = _as_cpu_tensor(
+                    metas[i].get(
+                        'stage1_pred_delta_trans',
+                        None,
+                    )
+                )
+
+
+                active = metas[i].get(
+                    'stage1_active_cam_indices',
+                    None,
+                )
+
+                active_mask = metas[i].get(
+                    'stage1_active_cam_mask',
+                    None,
+                )
+
+
                 if active is not None:
-                    meta_payload['stage1_active_cam_indices'] = active.long()
+                    active = _as_cpu_tensor(
+                        active
+                    ).long()
+
+
                 if active_mask is not None:
-                    meta_payload['stage1_active_cam_mask'] = active_mask
-                if total_R is not None:
-                    meta_payload['pred_delta_rot_total_R'] = total_R
-                if total_t is not None:
-                    meta_payload['pred_delta_trans_total'] = total_t
+                    active_mask = _as_cpu_tensor(
+                        active_mask
+                    ).bool()
+
+
+                # ============================================================
+                # 3. Common metadata
+                # ============================================================
+
+                meta_payload = {}
+
+
+                if (
+                    stage1_rot_cam is not None
+                    and stage1_trans_cam is not None
+                ):
+
+                    meta_payload.update({
+
+                        'pred_delta_rot_1st':
+                            stage1_rot_cam,
+
+                        'pred_delta_trans_1st':
+                            stage1_trans_cam,
+
+                        'stage1_pred_delta_rot':
+                            stage1_rot_cam,
+
+                        'stage1_pred_delta_trans':
+                            stage1_trans_cam,
+                    })
+
+
+                if active is not None:
+
+                    meta_payload[
+                        'stage1_active_cam_indices'
+                    ] = active
+
+
+                if active_mask is not None:
+
+                    meta_payload[
+                        'stage1_active_cam_mask'
+                    ] = active_mask
+
+
+                # ============================================================
+                # 4. RRRF V2
+                #
+                # IMPORTANT:
+                #
+                # NO camera averaging.
+                #
+                # Delta_total = Delta1 @ Delta2
+                #
+                # R_total = R1 @ R2
+                #
+                # t_total = t1 + R1 @ t2
+                # ============================================================
+
+                if self.rrrf_mode == 'residual_se3_v2':
+
+                    if (
+                        pred_rot_all is None
+                        or pred_trans_all is None
+                    ):
+
+                        raise RuntimeError(
+                            '[RRRF V2 predict] '
+                            'Stage-2 prediction is missing.'
+                        )
+
+
+                    if (
+                        stage1_rot_cam is None
+                        or stage1_trans_cam is None
+                    ):
+
+                        raise RuntimeError(
+                            '[RRRF V2 predict] '
+                            'Stage-1 prediction is missing.'
+                        )
+
+
+                    pred2_rot_cam = _as_cpu_tensor(
+                        pred_rot_all[i]
+                    )
+
+                    pred2_trans_cam = _as_cpu_tensor(
+                        pred_trans_all[i]
+                    )
+
+
+                    # --------------------------------------------------------
+                    # Normalize shape to [Ncam,3]
+                    # --------------------------------------------------------
+
+                    if pred2_rot_cam.ndim == 1:
+
+                        pred2_rot_cam = (
+                            pred2_rot_cam
+                            .unsqueeze(0)
+                        )
+
+
+                    if pred2_trans_cam.ndim == 1:
+
+                        pred2_trans_cam = (
+                            pred2_trans_cam
+                            .unsqueeze(0)
+                        )
+
+
+                    if stage1_rot_cam.ndim == 1:
+
+                        stage1_rot_cam = (
+                            stage1_rot_cam
+                            .unsqueeze(0)
+                        )
+
+
+                    if stage1_trans_cam.ndim == 1:
+
+                        stage1_trans_cam = (
+                            stage1_trans_cam
+                            .unsqueeze(0)
+                        )
+
+
+                    # --------------------------------------------------------
+                    # Camera-count sanity
+                    # --------------------------------------------------------
+
+                    ncam = stage1_rot_cam.shape[0]
+
+
+                    if pred2_rot_cam.shape[0] != ncam:
+
+                        raise RuntimeError(
+                            '[RRRF V2 predict] '
+                            'Stage2 rotation camera count mismatch: '
+                            f's1={ncam}, '
+                            f's2={pred2_rot_cam.shape[0]}'
+                        )
+
+
+                    if pred2_trans_cam.shape[0] != ncam:
+
+                        raise RuntimeError(
+                            '[RRRF V2 predict] '
+                            'Stage2 translation camera count mismatch: '
+                            f's1={ncam}, '
+                            f's2={pred2_trans_cam.shape[0]}'
+                        )
+
+
+                    # --------------------------------------------------------
+                    # SE(3) composition
+                    # --------------------------------------------------------
+
+                    R1 = axis_angle_to_matrix(
+                        stage1_rot_cam.float()
+                    )
+
+                    R2 = axis_angle_to_matrix(
+                        pred2_rot_cam.float()
+                    )
+
+
+                    R_total = (
+                        R1
+                        @ R2
+                    )
+
+
+                    t_total = (
+                        stage1_trans_cam.float()
+                        +
+                        torch.einsum(
+                            'cij,cj->ci',
+                            R1,
+                            pred2_trans_cam.float(),
+                        )
+                    )
+
+
+                    # --------------------------------------------------------
+                    # Save V2 residual + total
+                    # --------------------------------------------------------
+
+                    meta_payload.update({
+
+                        'pred_delta_rot_2nd':
+                            pred2_rot_cam,
+
+                        'pred_delta_trans_2nd':
+                            pred2_trans_cam,
+
+                        'stage2_pred_delta_rot':
+                            pred2_rot_cam,
+
+                        'stage2_pred_delta_trans':
+                            pred2_trans_cam,
+
+                        # compatibility aliases
+                        'pred_delta_rot':
+                            pred2_rot_cam,
+
+                        'pred_delta_trans':
+                            pred2_trans_cam,
+
+                        'pred_delta_rot_total_R':
+                            R_total,
+
+                        'pred_delta_trans_total':
+                            t_total,
+                    })
+
+
+                # ============================================================
+                # 5. Legacy RRRF V1
+                #
+                # Keep previous scene-global behavior ONLY for
+                # backward-compatible V1 ablation.
+                # ============================================================
+
+                elif self.rrrf_mode == 'residual_se3':
+
+                    if (
+                        pred_rot_all is not None
+                        and pred_trans_all is not None
+                        and stage1_rot_cam is not None
+                        and stage1_trans_cam is not None
+                    ):
+
+                        pred2_rot = _as_cpu_tensor(
+                            pred_rot_all[i]
+                        )
+
+                        pred2_trans = _as_cpu_tensor(
+                            pred_trans_all[i]
+                        )
+
+
+                        # ----------------------------------------------------
+                        # V1 only:
+                        # scene-global Stage-1 representative
+                        # ----------------------------------------------------
+
+                        if (
+                            active_mask is not None
+                            and active_mask.any()
+                        ):
+
+                            stage1_rot_mean = (
+                                stage1_rot_cam[
+                                    active_mask
+                                ]
+                                .mean(dim=0)
+                            )
+
+                            stage1_trans_mean = (
+                                stage1_trans_cam[
+                                    active_mask
+                                ]
+                                .mean(dim=0)
+                            )
+
+
+                        elif (
+                            active is not None
+                            and active.numel() > 0
+                        ):
+
+                            act_idx = (
+                                active
+                                .long()
+                                .view(-1)
+                            )
+
+                            stage1_rot_mean = (
+                                stage1_rot_cam[
+                                    act_idx
+                                ]
+                                .mean(dim=0)
+                            )
+
+                            stage1_trans_mean = (
+                                stage1_trans_cam[
+                                    act_idx
+                                ]
+                                .mean(dim=0)
+                            )
+
+
+                        else:
+
+                            stage1_rot_mean = (
+                                stage1_rot_cam
+                                .mean(dim=0)
+                            )
+
+                            stage1_trans_mean = (
+                                stage1_trans_cam
+                                .mean(dim=0)
+                            )
+
+
+                        meta_payload.update({
+
+                            'pred_delta_rot_2nd':
+                                pred2_rot,
+
+                            'pred_delta_trans_2nd':
+                                pred2_trans,
+
+                            'stage2_pred_delta_rot':
+                                pred2_rot,
+
+                            'stage2_pred_delta_trans':
+                                pred2_trans,
+
+                            'pred_delta_rot':
+                                pred2_rot,
+
+                            'pred_delta_trans':
+                                pred2_trans,
+
+                            # V1 compatibility only
+                            'stage1_pred_delta_rot_mean':
+                                stage1_rot_mean,
+
+                            'stage1_pred_delta_trans_mean':
+                                stage1_trans_mean,
+                        })
+
+
+                # ============================================================
+                # 6. Attach calibration metadata to prediction
+                # ============================================================
 
                 if len(meta_payload) > 0:
-                    temp_instances.set_metainfo(meta_payload)
-                # ===================== [END COMPLETE] ================================================
+
+                    temp_instances.set_metainfo(
+                        meta_payload
+                    )
 
                 ret_layer.append(temp_instances)
 
             rets.append(ret_layer)
+        
         assert len(
             rets
         ) == 1, f'only support one layer now, but get {len(rets)} layers'
@@ -3085,7 +4453,19 @@ class TransFusionHead(nn.Module):
             heatmap[None],
         )
 
-    def loss(self, batch_feats, det_xyz,det_feats, batch_data_samples,pred_delta_rot=None, pred_delta_trans=None, gt_delta_rot=None, gt_delta_trans=None):
+    def loss(
+        self,
+        batch_feats,
+        det_xyz,
+        det_feats,
+        batch_data_samples,
+        pred_delta_rot=None,
+        pred_delta_trans=None,
+        gt_delta_rot=None,
+        gt_delta_trans=None,
+        stage1_active_cam_mask=None,
+        camera_proposal_valid_mask=None,
+    ):
         """Loss function for CenterHead.
 
         Args:
@@ -3100,15 +4480,37 @@ class TransFusionHead(nn.Module):
         for data_sample in batch_data_samples:
             batch_input_metas.append(data_sample.metainfo)
             batch_gt_instances_3d.append(data_sample.gt_instances_3d)
-        preds_dicts = self(batch_feats,det_xyz, det_feats,batch_input_metas,batch_gt_instances_3d)
+        
+        preds_dicts = self(
+
+            batch_feats,
+            det_xyz,
+            det_feats,
+            batch_input_metas,
+            batch_gt_instances_3d,
+
+            stage1_pred_delta_rot=
+                pred_delta_rot.detach(),
+
+            stage1_pred_delta_trans=
+                pred_delta_trans.detach(),
+
+            stage1_active_cam_mask=
+                stage1_active_cam_mask,
+
+            camera_proposal_valid_mask=
+                camera_proposal_valid_mask,
+        )
+        
         loss = self.loss_by_feat(
                     preds_dicts, 
                     batch_gt_instances_3d, 
                     batch_input_metas, # metas는 여전히 다른 용도로 필요할 수 있음
                     pred_delta_rot=pred_delta_rot,
                     pred_delta_trans=pred_delta_trans,
-                    gt_delta_rot=gt_delta_rot,       # <-- 전달
-                    gt_delta_trans=gt_delta_trans   # <-- 전달
+                    gt_delta_rot=gt_delta_rot,# <-- 전달
+                    gt_delta_trans=gt_delta_trans,
+                    stage1_active_cam_mask = stage1_active_cam_mask,
                 )
         
         # --- ✨ 3. 시각화를 위해 예측값 추가 ---
@@ -3131,6 +4533,7 @@ class TransFusionHead(nn.Module):
                      pred_delta_trans: torch.Tensor,
                      gt_delta_rot: torch.Tensor,    # <-- 추가
                      gt_delta_trans: torch.Tensor,
+                     stage1_active_cam_mask,
                      *args,
                      **kwargs):
         (
@@ -3257,6 +4660,312 @@ class TransFusionHead(nn.Module):
 
             loss_dict['loss_calib_trans_pred'] = \
                 loss_calib_trans_pred * 50.0
+        
+        elif self.rrrf_mode == 'residual_se3_v2':
+
+            pred_delta_rot_2nd = (
+                preds_dict[
+                    'pred_delta_rot'
+                ]
+            )
+            # [B,Ncam,3]
+
+            pred_delta_trans_2nd = (
+                preds_dict[
+                    'pred_delta_trans'
+                ]
+            )
+
+            # ========================================================
+            # Stage-1
+            # ========================================================
+
+            rot1 = pred_delta_rot.detach()
+            trans1 = pred_delta_trans.detach()
+
+            # ========================================================
+            # GT total perturbation
+            # ========================================================
+
+            rot_gt = gt_delta_rot.detach()
+            trans_gt = gt_delta_trans.detach()
+
+            R1 = axis_angle_to_matrix(
+                rot1
+            )
+
+            R_gt = axis_angle_to_matrix(
+                rot_gt
+            )
+
+            # ========================================================
+            # CORRECT residual target
+            #
+            # Delta2_GT =
+            #
+            #     inv(Delta1) @ Delta_GT
+            #
+            # Rotation:
+            #
+            #     R2_GT = R1^T @ R_GT
+            # ========================================================
+
+            R2_gt = (
+                R1.transpose(
+                    -1,
+                    -2,
+                )
+                @ R_gt
+            )
+
+            # ========================================================
+            # Translation:
+            #
+            # t2_GT =
+            #
+            #     R1^T @ (tGT - t1)
+            # ========================================================
+
+            trans_diff = (
+                trans_gt
+                - trans1
+            )
+
+            t2_gt = torch.einsum(
+                'bcij,bcj->bci',
+
+                R1.transpose(
+                    -1,
+                    -2,
+                ),
+
+                trans_diff,
+            )
+
+            R2_pred = axis_angle_to_matrix(
+                pred_delta_rot_2nd
+            )
+
+            # ========================================================
+            # Valid cameras
+            # ========================================================
+
+            if stage1_active_cam_mask is None:
+
+                valid_cam = torch.ones(
+                    rot1.shape[:2],
+                    dtype=torch.bool,
+                    device=rot1.device,
+                )
+
+            else:
+
+                valid_cam = (
+                    stage1_active_cam_mask.bool()
+                )
+
+
+            valid_cam = (
+                valid_cam
+                & torch.isfinite(
+                    rot1
+                ).all(dim=-1)
+                & torch.isfinite(
+                    trans1
+                ).all(dim=-1)
+                & torch.isfinite(
+                    rot_gt
+                ).all(dim=-1)
+                & torch.isfinite(
+                    trans_gt
+                ).all(dim=-1)
+            )
+
+
+            if valid_cam.any():
+
+                loss_calib_rot_pred = (
+                    identity_matrix_loss(
+
+                        R2_pred[
+                            valid_cam
+                        ],
+
+                        R2_gt[
+                            valid_cam
+                        ],
+                    )
+                )
+
+
+                loss_calib_trans_pred = (
+                    F.smooth_l1_loss(
+
+                        pred_delta_trans_2nd[
+                            valid_cam
+                        ],
+
+                        t2_gt[
+                            valid_cam
+                        ],
+
+                        reduction='mean',
+                    )
+                )
+
+            else:
+
+                loss_calib_rot_pred = (
+                    pred_delta_rot_2nd.sum()
+                    * 0.0
+                )
+
+                loss_calib_trans_pred = (
+                    pred_delta_trans_2nd.sum()
+                    * 0.0
+                )
+
+
+            loss_dict[
+                'loss_calib_rot_pred'
+            ] = (
+                loss_calib_rot_pred
+                * 100.0
+            )
+
+
+            loss_dict[
+                'loss_calib_trans_pred'
+            ] = (
+                loss_calib_trans_pred
+                * 50.0
+            )
+
+            with torch.no_grad():
+                # ========================================================
+                # Total error prediction
+                #
+                # Delta_total =
+                #
+                #     Delta1 @ Delta2
+                # ========================================================
+
+                R_total = (
+                    R1
+                    @ R2_pred
+                )
+
+
+                t_total = (
+                    trans1
+                    +
+                    torch.einsum(
+                        'bcij,bcj->bci',
+                        R1,
+                        pred_delta_trans_2nd,
+                    )
+                )
+
+
+                # ========================================================
+                # Rotation errors
+                # ========================================================
+
+                rot_s1_rad = geodesic_distance_loss(
+                    R1[valid_cam],
+                    R_gt[valid_cam],
+                )
+
+
+                rot_final_rad = geodesic_distance_loss(
+                    R_total[valid_cam],
+                    R_gt[valid_cam],
+                )
+
+
+                rot_s1_deg = (
+                    rot_s1_rad.mean()
+                    * 180.0
+                    / math.pi
+                )
+
+
+                rot_final_deg = (
+                    rot_final_rad.mean()
+                    * 180.0
+                    / math.pi
+                )
+
+
+                # ========================================================
+                # Translation errors
+                # ========================================================
+
+                trans_s1_l2 = (
+                    torch.linalg.norm(
+                        (
+                            trans1
+                            - trans_gt
+                        )[valid_cam],
+                        dim=-1,
+                    )
+                    .mean()
+                )
+
+
+                trans_final_l2 = (
+                    torch.linalg.norm(
+                        (
+                            t_total
+                            - trans_gt
+                        )[valid_cam],
+                        dim=-1,
+                    )
+                    .mean()
+                )
+
+
+                # Positive gain = Stage-2 improves Stage-1.
+                rot_gain_deg = (
+                    rot_s1_deg
+                    - rot_final_deg
+                )
+
+
+                trans_gain_m = (
+                    trans_s1_l2
+                    - trans_final_l2
+                )
+
+
+            loss_dict[
+                'rrrf_v2_s1_rot_err_deg'
+            ] = rot_s1_deg
+
+
+            loss_dict[
+                'rrrf_v2_final_rot_err_deg'
+            ] = rot_final_deg
+
+
+            loss_dict[
+                'rrrf_v2_rot_gain_deg'
+            ] = rot_gain_deg
+
+
+            loss_dict[
+                'rrrf_v2_s1_trans_err_m'
+            ] = trans_s1_l2
+
+
+            loss_dict[
+                'rrrf_v2_final_trans_err_m'
+            ] = trans_final_l2
+
+
+            loss_dict[
+                'rrrf_v2_trans_gain_m'
+            ] = trans_gain_m
 
         # compute heatmap loss
         loss_heatmap = self.loss_heatmap(
