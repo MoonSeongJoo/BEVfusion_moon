@@ -245,6 +245,7 @@ class BEVFusion(Base3DDetector):
             'z_calib',
             'joint',
             'rrrf',
+            'rrrf_pred_only',   # NEW
             'rrrf_v2_geo',   # V2 SE(3) geometry training
             'rrrf_v2',       # V2 SE(3) + refined attention
             'rrrf_full',
@@ -259,6 +260,7 @@ class BEVFusion(Base3DDetector):
         
         self.rrrf_training_stages = {
             'rrrf',
+            'rrrf_pred_only',   # NEW
             'rrrf_v2_geo',
             'rrrf_v2',
             'rrrf_full',
@@ -824,6 +826,42 @@ class BEVFusion(Base3DDetector):
 
             freeze(module)
 
+        # ============================================================
+        # RRRF V1 predictor-only adaptation
+        # ============================================================
+
+        if stage == 'rrrf_pred_only':
+
+            if (
+                getattr(
+                    self.bbox_head,
+                    'rrrf_mode',
+                    None,
+                )
+                != 'residual_se3'
+            ):
+                raise RuntimeError(
+                    'rrrf_pred_only requires '
+                    'bbox_head.rrrf_mode="residual_se3".'
+                )
+
+            # Everything above remains frozen.
+            # Re-open ONLY the Stage-2 residual predictor.
+            trainable(
+                self.bbox_head.calibration_predictor
+            )
+
+            print(
+                '\n'
+                '=========================================\n'
+                '[RRRF PREDICTOR-ONLY TRAINING]\n'
+                '=========================================\n'
+                'ALL modules           : FROZEN\n'
+                'calibration_predictor : TRAINABLE\n'
+                '========================================='
+            )
+
+            return
 
         # ============================================================
         # 4. Common RRRF front-end
@@ -1180,7 +1218,21 @@ class BEVFusion(Base3DDetector):
             if stage != 'rrrf_full':
 
                 self.bbox_head.eval()
+            
+            # ========================================================
+            # RRRF V1 predictor-only adaptation
+            #
+            # Keep ALL frozen modules in eval mode.
+            # Re-open ONLY calibration_predictor.
+            # ========================================================
 
+            if stage == 'rrrf_pred_only':
+
+                self.feat_projector.eval()
+
+                self.bbox_head.calibration_predictor.train()
+
+                return self
 
             # ========================================================
             # Coarse RRRF
@@ -1315,6 +1367,7 @@ class BEVFusion(Base3DDetector):
 
         if self.lgpc_train_stage in {
             'rrrf',
+            'rrrf_pred_only',
             'rrrf_full',
         }:
 
@@ -1335,6 +1388,37 @@ class BEVFusion(Base3DDetector):
                 if module is not None:
                     module.eval()
 
+            if self.lgpc_train_stage == 'rrrf_pred_only':
+
+                # Full frozen network in eval mode
+                for module in [
+                    self.img_backbone,
+                    self.img_neck,
+                    self.img_bbox_head,
+
+                    self.corr,
+                    self.z_estimator,
+                    self.calib_head,
+
+                    self.pts_voxel_encoder,
+                    self.pts_middle_encoder,
+                    self.pts_backbone,
+                    self.pts_neck,
+
+                    self.view_transform,
+                    self.fusion_layer,
+
+                    self.feat_projector,
+                    self.bbox_head,
+                ]:
+                    if module is not None:
+                        module.eval()
+
+                # bbox_head.eval() above also switches predictor to eval,
+                # so explicitly re-open ONLY predictor train mode.
+                self.bbox_head.calibration_predictor.train()
+
+                return self
 
             # ========================================================
             # RRRF-only warm-up
@@ -3627,7 +3711,7 @@ class BEVFusion(Base3DDetector):
             )
 
 
-            if num_valid < 6:
+            if num_valid < 3:
 
                 raise RuntimeError(
                     '[GEO SOLVER] '

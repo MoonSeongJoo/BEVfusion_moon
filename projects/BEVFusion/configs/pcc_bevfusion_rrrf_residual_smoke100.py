@@ -83,7 +83,7 @@ model_wrapper_cfg = dict(
 train_cfg = dict(
     _delete_=True,
     type='IterBasedTrainLoop',
-    max_iters=10000,
+    max_iters=200,
     val_interval=999999,
 )
 
@@ -144,9 +144,9 @@ default_hooks = dict(
     checkpoint=dict(
         _delete_=True,
         type='CheckpointHook',
-        interval=1,
-        by_epoch=True,
-        max_keep_ckpts=4,
+        interval=1000,
+        by_epoch=False,
+        max_keep_ckpts=3,
         save_last=True,
     ),
 
@@ -167,9 +167,7 @@ default_hooks = dict(
 # ============================================================
 
 load_from = (
-    'data/work_dirs/'
-    'pcc_repair_v1_lgpc_zcalib_ddp2/'
-    'epoch_4.pth'
+    "data/work_dirs/pcc_rrrf_feature_refine_full/iter_2000.pth"
 )
 
-resume = False
+resume = True
