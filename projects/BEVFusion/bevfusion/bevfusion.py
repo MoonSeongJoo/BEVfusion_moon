@@ -242,6 +242,8 @@ class BEVFusion(Base3DDetector):
             'corr_refine',
             'z',
             'calib',
+            'calib_trans_geo',
+            'calib_trans_geo_feat', 
             'z_calib',
             'joint',
             'rrrf',
@@ -637,6 +639,108 @@ class BEVFusion(Base3DDetector):
             train_calib,
         )
 
+        # ============================================================
+        # Candidate-A:
+        # Geometric Translation-only stage
+        # ============================================================
+
+        if stage == 'calib_trans_geo':
+
+            # First freeze entire CalibHead.
+            for p in self.calib_head.parameters():
+                p.requires_grad = False
+
+
+            # Train ONLY Candidate-A translation path.
+            trainable_prefixes = (
+
+                'rot_condition_encoder.',
+
+                'trans_score_head.',
+
+                'trans_residual_head.',
+            )
+
+
+            for name, p in (
+                self.calib_head.named_parameters()
+            ):
+
+                if name.startswith(
+                    trainable_prefixes
+                ):
+
+                    p.requires_grad = True
+
+
+        # ============================================================
+        # Candidate-B:
+        # Rotation-compensated geometric feature residual stage
+        #
+        # Existing LGPC:
+        #     FROZEN
+        #
+        # New B modules:
+        #     TRAIN
+        # ============================================================
+
+        if stage == 'calib_trans_geo_feat':
+
+            # --------------------------------------------------------
+            # Safety check
+            # --------------------------------------------------------
+
+            if (
+                getattr(
+                    self.calib_head,
+                    'trans_refine_mode',
+                    None,
+                )
+                != 'geo_feature_residual'
+            ):
+
+                raise RuntimeError(
+                    'lgpc_train_stage="calib_trans_geo_feat" '
+                    'requires '
+                    'calib_head.trans_refine_mode='
+                    '"geo_feature_residual". '
+                    f'Current='
+                    f'{getattr(self.calib_head, "trans_refine_mode", None)}'
+                )
+
+
+            # --------------------------------------------------------
+            # Freeze entire existing CalibHead first.
+            # --------------------------------------------------------
+
+            for p in self.calib_head.parameters():
+
+                p.requires_grad = False
+
+
+            # --------------------------------------------------------
+            # Re-open ONLY Candidate-B modules.
+            # --------------------------------------------------------
+
+            trainable_prefixes_b = (
+
+                'geo_feature_encoder.',
+
+                'geo_score_head.',
+
+                'geo_residual_head.',
+            )
+
+
+            for name, p in (
+                self.calib_head.named_parameters()
+            ):
+
+                if name.startswith(
+                    trainable_prefixes_b
+                ):
+
+                    p.requires_grad = True
 
         print(
             '\n'
@@ -672,6 +776,32 @@ class BEVFusion(Base3DDetector):
 
             print(
                 'LocalRefiner = TRAIN'
+            )
+        
+        if stage == 'calib_trans_geo_feat':
+
+            print(
+                'Candidate-B modules:'
+            )
+
+            print(
+                '  geo_feature_encoder = TRAIN'
+            )
+
+            print(
+                '  geo_score_head       = TRAIN'
+            )
+
+            print(
+                '  geo_residual_head    = TRAIN'
+            )
+
+            print(
+                '  existing trans_head  = FROZEN'
+            )
+
+            print(
+                '  existing rot_head    = FROZEN'
             )
 
         print(
@@ -1607,6 +1737,67 @@ class BEVFusion(Base3DDetector):
 
             # Only CalibHead is optimized.
             self.calib_head.train()
+        
+        elif stage == 'calib_trans_geo':
+
+            # Fixed feature providers.
+            self.corr.eval()
+            self.z_estimator.eval()
+
+            # IMPORTANT:
+            # Entire CalibHead starts in eval mode.
+            #
+            # This prevents Dropout in the frozen rotation
+            # path from changing rotation predictions.
+            self.calib_head.eval()
+
+
+            # Re-open ONLY translation-specific modules.
+            self.calib_head.rot_condition_encoder.train()
+
+            self.calib_head.trans_score_head.train()
+
+            self.calib_head.trans_residual_head.train()
+        
+        elif stage == 'calib_trans_geo_feat':
+
+            # ========================================================
+            # Candidate-B train/eval mode restoration
+            #
+            # MMEngine calls model.train() repeatedly.
+            #
+            # Therefore:
+            #   frozen pretrained modules -> eval()
+            #   new B modules             -> train()
+            # ========================================================
+
+            # Fixed upstream feature providers.
+            self.corr.eval()
+
+            self.z_estimator.eval()
+
+
+            # --------------------------------------------------------
+            # Entire existing CalibHead first goes to eval mode.
+            #
+            # This is CRITICAL:
+            #
+            # existing trans_head contains Dropout.
+            # We want deterministic pretrained t_neural.
+            # --------------------------------------------------------
+
+            self.calib_head.eval()
+
+
+            # --------------------------------------------------------
+            # Re-open ONLY Candidate-B modules.
+            # --------------------------------------------------------
+
+            self.calib_head.geo_feature_encoder.train()
+
+            self.calib_head.geo_score_head.train()
+
+            self.calib_head.geo_residual_head.train()
         
         elif stage == 'z_calib':
 
@@ -3401,6 +3592,80 @@ class BEVFusion(Base3DDetector):
             'cam2lidar': camera2lidar,
         }
     
+
+    def _geo_masked_diag_mean(
+        self,
+        diagnostics,
+        key,
+    ):
+
+        valid_mask = diagnostics[
+            'solver_valid_mask'
+        ]
+
+        if bool(valid_mask.any()):
+
+            return diagnostics[
+                key
+            ][valid_mask].mean()
+
+
+        return diagnostics[
+            key
+        ].new_tensor(
+            float('nan')
+        )
+
+    def _geo_masked_translation_error(
+        self,
+        pred_trans,
+        gt_trans,
+        diagnostics,
+    ):
+
+        valid_mask = diagnostics[
+            'solver_valid_mask'
+        ]
+
+        if bool(
+            valid_mask.any()
+        ):
+
+            diff = (
+                pred_trans[
+                    valid_mask
+                ]
+                -
+                gt_trans[
+                    valid_mask
+                ]
+            )
+
+            mae = torch.abs(
+                diff
+            ).mean()
+
+            l2 = torch.linalg.norm(
+                diff,
+                dim=-1,
+            ).mean()
+
+            return mae, l2
+
+
+        # No camera was solvable.
+        #
+        # Diagnostic only:
+        # preserve the sample without crashing.
+        nan_value = pred_trans.new_tensor(
+            float('nan')
+        )
+
+        return (
+            nan_value,
+            nan_value,
+        )
+    
     @torch.no_grad()
     def _solve_translation_given_rotation(
         self,
@@ -3662,6 +3927,10 @@ class BEVFusion(Base3DDetector):
         valid_counts = []
         residuals = []
         cond_numbers = []
+        # NEW:
+        # Whether each camera had enough geometric constraints
+        # to produce a reliable translation solution.
+        solver_valid_flags = []
 
 
         for cam_idx in range(A_cam):
@@ -3711,13 +3980,53 @@ class BEVFusion(Base3DDetector):
             )
 
 
+            # ============================================================
+            # Not enough object-centric correspondences.
+            #
+            # This is a NORMAL validation edge case.
+            #
+            # Some cameras may contain no usable object/query anchors.
+            # Do NOT abort the entire DDP validation.
+            #
+            # Fallback:
+            #     delta translation = [0, 0, 0]
+            #
+            # Meaning:
+            #     no translation correction for this camera.
+            #
+            # The camera is also marked invalid for GEO diagnostic
+            # averaging so that this fallback does not contaminate
+            # A/B/C/D oracle statistics.
+            # ============================================================
+
             if num_valid < 3:
 
-                raise RuntimeError(
-                    '[GEO SOLVER] '
-                    f'cam={cam_idx}: '
-                    f'only {num_valid} valid points.'
+                solver_valid_flags.append(
+                    False
                 )
+
+                # pred_trans was initialized to zero,
+                # therefore leave:
+                #
+                # pred_trans[cam_idx] = [0, 0, 0]
+
+                residuals.append(
+                    torch.tensor(
+                        0.0,
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                )
+
+                cond_numbers.append(
+                    torch.tensor(
+                        float('inf'),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                )
+
+                continue
 
 
             r = (
@@ -3850,6 +4159,40 @@ class BEVFusion(Base3DDetector):
             # 8. Least-squares solve
             # ========================================================
 
+            # Even with >= 3 points, degenerate ray geometry can make
+            # the linear system rank deficient.
+            matrix_rank = int(
+                torch.linalg.matrix_rank(
+                    A_matrix
+                ).item()
+            )
+
+
+            if matrix_rank < 3:
+
+                solver_valid_flags.append(
+                    False
+                )
+
+                residuals.append(
+                    torch.tensor(
+                        0.0,
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                )
+
+                cond_numbers.append(
+                    torch.tensor(
+                        float('inf'),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                )
+
+                continue
+
+
             solution = torch.linalg.lstsq(
                 A_matrix,
                 b_vector,
@@ -3859,9 +4202,42 @@ class BEVFusion(Base3DDetector):
             ]
 
 
+            # Additional numerical safety.
+            if not torch.isfinite(
+                solution
+            ).all():
+
+                solver_valid_flags.append(
+                    False
+                )
+
+                residuals.append(
+                    torch.tensor(
+                        0.0,
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                )
+
+                cond_numbers.append(
+                    torch.tensor(
+                        float('inf'),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                )
+
+                continue
+
+
             pred_trans[
                 cam_idx
             ] = solution
+
+
+            solver_valid_flags.append(
+                True
+            )
 
 
             # ========================================================
@@ -3897,7 +4273,15 @@ class BEVFusion(Base3DDetector):
             )
 
 
+        solver_valid_mask = torch.tensor(
+            solver_valid_flags,
+            device=device,
+            dtype=torch.bool,
+        )
+
+
         diagnostics = {
+
             'valid_count':
                 torch.tensor(
                     valid_counts,
@@ -3905,10 +4289,28 @@ class BEVFusion(Base3DDetector):
                     dtype=torch.float32,
                 ),
 
+
+            'solver_valid_mask':
+                solver_valid_mask,
+
+
+            'solver_valid_count':
+                solver_valid_mask
+                .float()
+                .sum(),
+
+
+            'solver_valid_ratio':
+                solver_valid_mask
+                .float()
+                .mean(),
+
+
             'residual_rmse':
                 torch.stack(
                     residuals
                 ).float(),
+
 
             'condition_number':
                 torch.stack(
@@ -4941,7 +5343,11 @@ class BEVFusion(Base3DDetector):
 
             if (
                 self.is_lgpc_stage1
-                and self.lgpc_train_stage == 'calib'
+                and self.lgpc_train_stage in {
+                    'calib',
+                    'calib_trans_geo',
+                    'calib_trans_geo_feat',
+                }
                 and len(active_cam_indices) == 0
             ):
 
@@ -7736,6 +8142,49 @@ class BEVFusion(Base3DDetector):
                         )
                         * 25.0
                     )
+                
+                if stage in {
+                    'calib_trans_geo',
+                    'calib_trans_geo_feat',
+                }:
+
+                    # ========================================================
+                    # Translation-only optimization
+                    #
+                    # Rotation is pretrained/frozen.
+                    # ========================================================
+
+                    losses['loss_calib_trans'] = (
+
+                        F.smooth_l1_loss(
+
+                            pred_trans_filtered,
+
+                            gt_trans_filtered,
+
+                            reduction='mean',
+                        )
+
+                        * 25.0
+                    )
+
+
+                    # --------------------------------------------------------
+                    # Rotation metric is logging only.
+                    #
+                    # detach() ensures it cannot influence optimization.
+                    # --------------------------------------------------------
+
+                    losses['calib_rot_frozen_obj'] = (
+
+                        identity_matrix_loss(
+
+                            R_pred_calib,
+
+                            R_gt_calib,
+
+                        ).detach()
+                    )
 
                 # ============================================================
                 # Physical Calib diagnostics
@@ -9083,32 +9532,23 @@ class BEVFusion(Base3DDetector):
                 )
 
 
-                d_common_mae = (
-                    torch.abs(
-                        trans_d_common
-                        - gt_trans_active
-                    )
-                    .mean()
+                (
+                    d_common_mae,
+                    d_common_l2,
+                ) = self._geo_masked_translation_error(
+                    trans_d_common,
+                    gt_trans_active,
+                    diag_d_common,
                 )
 
-
-                d_common_l2 = (
-                    torch.linalg.norm(
-                        trans_d_common
-                        - gt_trans_active,
-                        dim=-1,
-                    )
-                    .mean()
+                (
+                    a_mae,
+                    a_l2,
+                ) = self._geo_masked_translation_error(
+                    trans_a,
+                    gt_trans_active,
+                    diag_a,
                 )
-
-                a_mae = torch.abs(
-                    trans_a - gt_trans_active
-                ).mean()
-
-                a_l2 = torch.linalg.norm(
-                    trans_a - gt_trans_active,
-                    dim=-1,
-                ).mean()
 
                 # ========================================================
                 # B. CORRNET-ONLY ERROR ISOLATION
@@ -9139,14 +9579,14 @@ class BEVFusion(Base3DDetector):
                     delta_rot=gt_rot_active,
                 )
 
-                b_mae = torch.abs(
-                    trans_b - gt_trans_active
-                ).mean()
-
-                b_l2 = torch.linalg.norm(
-                    trans_b - gt_trans_active,
-                    dim=-1,
-                ).mean()
+                (
+                    b_mae,
+                    b_l2,
+                ) = self._geo_masked_translation_error(
+                    trans_b,
+                    gt_trans_active,
+                    diag_b,
+                )
 
                 # ========================================================
                 # C. ZESTIMATOR-ONLY ERROR ISOLATION
@@ -9186,14 +9626,14 @@ class BEVFusion(Base3DDetector):
                     delta_rot=gt_rot_active,
                 )
 
-                c_mae = torch.abs(
-                    trans_c - gt_trans_active
-                ).mean()
-
-                c_l2 = torch.linalg.norm(
-                    trans_c - gt_trans_active,
-                    dim=-1,
-                ).mean()
+                (
+                    c_mae,
+                    c_l2,
+                ) = self._geo_masked_translation_error(
+                    trans_c,
+                    gt_trans_active,
+                    diag_c,
+                )
 
                 # ========================================================
                 # D. REAL PROVIDER TEST
@@ -9218,14 +9658,14 @@ class BEVFusion(Base3DDetector):
                     delta_rot=gt_rot_active,
                 )
 
-                d_mae = torch.abs(
-                    trans_d - gt_trans_active
-                ).mean()
-
-                d_l2 = torch.linalg.norm(
-                    trans_d - gt_trans_active,
-                    dim=-1,
-                ).mean()
+                (
+                    d_mae,
+                    d_l2,
+                ) = self._geo_masked_translation_error(
+                    trans_d,
+                    gt_trans_active,
+                    diag_d,
+                )
 
                 # Keep scalar diagnostics so they can be attached to
                 # DataSample.metainfo as well as printed.
@@ -9236,7 +9676,10 @@ class BEVFusion(Base3DDetector):
                         diag_a['valid_count'].float().mean().detach().cpu()
                     ),
                     'geo_A_residual_rmse': float(
-                        diag_a['residual_rmse'].mean().detach().cpu()
+                        self._geo_masked_diag_mean(
+                            diag_a,
+                            'residual_rmse',
+                        ).detach().cpu()
                     ),
                     'geo_B_mae_m': float(b_mae.detach().cpu()),
                     'geo_B_l2_m': float(b_l2.detach().cpu()),
@@ -9244,7 +9687,10 @@ class BEVFusion(Base3DDetector):
                         diag_b['valid_count'].float().mean().detach().cpu()
                     ),
                     'geo_B_residual_rmse': float(
-                        diag_b['residual_rmse'].mean().detach().cpu()
+                        self._geo_masked_diag_mean(
+                            diag_b,
+                            'residual_rmse',
+                        ).detach().cpu()
                     ),
                     'geo_C_mae_m': float(c_mae.detach().cpu()),
                     'geo_C_l2_m': float(c_l2.detach().cpu()),
@@ -9252,7 +9698,10 @@ class BEVFusion(Base3DDetector):
                         diag_c['valid_count'].float().mean().detach().cpu()
                     ),
                     'geo_C_residual_rmse': float(
-                        diag_c['residual_rmse'].mean().detach().cpu()
+                        self._geo_masked_diag_mean(
+                            diag_c,
+                            'residual_rmse',
+                        ).detach().cpu()
                     ),
                     'geo_D_mae_m': float(d_mae.detach().cpu()),
                     'geo_D_l2_m': float(d_l2.detach().cpu()),
@@ -9260,7 +9709,10 @@ class BEVFusion(Base3DDetector):
                         diag_d['valid_count'].float().mean().detach().cpu()
                     ),
                     'geo_D_residual_rmse': float(
-                        diag_d['residual_rmse'].mean().detach().cpu()
+                        self._geo_masked_diag_mean(
+                            diag_d,
+                            'residual_rmse',
+                        ).detach().cpu()
                     ),
                     'geo_D_common_mae_m': float(
                         d_common_mae.detach().cpu()
@@ -9277,9 +9729,40 @@ class BEVFusion(Base3DDetector):
                     ),
 
                     'geo_D_common_residual_rmse': float(
+                        self._geo_masked_diag_mean(
+                            diag_d_common,
+                            'residual_rmse',
+                        ).detach().cpu()
+                    ),
+
+                    'geo_A_solver_valid_ratio': float(
+                        diag_a[
+                            'solver_valid_ratio'
+                        ].detach().cpu()
+                    ),
+
+                    'geo_B_solver_valid_ratio': float(
+                        diag_b[
+                            'solver_valid_ratio'
+                        ].detach().cpu()
+                    ),
+
+                    'geo_C_solver_valid_ratio': float(
+                        diag_c[
+                            'solver_valid_ratio'
+                        ].detach().cpu()
+                    ),
+
+                    'geo_D_solver_valid_ratio': float(
+                        diag_d[
+                            'solver_valid_ratio'
+                        ].detach().cpu()
+                    ),
+
+                    'geo_D_common_solver_valid_ratio': float(
                         diag_d_common[
-                            'residual_rmse'
-                        ].mean().detach().cpu()
+                            'solver_valid_ratio'
+                        ].detach().cpu()
                     ),
                 }
 

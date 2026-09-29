@@ -472,6 +472,7 @@ class CalibrationCorrectionHead(BaseModule):
         #   always ZEstimator prediction
         # ========================================================
         z_gate_mode: str = 'learned',
+        trans_refine_mode='neural',
         init_cfg=None,
     ):
         super().__init__(
@@ -483,6 +484,26 @@ class CalibrationCorrectionHead(BaseModule):
         self.camera_pose_dim = camera_pose_dim
 
         self.z_gate_mode = z_gate_mode
+
+        self.trans_refine_mode = trans_refine_mode
+
+        valid_trans_refine_modes = {
+            'neural',
+            'geo_wls',
+            'geo_feature_residual',
+        }
+
+        if self.trans_refine_mode not in valid_trans_refine_modes:
+            raise ValueError(
+                f'Unsupported trans_refine_mode='
+                f'{self.trans_refine_mode}, '
+                f'valid={valid_trans_refine_modes}'
+            )
+
+        print(
+            '[CalibrationCorrectionHead] '
+            f'trans_refine_mode = {self.trans_refine_mode}'
+        )
 
         valid_z_gate_modes = {
             'learned',
@@ -832,6 +853,164 @@ class CalibrationCorrectionHead(BaseModule):
         )
         # 144 + 16 = 160
 
+        # ============================================================
+        # B: Rotation-compensated geometric feature residual
+        #
+        # Existing pretrained trans_head is preserved.
+        #
+        # t_final =
+        #     t_neural
+        #     + delta_t_geo_feature
+        # ============================================================
+
+        self.geo_feature_dim = 32
+
+        # ------------------------------------------------------------
+        # Per-point geometric input
+        #
+        # rotated camera XYZ          3
+        # post-rotation ray residual  2
+        # source depth                1
+        # Z reliability               4
+        # Z gate                      1
+        # residual magnitude          1
+        #
+        # total = 12
+        # ------------------------------------------------------------
+
+        geo_point_input_dim = 12
+
+
+        self.geo_feature_encoder = nn.Sequential(
+
+            nn.Linear(
+                geo_point_input_dim,
+                64,
+            ),
+
+            nn.LayerNorm(
+                64,
+            ),
+
+            nn.Mish(),
+
+            nn.Linear(
+                64,
+                self.geo_feature_dim,
+            ),
+
+            nn.LayerNorm(
+                self.geo_feature_dim,
+            ),
+
+            nn.Mish(),
+        )
+
+
+        # ------------------------------------------------------------
+        # Learn which geometric correspondences are trustworthy.
+        #
+        # geo feature             32
+        # Z reliability            4
+        # Z gate                   1
+        # ray residual magnitude   1
+        #
+        # total = 38
+        # ------------------------------------------------------------
+
+        geo_score_input_dim = (
+            self.geo_feature_dim
+            + self.z_reliability_dim
+            + 1
+            + 1
+        )
+
+
+        self.geo_score_head = nn.Sequential(
+
+            nn.Linear(
+                geo_score_input_dim,
+                32,
+            ),
+
+            nn.Mish(),
+
+            nn.Linear(
+                32,
+                1,
+            ),
+        )
+
+
+        # ------------------------------------------------------------
+        # Residual translation head
+        #
+        # existing trans_feature   160
+        # geo aggregate             32
+        # t_neural                   3
+        #
+        # total = 195
+        # ------------------------------------------------------------
+
+        geo_residual_input_dim = (
+            trans_pose_input_dim
+            + self.geo_feature_dim
+            + 3
+        )
+
+
+        self.geo_residual_head = nn.Sequential(
+
+            nn.Linear(
+                geo_residual_input_dim,
+                128,
+            ),
+
+            nn.LayerNorm(
+                128,
+            ),
+
+            nn.Mish(),
+
+            nn.Linear(
+                128,
+                64,
+            ),
+
+            nn.LayerNorm(
+                64,
+            ),
+
+            nn.Mish(),
+
+            nn.Linear(
+                64,
+                3,
+            ),
+        )
+
+
+        # Residual is intentionally bounded.
+        self.geo_feature_residual_max_m = 0.5
+
+
+        # ============================================================
+        # IMPORTANT:
+        # Initial B model must be EXACTLY the old neural baseline.
+        #
+        # delta_t_geo = 0
+        # =>
+        # t_final = t_neural
+        # ============================================================
+
+        nn.init.zeros_(
+            self.geo_residual_head[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.geo_residual_head[-1].bias
+        )
+
         self.trans_head = nn.Sequential(
 
             nn.Linear(
@@ -866,6 +1045,74 @@ class CalibrationCorrectionHead(BaseModule):
                 64,
                 3,
             ),
+        )
+
+        # ============================================================
+        # Geometric translation residual head
+        #
+        # input:
+        #     trans_feature     160
+        #     normalized T_geo    3
+        #
+        # total                163
+        # ============================================================
+
+        self.geo_trans_scale_m = 1.5
+        self.geo_residual_max_m = 0.75
+
+
+        geo_residual_input_dim = (
+            trans_pose_input_dim
+            + 3
+        )
+
+        self.trans_residual_head = nn.Sequential(
+
+            nn.Linear(
+                geo_residual_input_dim,
+                128,
+            ),
+
+            nn.LayerNorm(
+                128,
+            ),
+
+            nn.Mish(),
+
+            nn.Dropout(
+                dropout_p,
+            ),
+
+
+            nn.Linear(
+                128,
+                64,
+            ),
+
+            nn.LayerNorm(
+                64,
+            ),
+
+            nn.Mish(),
+
+
+            nn.Linear(
+                64,
+                3,
+            ),
+        )
+
+
+        # IMPORTANT:
+        # Start from pure geometric translation.
+        #
+        # initial residual = 0
+        nn.init.zeros_(
+            self.trans_residual_head[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.trans_residual_head[-1].bias
         )
 
 
@@ -959,6 +1206,594 @@ class CalibrationCorrectionHead(BaseModule):
             self.depth_gate[-1].bias
         )
 
+    def _build_rotation_compensated_geo_feature(
+        self,
+        source_xyz,
+        target_ray,
+        pred_rot,
+        broken_camera2lidar,
+        z_reliability,
+        z_gate,
+        point_valid_mask,
+    ):
+        """
+        Build geometric residual AFTER predicted rotation compensation.
+
+        No translation is analytically solved here.
+
+        The geometry is treated as an informative feature,
+        NOT as a hard translation solution.
+        """
+
+        # ============================================================
+        # 1. Protect existing pretrained branches
+        # ============================================================
+
+        source_xyz = source_xyz.detach()
+        target_ray = target_ray.detach()
+        pred_rot = pred_rot.detach()
+
+        B = broken_camera2lidar.detach()
+
+        z_reliability_det = z_reliability.detach()
+        z_gate_det = z_gate.detach()
+
+
+        # ============================================================
+        # 2. Broken camera -> LiDAR
+        # ============================================================
+
+        R_b = B[..., :3, :3]
+        t_b = B[..., :3, 3]
+
+        p_lidar = (
+            torch.matmul(
+                R_b.unsqueeze(1),
+                source_xyz.unsqueeze(-1),
+            ).squeeze(-1)
+            +
+            t_b.unsqueeze(1)
+        )
+
+
+        # ============================================================
+        # 3. Apply predicted calibration ROTATION only
+        #
+        # No translation correction here.
+        # ============================================================
+
+        R_delta = axis_angle_to_matrix(
+            pred_rot
+        )
+
+
+        p_rot_lidar = torch.matmul(
+            R_delta.unsqueeze(1),
+            p_lidar.unsqueeze(-1),
+        ).squeeze(-1)
+
+
+        # ============================================================
+        # 4. Express rotation-compensated point back
+        #    in broken-camera coordinates
+        #
+        # same geometry used as c0 in Candidate A
+        # ============================================================
+
+        p_rot_cam = torch.matmul(
+            R_b.transpose(-1, -2).unsqueeze(1),
+            (
+                p_rot_lidar
+                - t_b.unsqueeze(1)
+            ).unsqueeze(-1),
+        ).squeeze(-1)
+
+
+        p_rot_cam = torch.nan_to_num(
+            p_rot_cam,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+
+        # ============================================================
+        # 5. Build valid geometry mask
+        # ============================================================
+
+        geo_valid_mask = (
+            point_valid_mask.bool()
+            &
+            torch.isfinite(
+                p_rot_cam
+            ).all(dim=-1)
+            &
+            (
+                p_rot_cam[..., 2]
+                > 1.0e-3
+            )
+        )
+
+
+        # ============================================================
+        # 6. Rotation-compensated ray
+        # ============================================================
+
+        z_rot = (
+            p_rot_cam[..., 2:3]
+            .clamp_min(1.0e-3)
+        )
+
+
+        rot_ray_xy = (
+            p_rot_cam[..., :2]
+            / z_rot
+        )
+
+
+        target_ray_xy = (
+            target_ray[..., :2]
+        )
+
+
+        # ============================================================
+        # 7. Remaining geometric inconsistency AFTER rotation
+        #
+        # This is the most important B feature.
+        # ============================================================
+
+        post_rot_ray_delta = (
+            target_ray_xy
+            - rot_ray_xy
+        )
+
+
+        post_rot_ray_delta = torch.nan_to_num(
+            post_rot_ray_delta,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+
+        # Stabilized network input
+        post_rot_ray_delta_norm = (
+            post_rot_ray_delta
+            .clamp(
+                min=-2.0,
+                max=2.0,
+            )
+            / 2.0
+        )
+
+
+        post_rot_residual_norm = (
+            torch.linalg.vector_norm(
+                post_rot_ray_delta,
+                dim=-1,
+                keepdim=True,
+            )
+            .clamp(
+                min=0.0,
+                max=2.0,
+            )
+            / 2.0
+        )
+
+
+        # ============================================================
+        # 8. Normalize rotated 3D geometry
+        # ============================================================
+
+        p_rot_cam_norm = (
+            p_rot_cam
+            / 80.0
+        ).clamp(
+            min=-2.0,
+            max=2.0,
+        )
+
+
+        source_z_norm = (
+            source_xyz[..., 2:3]
+            / 80.0
+        ).clamp(
+            min=0.0,
+            max=1.0,
+        )
+
+
+        # ============================================================
+        # 9. 12-D per-point B feature
+        # ============================================================
+
+        geo_point_input = torch.cat(
+            [
+                p_rot_cam_norm,             # 3
+                post_rot_ray_delta_norm,    # 2
+                source_z_norm,              # 1
+                z_reliability_det,          # 4
+                z_gate_det,                 # 1
+                post_rot_residual_norm,     # 1
+            ],
+            dim=-1,
+        )
+
+
+        geo_point_input = torch.nan_to_num(
+            geo_point_input,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+
+        return (
+            geo_point_input,
+            geo_valid_mask,
+            post_rot_residual_norm,
+        )
+
+    def _solve_geometric_translation(
+        self,
+        source_xyz,
+        target_ray,
+        pred_rot,
+        broken_camera2lidar,
+        trans_weight,
+        point_valid_mask,
+    ):
+        """
+        Differentiable geometric translation solver.
+
+        Solves t_delta in the SAME frame/convention as:
+            T_broken_C2L = Delta @ T_clean_C2L
+
+        Inputs
+        ------
+        source_xyz:
+            [M,Q,3]
+            3D source points reconstructed from broken projection
+            in broken-camera coordinates.
+
+        target_ray:
+            [M,Q,3]
+            [x, y, 1] clean/target image rays.
+
+        pred_rot:
+            [M,3]
+            predicted axis-angle Delta rotation.
+
+        broken_camera2lidar:
+            [M,4,4]
+
+        trans_weight:
+            [M,Q]
+
+        point_valid_mask:
+            [M,Q]
+
+        Returns
+        -------
+        t_geo:
+            [M,3]
+            geometric estimate of Delta translation.
+        """
+
+        orig_dtype = source_xyz.dtype
+
+        # --------------------------------------------------------
+        # Solve WLS in FP32 even under AMP.
+        # Much safer for 3x3 linear solve.
+        # --------------------------------------------------------
+
+        source_xyz_f = source_xyz.float()
+        target_ray_f = target_ray.float()
+        trans_weight_f = trans_weight.float()
+
+        B = broken_camera2lidar.float()
+
+        # --------------------------------------------------------
+        # IMPORTANT:
+        # First implementation protects the already-good
+        # rotation predictor.
+        #
+        # Translation loss does NOT backprop into rotation head.
+        # --------------------------------------------------------
+
+        pred_rot_for_geo = pred_rot.detach().float()
+
+        R_delta = axis_angle_to_matrix(
+            pred_rot_for_geo
+        )
+        # [M,3,3]
+
+
+        # --------------------------------------------------------
+        # Broken camera -> LiDAR
+        # --------------------------------------------------------
+
+        R_b = B[..., :3, :3]
+        # [M,3,3]
+
+        t_b = B[..., :3, 3]
+        # [M,3]
+
+
+        # --------------------------------------------------------
+        # p_i = B * source_xyz
+        #
+        # source XYZ:
+        # broken-camera frame
+        #
+        # p_lidar:
+        # LiDAR-side coordinates
+        # --------------------------------------------------------
+
+        p_lidar = (
+            torch.matmul(
+                R_b.unsqueeze(1),
+                source_xyz_f.unsqueeze(-1),
+            ).squeeze(-1)
+            +
+            t_b.unsqueeze(1)
+        )
+        # [M,Q,3]
+
+
+        # --------------------------------------------------------
+        # c0_i =
+        #
+        # R_B^T (
+        #     R_delta * p_i
+        #     - t_B
+        # )
+        #
+        # Then:
+        #
+        # clean_camera_point
+        # =
+        # c0_i + R_B^T * t_delta
+        # --------------------------------------------------------
+
+        rotated_p = torch.matmul(
+            R_delta.unsqueeze(1),
+            p_lidar.unsqueeze(-1),
+        ).squeeze(-1)
+        # [M,Q,3]
+
+
+        c0 = torch.matmul(
+            R_b.transpose(-1, -2).unsqueeze(1),
+            (
+                rotated_p
+                - t_b.unsqueeze(1)
+            ).unsqueeze(-1),
+        ).squeeze(-1)
+        # [M,Q,3]
+
+
+        # --------------------------------------------------------
+        # Target normalized ray
+        #
+        # target_ray = [x, y, 1]
+        # --------------------------------------------------------
+
+        x = target_ray_f[..., 0]
+        y = target_ray_f[..., 1]
+
+
+        M, Q = x.shape
+
+
+        # --------------------------------------------------------
+        # H_i =
+        #
+        # [ 1  0  -x ]
+        # [ 0  1  -y ]
+        # --------------------------------------------------------
+
+        H = torch.zeros(
+            M,
+            Q,
+            2,
+            3,
+            device=source_xyz.device,
+            dtype=torch.float32,
+        )
+
+        H[..., 0, 0] = 1.0
+        H[..., 0, 2] = -x
+
+        H[..., 1, 1] = 1.0
+        H[..., 1, 2] = -y
+
+
+        # --------------------------------------------------------
+        # A_i = H_i R_B^T
+        # --------------------------------------------------------
+
+        R_b_inv = R_b.transpose(
+            -1,
+            -2,
+        )
+
+        A = torch.matmul(
+            H,
+            R_b_inv.unsqueeze(1),
+        )
+        # [M,Q,2,3]
+
+
+        # --------------------------------------------------------
+        # b_i = -H_i c0_i
+        # --------------------------------------------------------
+
+        b = -torch.matmul(
+            H,
+            c0.unsqueeze(-1),
+        ).squeeze(-1)
+        # [M,Q,2]
+
+
+        # --------------------------------------------------------
+        # Weight
+        #
+        # Invalid correspondences must be exactly zero.
+        # --------------------------------------------------------
+
+        geo_valid_mask = (
+            point_valid_mask.bool()
+            & torch.isfinite(source_xyz_f).all(dim=-1)
+            & torch.isfinite(target_ray_f).all(dim=-1)
+            & (source_xyz_f[..., 2] > 1.0e-3)
+        )
+
+        valid = geo_valid_mask.float()
+
+        w = (
+            trans_weight_f
+            * valid
+        )
+
+        w = (
+            w
+            /
+            w.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(
+                1e-8
+            )
+        )
+        # [M,Q]
+
+
+        sqrt_w = torch.where(
+            geo_valid_mask,
+            torch.sqrt(
+                w.clamp_min(1.0e-8)
+            ),
+            torch.zeros_like(w),
+        )
+        
+        A_w = (
+            A
+            * sqrt_w[
+                ...,
+                None,
+                None,
+            ]
+        )
+
+        b_w = (
+            b
+            * sqrt_w[
+                ...,
+                None,
+            ]
+        )
+
+
+        # --------------------------------------------------------
+        # Flatten:
+        #
+        # [M,Q,2,3]
+        # ->
+        # [M,2Q,3]
+        # --------------------------------------------------------
+
+        A_w = A_w.reshape(
+            M,
+            Q * 2,
+            3,
+        )
+
+        b_w = b_w.reshape(
+            M,
+            Q * 2,
+            1,
+        )
+
+
+        # --------------------------------------------------------
+        # Normal equations
+        # --------------------------------------------------------
+
+        AtA = torch.matmul(
+            A_w.transpose(-1, -2),
+            A_w,
+        )
+        # [M,3,3]
+
+
+        Atb = torch.matmul(
+            A_w.transpose(-1, -2),
+            b_w,
+        )
+        # [M,3,1]
+
+
+        # --------------------------------------------------------
+        # Tikhonov / ridge stabilization.
+        #
+        # This is important because target rays can occasionally
+        # have weak geometric diversity.
+        # --------------------------------------------------------
+
+        eye = torch.eye(
+            3,
+            device=AtA.device,
+            dtype=AtA.dtype,
+        ).unsqueeze(0)
+
+
+        lambda_reg = 1.0e-3
+
+        AtA_reg = (
+            AtA
+            +
+            lambda_reg * eye
+        )
+
+
+        # --------------------------------------------------------
+        # Differentiable solve
+        # --------------------------------------------------------
+
+        t_geo = torch.linalg.solve(
+            AtA_reg,
+            Atb,
+        ).squeeze(-1)
+        # [M,3]
+
+
+        # --------------------------------------------------------
+        # No-valid-point fallback
+        # --------------------------------------------------------
+
+        has_valid = (
+            geo_valid_mask
+            .sum(dim=1)
+            >= 3
+        )
+
+        t_geo = torch.where(
+            has_valid.unsqueeze(-1),
+            t_geo,
+            torch.zeros_like(t_geo),
+        )
+
+
+        t_geo = torch.nan_to_num(
+            t_geo,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+
+        return t_geo.to(orig_dtype)
 
     def _sample_local_feature(
         self,
@@ -2158,16 +2993,227 @@ class CalibrationCorrectionHead(BaseModule):
         )
         # [M,144]
 
-
         # ============================================================
-        # 29. Translation prediction
+        # Existing pretrained neural translation baseline
         # ============================================================
 
-        pred_trans = self.trans_head(
+        t_neural = self.trans_head(
             trans_feature
         )
         # [M,3]
 
+        # ============================================================
+        # Translation mode
+        # ============================================================
+
+        if self.trans_refine_mode == 'neural':
+
+            # Original pretrained baseline
+            pred_trans = t_neural
+
+
+        elif self.trans_refine_mode == 'geo_wls':
+
+            # ========================================================
+            # Candidate A
+            # ========================================================
+
+            t_geo = self._solve_geometric_translation(
+                source_xyz=source_xyz,
+                target_ray=target_ray,
+                pred_rot=pred_rot,
+                broken_camera2lidar=camera2lidar_context,
+                trans_weight=trans_weight,
+                point_valid_mask=point_valid_mask,
+            )
+
+
+            t_geo_norm = (
+                t_geo
+                / self.geo_trans_scale_m
+            ).clamp(
+                min=-2.0,
+                max=2.0,
+            )
+
+
+            geo_residual_feature = torch.cat(
+                [
+                    trans_feature,
+                    t_geo_norm,
+                ],
+                dim=-1,
+            )
+
+
+            raw_residual_trans = (
+                self.trans_residual_head(
+                    geo_residual_feature
+                )
+            )
+
+
+            delta_t_residual = (
+                self.geo_residual_max_m
+                * torch.tanh(
+                    raw_residual_trans
+                )
+            )
+
+
+            pred_trans = (
+                t_geo
+                + delta_t_residual
+            )
+
+
+        elif self.trans_refine_mode == 'geo_feature_residual':
+
+            # ========================================================
+            # Candidate B
+            #
+            # Existing neural prediction is the baseline.
+            #
+            # Geometry provides only a learned residual feature.
+            # ========================================================
+
+            (
+                geo_point_input,
+                geo_valid_mask,
+                post_rot_residual_norm,
+            ) = self._build_rotation_compensated_geo_feature(
+
+                source_xyz=source_xyz,
+
+                target_ray=target_ray,
+
+                pred_rot=pred_rot,
+
+                broken_camera2lidar=
+                    camera2lidar_context,
+
+                z_reliability=
+                    z_reliability,
+
+                z_gate=
+                    z_gate,
+
+                point_valid_mask=
+                    point_valid_mask,
+            )
+
+
+            # --------------------------------------------------------
+            # Per-point geo feature
+            # --------------------------------------------------------
+
+            geo_point_feature = (
+                self.geo_feature_encoder(
+                    geo_point_input
+                )
+            )
+            # [M,Q,32]
+
+
+            # --------------------------------------------------------
+            # Learn reliability of geo information
+            # --------------------------------------------------------
+
+            geo_score_input = torch.cat(
+                [
+                    geo_point_feature,
+                    z_reliability.detach(),
+                    z_gate.detach(),
+                    post_rot_residual_norm,
+                ],
+                dim=-1,
+            )
+
+
+            geo_logits = self.geo_score_head(
+                geo_score_input
+            )
+
+
+            geo_weight = self._masked_softmax(
+                geo_logits,
+                geo_valid_mask,
+            )
+
+
+            # --------------------------------------------------------
+            # Set aggregation
+            # --------------------------------------------------------
+
+            geo_set_feature = (
+                geo_weight.unsqueeze(-1)
+                * geo_point_feature
+            ).sum(
+                dim=1
+            )
+            # [M,32]
+
+
+            # --------------------------------------------------------
+            # Normalize existing neural translation
+            # --------------------------------------------------------
+
+            t_neural_norm = (
+                t_neural.detach()
+                / 1.5
+            ).clamp(
+                min=-2.0,
+                max=2.0,
+            )
+
+
+            # --------------------------------------------------------
+            # IMPORTANT:
+            # existing pretrained translation path remains frozen
+            # --------------------------------------------------------
+
+            geo_residual_input = torch.cat(
+                [
+                    trans_feature.detach(),     # 160
+                    geo_set_feature,            # 32
+                    t_neural_norm,              # 3
+                ],
+                dim=-1,
+            )
+            # [M,195]
+
+
+            raw_geo_residual = (
+                self.geo_residual_head(
+                    geo_residual_input
+                )
+            )
+
+
+            delta_t_geo = (
+                self.geo_feature_residual_max_m
+                * torch.tanh(
+                    raw_geo_residual
+                )
+            )
+
+
+            # ========================================================
+            # FINAL B TRANSLATION
+            # ========================================================
+
+            pred_trans = (
+                t_neural.detach()
+                + delta_t_geo
+            )
+
+
+        else:
+
+            raise RuntimeError(
+                f'Unknown trans_refine_mode='
+                f'{self.trans_refine_mode}'
+            )
 
         # ============================================================
         # 30. Final 6-DoF
@@ -2325,6 +3371,61 @@ class CalibrationCorrectionHead(BaseModule):
                 )
             )
 
+            if (
+                self.trans_refine_mode
+                == 'geo_feature_residual'
+            ):
+                
+                geo_weight_max = (
+                    geo_weight
+                    .max(dim=1)
+                    .values
+                    .mean()
+                )
+
+
+                geo_effective_k = (
+                    1.0
+                    /
+                    geo_weight
+                    .pow(2)
+                    .sum(dim=1)
+                    .clamp_min(1e-8)
+                ).mean()
+
+
+                post_rot_ray_mean = (
+                    post_rot_residual_norm
+                    .squeeze(-1)[
+                        geo_valid_mask
+                    ]
+                    .mean()
+                    if geo_valid_mask.any()
+                    else post_rot_residual_norm.new_tensor(0.0)
+                )
+
+
+                t_neural_norm_m = (
+                    torch.linalg.vector_norm(
+                        t_neural,
+                        dim=-1,
+                    ).mean()
+                )
+
+
+                geo_delta_norm_m = (
+                    torch.linalg.vector_norm(
+                        delta_t_geo,
+                        dim=-1,
+                    ).mean()
+                )
+
+
+                geo_delta_absmax_m = (
+                    torch.abs(
+                        delta_t_geo
+                    ).max()
+                )
 
             if has_valid.any():
 
@@ -2770,8 +3871,31 @@ class CalibrationCorrectionHead(BaseModule):
 
             'calib_z_used_pred_fraction':
                 z_used_pred_fraction,
+            
         }
 
+        if self.trans_refine_mode == 'geo_feature_residual':
+
+            diagnostics.update({
+
+                'calib_b_geo_weight_max':
+                    geo_weight_max,
+
+                'calib_b_geo_effective_k':
+                    geo_effective_k,
+
+                'calib_b_postrot_ray_residual':
+                    post_rot_ray_mean,
+
+                'calib_b_t_neural_norm_m':
+                    t_neural_norm_m,
+
+                'calib_b_geo_delta_norm_m':
+                    geo_delta_norm_m,
+
+                'calib_b_geo_delta_absmax_m':
+                    geo_delta_absmax_m,
+            })
 
         return (
             pred_delta_6dof,
