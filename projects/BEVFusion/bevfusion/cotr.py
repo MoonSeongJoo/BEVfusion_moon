@@ -41,6 +41,11 @@ class COTR(BaseModule):
                 local_refine_grid_size=5,
                 local_refine_temperature=1.0,
                 local_refine_candidate_loss_weight=0.01,
+                local_refine_coarse_loss_weight=0.2,
+                local_refine_patch_embed_dim=32,
+                local_refine_patch_grid_size=3,
+                local_refine_patch_radius_l2_px=24.0,
+                local_refine_patch_radius_high_px=48.0,
                 init_cfg=None): # mmdet3d의 표준 가중치 초기화를 위해 init_cfg를 받습니다.
         # super() 호출 시 init_cfg를 전달해야 Pretrained 가중치 로딩이 동작합니다.
         super(COTR, self).__init__(init_cfg)
@@ -55,6 +60,10 @@ class COTR(BaseModule):
 
         self.local_refine_candidate_loss_weight = float(
             local_refine_candidate_loss_weight
+        )
+
+        self.local_refine_coarse_loss_weight = float(
+            local_refine_coarse_loss_weight
         )
 
         if (
@@ -124,6 +133,21 @@ class COTR(BaseModule):
 
                     temperature=
                         local_refine_temperature,
+                    
+                    high_in_channels=
+                        hidden_dim,
+
+                    patch_embed_dim=
+                        local_refine_patch_embed_dim,
+
+                    patch_grid_size=
+                        local_refine_patch_grid_size,
+
+                    patch_radius_l2_px=
+                        local_refine_patch_radius_l2_px,
+
+                    patch_radius_high_px=
+                        local_refine_patch_radius_high_px,
                 )
             )
 
@@ -231,11 +255,17 @@ class COTR(BaseModule):
                 local_feature=
                     local_feature.detach(),
 
+                high_feature=
+                    enc_out.detach(),
+
                 query_input=
                     query_input.detach(),
 
+                # coarse_corr=
+                #     coarse_corr.detach(), # for coars corr freeze
+                
                 coarse_corr=
-                    coarse_corr.detach(),
+                    coarse_corr  # for coars corr training
             )
 
 
@@ -316,8 +346,32 @@ class COTR(BaseModule):
                         'candidate_offsets_px'
                     ],
 
+                # ========================================================
+                # Existing:
+                # Candidate supervision target calculation only.
+                #
+                # No gradient is required here.
+                # ========================================================
                 'coarse_corr':
                     coarse_corr.detach(),
+
+                # ========================================================
+                # NEW:
+                # Direct coarse correspondence supervision.
+                #
+                # IMPORTANT:
+                # Training time:
+                #     MUST retain autograd graph.
+                #
+                # Evaluation:
+                #     graph is unnecessary.
+                # ========================================================
+                'coarse_corr_train':
+                    (
+                        coarse_corr
+                        if self.training
+                        else coarse_corr.detach()
+                    ),
             }
 
 

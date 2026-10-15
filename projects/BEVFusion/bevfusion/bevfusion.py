@@ -547,6 +547,7 @@ class BEVFusion(Base3DDetector):
         train_corr = (
             stage in {
                 'corr',
+                'corr_refine',
                 'joint',
             }
         )
@@ -592,41 +593,26 @@ class BEVFusion(Base3DDetector):
                     False,
                 )
             ):
-
                 raise RuntimeError(
                     'lgpc_train_stage="corr_refine" '
-                    'requires '
-                    'corr.enable_local_refine=True'
+                    'requires corr.enable_local_refine=True'
                 )
 
-
             if self.corr.local_refiner is None:
-
                 raise RuntimeError(
                     'LocalCorrRefiner was not built.'
                 )
 
+            # CorrNet:
+            # original intended trainability has already been restored by
+            # _set_lgpc_module_trainable('corr', True)
 
-            # First freeze EVERYTHING in Corr wrapper.
-            for p in self.corr.parameters():
-
-                p.requires_grad = False
-
-
-            # Then enable ONLY LocalRefiner.
-            for p in (
-                self.corr
-                .local_refiner
-                .parameters()
-            ):
-
+            # LocalRefiner must remain trainable.
+            for p in self.corr.local_refiner.parameters():
                 p.requires_grad = True
 
-
-            # Base COTR remains deterministic.
-            self.corr.eval()
-
-            # Only new head is train mode.
+            # Train mode for coarse Corr + LocalRefiner
+            self.corr.train()
             self.corr.local_refiner.train()
 
         self._set_lgpc_module_trainable(
@@ -1696,7 +1682,8 @@ class BEVFusion(Base3DDetector):
             # Base COTR deterministic
             # ========================================================
 
-            self.corr.eval()
+            # self.corr.eval()
+            self.corr.train()
 
 
             # ========================================================
@@ -5579,7 +5566,85 @@ class BEVFusion(Base3DDetector):
                             sbs_view,
                             query_input_filtered,
                         )
+            
 
+                # ============================================================
+                # CORRESPONDENCE CONFIDENCE
+                #
+                # LocalCorrRefinementHead confidence -> CalibHead
+                #
+                # 1.0 : high confidence
+                # 0.0 : ambiguous
+                # ============================================================
+
+                corr_confidence_active = torch.ones(
+                    raw_corrs_active.shape[:2],
+                    device=raw_corrs_active.device,
+                    dtype=raw_corrs_active.dtype,
+                )
+
+                refine_diag_for_calib = getattr(
+                    self.corr,
+                    'last_refine_diag',
+                    None,
+                )
+
+                if (
+                    getattr(self.corr, 'enable_local_refine', False)
+                    and
+                    refine_diag_for_calib is not None
+                ):
+
+                    corr_max_weight = (
+                        refine_diag_for_calib[
+                            'max_weight'
+                        ]
+                    )
+
+                    corr_entropy = (
+                        refine_diag_for_calib[
+                            'candidate_entropy_norm'
+                        ]
+                    )
+
+                    corr_max_weight = torch.nan_to_num(
+                        corr_max_weight,
+                        nan=0.0,
+                        posinf=1.0,
+                        neginf=0.0,
+                    ).clamp(
+                        min=0.0,
+                        max=1.0,
+                    )
+
+                    corr_entropy = torch.nan_to_num(
+                        corr_entropy,
+                        nan=1.0,
+                        posinf=1.0,
+                        neginf=0.0,
+                    ).clamp(
+                        min=0.0,
+                        max=1.0,
+                    )
+
+                    # --------------------------------------------------------
+                    # High max probability + low entropy
+                    # => reliable correspondence
+                    # --------------------------------------------------------
+
+                    corr_confidence_active = (
+                        0.5 * corr_max_weight
+                        +
+                        0.5 * (1.0 - corr_entropy)
+                    )
+
+                    corr_confidence_active = (
+                        corr_confidence_active
+                        .clamp(
+                            min=0.05,
+                            max=1.0,
+                        )
+                    )
 
                 # ============================================================
                 # Runtime shape check
@@ -5773,6 +5838,135 @@ class BEVFusion(Base3DDetector):
                                 refine_train_aux[
                                     'coarse_corr'
                                 ]
+                            )
+
+                            # ============================================================
+                            # NEW:
+                            # Non-detached coarse Corr.
+                            #
+                            # This tensor will receive direct GT supervision.
+                            # ============================================================
+
+                            coarse_corr_for_train = (
+                                refine_train_aux[
+                                    'coarse_corr_train'
+                                ]
+                            )
+
+                            # ============================================================
+                            # R2.2:
+                            # DIRECT COARSE CORRESPONDENCE SUPERVISION
+                            #
+                            # Existing:
+                            #
+                            #   refined_corr
+                            #       -> loss_corr
+                            #
+                            # NEW:
+                            #
+                            #   coarse_corr
+                            #       -> loss_coarse_corr
+                            #
+                            # Purpose:
+                            #
+                            # Prevent Base CorrNet from becoming only a loose
+                            # initializer for LocalRefiner.
+                            # ============================================================
+
+                            coarse_loss_weight = float(
+                                getattr(
+                                    self.corr,
+                                    'local_refine_coarse_loss_weight',
+                                    0.2,
+                                )
+                            )
+
+
+                            # ============================================================
+                            # Coarse correspondence loss
+                            #
+                            # Re-use the SAME CorrelationCycleLoss used by refined Corr.
+                            #
+                            # However:
+                            #   We do NOT want to count cycle loss twice.
+                            #
+                            # Therefore give zero cycle / zero cycle mask.
+                            # ============================================================
+
+                            coarse_zero_cycle = torch.zeros_like(
+                                query_input_filtered
+                            )
+
+                            coarse_zero_cycle_mask = torch.zeros_like(
+                                corr_supervision_mask,
+                                dtype=torch.bool,
+                            )
+
+
+                            (
+                                coarse_corr_loss_raw,
+                                coarse_corr_match_raw,
+                                coarse_corr_cycle_raw,
+                            ) = self.corr_loss(
+
+                                corr_pred=
+                                    coarse_corr_for_train,
+
+                                corr_target=
+                                    corr_target_active,
+
+                                cycle=
+                                    coarse_zero_cycle,
+
+                                queries=
+                                    query_input_filtered,
+
+                                cycle_mask=
+                                    coarse_zero_cycle_mask,
+
+                                corr_valid_mask=
+                                    corr_supervision_mask,
+                            )
+
+
+                            # ============================================================
+                            # IMPORTANT:
+                            #
+                            # MMEngine sums dictionary entries whose names contain
+                            # "loss".
+                            #
+                            # Therefore this participates in backward.
+                            # ============================================================
+
+                            losses[
+                                'loss_coarse_corr'
+                            ] = (
+                                coarse_corr_loss_raw
+                                *
+                                coarse_loss_weight
+                            )
+
+
+                            # ============================================================
+                            # Diagnostics only
+                            #
+                            # Do NOT include "loss" in their names.
+                            # ============================================================
+
+                            losses[
+                                'coarse_match_raw'
+                            ] = (
+                                coarse_corr_match_raw
+                            )
+
+                            losses[
+                                'coarse_aux_weight'
+                            ] = (
+                                coarse_corr_for_train
+                                .new_tensor(
+                                    coarse_loss_weight
+                                )
+                                .detach()
                             )
 
 
@@ -6025,40 +6219,280 @@ class BEVFusion(Base3DDetector):
 
 
                             # ========================================================
-                            # 6. Candidate classification loss
+                            # 6. V1.1 SOFT candidate supervision
+                            #
+                            # Forward:
+                            #
+                            #   candidate probabilities
+                            #       -> soft weighted offset
+                            #       -> continuous delta
+                            #
+                            # Therefore training target should also be a
+                            # DISTRIBUTION, not one-hot nearest-candidate class.
                             # ========================================================
+
+
+                            # --------------------------------------------------------
+                            # A. Uniform-valid baseline offset
+                            #
+                            # corr_refiner.py actually uses:
+                            #
+                            #   delta_px =
+                            #       soft_offset_px
+                            #       - baseline_offset_px
+                            #
+                            # Therefore, to obtain:
+                            #
+                            #   delta_px = GT_delta
+                            #
+                            # the desired soft offset itself is:
+                            #
+                            #   GT_delta + baseline_offset_px
+                            # --------------------------------------------------------
+
+                            valid_float = candidate_valid.to(
+                                dtype=gt_delta_px.dtype
+                            )
+
+
+                            baseline_weights_for_target = (
+
+                                valid_float
+
+                                /
+
+                                valid_float.sum(
+                                    dim=-1,
+                                    keepdim=True,
+                                ).clamp_min(
+                                    1.0
+                                )
+                            )
+
+
+                            baseline_offset_for_target = (
+
+                                baseline_weights_for_target
+                                .unsqueeze(-1)
+
+                                *
+
+                                offsets.view(
+                                    1,
+                                    1,
+                                    K_refine,
+                                    2,
+                                )
+
+                            ).sum(
+                                dim=2
+                            )
+
+                            # [A,Q,2]
+
+
+                            target_soft_offset_px = (
+
+                                gt_delta_px
+
+                                +
+
+                                baseline_offset_for_target
+                            )
+
+                            # [A,Q,2]
+
+
+                            # --------------------------------------------------------
+                            # B. Distance from desired continuous soft offset
+                            #    to every candidate anchor
+                            # --------------------------------------------------------
+
+                            soft_target_diff = (
+
+                                target_soft_offset_px
+                                .unsqueeze(2)
+
+                                -
+
+                                offsets.view(
+                                    1,
+                                    1,
+                                    K_refine,
+                                    2,
+                                )
+                            )
+
+
+                            soft_target_dist2 = (
+
+                                soft_target_diff ** 2
+
+                            ).sum(
+                                dim=-1
+                            )
+
+                            # [A,Q,K]
+
+
+                            # --------------------------------------------------------
+                            # C. Gaussian target distribution
+                            #
+                            # Current grid:
+                            #
+                            # radius = 64
+                            # grid_size = 5
+                            #
+                            # step =
+                            #     2 * 64 / (5 - 1)
+                            #     = 32 px
+                            #
+                            # sigma = step / 2
+                            #       = 16 px
+                            # --------------------------------------------------------
+
+                            grid_size_for_target = int(
+                                self.corr.local_refiner.grid_size
+                            )
+
+
+                            grid_step_px = (
+
+                                2.0
+                                * refine_radius_px
+
+                                /
+
+                                max(
+                                    grid_size_for_target - 1,
+                                    1,
+                                )
+                            )
+
+
+                            soft_target_sigma_px = max(
+                                grid_step_px * 0.5,
+                                1.0,
+                            )
+
+
+                            soft_target_logits = (
+
+                                -soft_target_dist2
+
+                                /
+
+                                (
+                                    2.0
+                                    * soft_target_sigma_px
+                                    * soft_target_sigma_px
+                                )
+                            )
+
+
+                            # Invalid candidate must never receive target probability.
+                            soft_target_logits = (
+
+                                soft_target_logits
+                                .masked_fill(
+                                    ~candidate_valid,
+                                    -1.0e4,
+                                )
+                            )
+
+
+                            soft_target_prob = torch.softmax(
+
+                                soft_target_logits,
+
+                                dim=-1,
+
+                            ).detach()
+
+                            # IMPORTANT:
+                            # GT-generated target distribution is supervision only.
+                            # No gradient should flow through it.
+
+
+                            # ========================================================
+                            # D. Actual candidate probability uses the same
+                            #    temperature as corr_refiner.py forward.
+                            # ========================================================
+
+                            refine_temperature = max(
+
+                                float(
+                                    self.corr.local_refiner.temperature
+                                ),
+
+                                1.0e-6,
+                            )
+
+
+                            pred_log_prob = F.log_softmax(
+
+                                score_logits
+                                / refine_temperature,
+
+                                dim=-1,
+                            )
+
+
+                            # ========================================================
+                            # E. Soft target KL loss
+                            #
+                            # KL(target || prediction)
+                            #
+                            # = 0 when predicted candidate distribution
+                            #   exactly matches the desired soft distribution.
+                            # ========================================================
+
+                            soft_target_log_prob = torch.log(
+
+                                soft_target_prob.clamp_min(
+                                    1.0e-8
+                                )
+                            )
+
+
+                            candidate_soft_kl_per_point = (
+
+                                soft_target_prob
+
+                                *
+
+                                (
+                                    soft_target_log_prob
+                                    -
+                                    pred_log_prob
+                                )
+
+                            ).sum(
+                                dim=-1
+                            )
+
+                            # [A,Q]
+
 
                             if candidate_supervision_mask.any():
 
-                                candidate_ce_raw = F.cross_entropy(
+                                candidate_soft_kl_raw = (
 
-                                    score_logits[
+                                    candidate_soft_kl_per_point[
                                         candidate_supervision_mask
-                                    ],
-
-                                    candidate_target_idx[
-                                        candidate_supervision_mask
-                                    ],
-
-                                    reduction='mean',
+                                    ]
+                                    .mean()
                                 )
 
 
-                                # ----------------------------------------------------
-                                # Normalize:
-                                #
-                                # uniform 25-way CE:
-                                #
-                                # CE = log(25)
-                                #
-                                # normalized CE = 1.0
-                                # ----------------------------------------------------
+                                # Normalize similarly to old K-way CE metric.
+                                candidate_soft_kl_norm = (
 
-                                candidate_ce_norm = (
+                                    candidate_soft_kl_raw
 
-                                    candidate_ce_raw
+                                    /
 
-                                    / math.log(
+                                    math.log(
                                         float(
                                             K_refine
                                         )
@@ -6079,15 +6513,49 @@ class BEVFusion(Base3DDetector):
                                     'loss_refine_candidate'
                                 ] = (
 
-                                    candidate_ce_norm
+                                    candidate_soft_kl_norm
 
-                                    * candidate_loss_weight
+                                    *
+
+                                    candidate_loss_weight
                                 )
 
 
                                 # ====================================================
-                                # Candidate accuracy
+                                # F. OLD hard-class metrics remain DIAGNOSTIC ONLY.
+                                #
+                                # These are useful for V1 vs V1.1 comparison.
+                                # They DO NOT participate in optimization.
                                 # ====================================================
+
+                                candidate_hard_ce_raw = F.cross_entropy(
+
+                                    score_logits[
+                                        candidate_supervision_mask
+                                    ],
+
+                                    candidate_target_idx[
+                                        candidate_supervision_mask
+                                    ],
+
+                                    reduction='mean',
+
+                                )
+
+
+                                candidate_hard_ce_norm = (
+
+                                    candidate_hard_ce_raw
+
+                                    /
+
+                                    math.log(
+                                        float(
+                                            K_refine
+                                        )
+                                    )
+                                )
+
 
                                 candidate_pred_idx = (
 
@@ -6116,9 +6584,10 @@ class BEVFusion(Base3DDetector):
 
 
                                 # ====================================================
-                                # Candidate quantization error
+                                # G. Existing nearest-candidate quantization diagnostic
                                 #
-                                # How far is GT residual from its nearest 5x5 candidate?
+                                # IMPORTANT:
+                                # This is NOT final output floor.
                                 # ====================================================
 
                                 nearest_dist2 = (
@@ -6139,10 +6608,74 @@ class BEVFusion(Base3DDetector):
                                 candidate_quant_error_px = (
 
                                     torch.sqrt(
+
                                         nearest_dist2[
                                             candidate_supervision_mask
-                                        ].clamp_min(0.0)
+                                        ].clamp_min(
+                                            0.0
+                                        )
+
                                     )
+                                    .mean()
+                                )
+
+
+                                # ====================================================
+                                # H. NEW:
+                                # Does the SOFT target itself represent the GT delta?
+                                #
+                                # target expectation
+                                #   minus baseline
+                                # should approach GT residual.
+                                # ====================================================
+
+                                soft_target_expected_offset = (
+
+                                    soft_target_prob
+                                    .unsqueeze(-1)
+
+                                    *
+
+                                    offsets.view(
+                                        1,
+                                        1,
+                                        K_refine,
+                                        2,
+                                    )
+
+                                ).sum(
+                                    dim=2
+                                )
+
+
+                                soft_target_expected_delta = (
+
+                                    soft_target_expected_offset
+
+                                    -
+
+                                    baseline_offset_for_target
+                                )
+
+
+                                soft_target_repr_error = (
+
+                                    torch.linalg.vector_norm(
+
+                                        soft_target_expected_delta
+                                        -
+                                        gt_delta_px,
+
+                                        dim=-1,
+                                    )
+                                )
+
+
+                                soft_target_repr_error_px = (
+
+                                    soft_target_repr_error[
+                                        candidate_supervision_mask
+                                    ]
                                     .mean()
                                 )
 
@@ -6150,38 +6683,49 @@ class BEVFusion(Base3DDetector):
                             else:
 
                                 # ----------------------------------------------------
-                                # Keep valid graph even for empty candidate batch.
+                                # Keep DDP/autograd graph valid.
                                 # ----------------------------------------------------
 
-                                candidate_ce_raw = (
+                                zero_candidate = (
+
                                     score_logits.sum()
                                     * 0.0
                                 )
 
 
-                                candidate_ce_norm = (
-                                    candidate_ce_raw
-                                )
-
-
                                 losses[
                                     'loss_refine_candidate'
-                                ] = (
-                                    candidate_ce_raw
+                                ] = zero_candidate
+
+
+                                candidate_soft_kl_raw = (
+                                    zero_candidate
                                 )
 
+                                candidate_soft_kl_norm = (
+                                    zero_candidate
+                                )
+
+                                candidate_hard_ce_raw = (
+                                    zero_candidate
+                                )
+
+                                candidate_hard_ce_norm = (
+                                    zero_candidate
+                                )
 
                                 candidate_acc = (
-                                    score_logits
-                                    .new_tensor(0.0)
+                                    zero_candidate.detach()
                                 )
-
 
                                 candidate_quant_error_px = (
-                                    score_logits
-                                    .new_tensor(0.0)
+                                    zero_candidate.detach()
                                 )
 
+                                soft_target_repr_error_px = (
+                                    zero_candidate.detach()
+                                )
+                            
 
                             # ========================================================
                             # 7. Diagnostic ratios
@@ -6235,20 +6779,57 @@ class BEVFusion(Base3DDetector):
 
 
                             # ========================================================
-                            # Logging only
+                            # V1.1 candidate diagnostics
                             # ========================================================
+
+                            # --------------------------------------------------------
+                            # OLD hard CE:
+                            # diagnostic only
+                            #
+                            # Keep this so V1 and V1.1 can be compared.
+                            # --------------------------------------------------------
 
                             losses[
                                 'refine_candidate_ce_raw'
                             ] = (
-                                candidate_ce_raw.detach()
+                                candidate_hard_ce_raw.detach()
                             )
 
 
                             losses[
                                 'refine_candidate_ce_norm'
                             ] = (
-                                candidate_ce_norm.detach()
+                                candidate_hard_ce_norm.detach()
+                            )
+
+
+                            # --------------------------------------------------------
+                            # NEW actual optimization objective
+                            # --------------------------------------------------------
+
+                            losses[
+                                'refine_candidate_soft_kl_raw'
+                            ] = (
+                                candidate_soft_kl_raw.detach()
+                            )
+
+
+                            losses[
+                                'refine_candidate_soft_kl_norm'
+                            ] = (
+                                candidate_soft_kl_norm.detach()
+                            )
+
+
+                            # --------------------------------------------------------
+                            # Can the soft target distribution geometrically represent
+                            # the desired continuous GT residual?
+                            # --------------------------------------------------------
+
+                            losses[
+                                'refine_soft_target_repr_error_px'
+                            ] = (
+                                soft_target_repr_error_px.detach()
                             )
 
 
@@ -7989,6 +8570,7 @@ class BEVFusion(Base3DDetector):
                             camera_intrinsics=camera_intrinsics_active,
                             camera2lidar_context=(camera2lidar_context_active),
                             point_valid_mask=calib_point_valid_mask,
+                            corr_confidence=corr_confidence_active,
                         )
 
                 else:
@@ -8005,6 +8587,7 @@ class BEVFusion(Base3DDetector):
                         camera_intrinsics=camera_intrinsics_active,
                         camera2lidar_context=(camera2lidar_context_active),
                         point_valid_mask=calib_point_valid_mask,
+                        corr_confidence=corr_confidence_active,
                     )
 
                 # ============================================================
@@ -9258,6 +9841,203 @@ class BEVFusion(Base3DDetector):
 
             raw_corrs_filtered, _, _, enc_out_filtered_4d  = self.corr(sbs_view, query_input_filtered)
 
+            # ============================================================
+            # PREDICT PATH:
+            # Correspondence uncertainty / confidence
+            #
+            # raw_corrs_filtered:
+            #     [NumActive, Q, 2]
+            #
+            # corr_confidence_filtered:
+            #     [NumActive, Q]
+            #
+            # 1.0:
+            #     high-confidence correspondence
+            #
+            # close to 0:
+            #     ambiguous local correspondence
+            #
+            # IMPORTANT:
+            # This is measurement reliability.
+            # It is NOT calibration-output gating.
+            # ============================================================
+
+            corr_confidence_filtered = torch.ones(
+                raw_corrs_filtered.shape[:2],
+                device=raw_corrs_filtered.device,
+                dtype=raw_corrs_filtered.dtype,
+            )
+
+
+            # ============================================================
+            # LocalCorrRefinementHead diagnostic generated by
+            # the CURRENT self.corr() forward above.
+            # ============================================================
+
+            refine_diag_predict = getattr(
+                self.corr,
+                'last_refine_diag',
+                None,
+            )
+
+
+            # ============================================================
+            # Use LocalRefiner uncertainty only when:
+            #
+            # 1. local refinement is actually enabled
+            # 2. current forward produced last_refine_diag
+            #
+            # Otherwise confidence remains all-ones,
+            # reproducing the old CalibHead behavior.
+            # ============================================================
+
+            if (
+                getattr(
+                    self.corr,
+                    'enable_local_refine',
+                    False,
+                )
+                and
+                refine_diag_predict is not None
+            ):
+
+                corr_max_weight = (
+                    refine_diag_predict[
+                        'max_weight'
+                    ]
+                )
+
+                corr_entropy = (
+                    refine_diag_predict[
+                        'candidate_entropy_norm'
+                    ]
+                )
+
+
+                # ========================================================
+                # Allow either
+                #     [M,Q]
+                # or
+                #     [M,Q,1]
+                # ========================================================
+
+                if (
+                    corr_max_weight.ndim == 3
+                    and
+                    corr_max_weight.shape[-1] == 1
+                ):
+                    corr_max_weight = (
+                        corr_max_weight.squeeze(-1)
+                    )
+
+                if (
+                    corr_entropy.ndim == 3
+                    and
+                    corr_entropy.shape[-1] == 1
+                ):
+                    corr_entropy = (
+                        corr_entropy.squeeze(-1)
+                    )
+
+
+                # ========================================================
+                # Shape guards
+                # ========================================================
+
+                expected_corr_shape = (
+                    raw_corrs_filtered.shape[:2]
+                )
+
+                if (
+                    corr_max_weight.shape
+                    != expected_corr_shape
+                ):
+                    raise RuntimeError(
+                        '[CORR CONF PRED] '
+                        'max_weight shape mismatch: '
+                        f'max_weight={corr_max_weight.shape}, '
+                        f'expected={expected_corr_shape}'
+                    )
+
+                if (
+                    corr_entropy.shape
+                    != expected_corr_shape
+                ):
+                    raise RuntimeError(
+                        '[CORR CONF PRED] '
+                        'candidate_entropy_norm shape mismatch: '
+                        f'entropy={corr_entropy.shape}, '
+                        f'expected={expected_corr_shape}'
+                    )
+
+
+                # ========================================================
+                # Numerical safety
+                # ========================================================
+
+                corr_max_weight = torch.nan_to_num(
+                    corr_max_weight,
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                ).clamp(
+                    min=0.0,
+                    max=1.0,
+                )
+
+                corr_entropy = torch.nan_to_num(
+                    corr_entropy,
+                    nan=1.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                ).clamp(
+                    min=0.0,
+                    max=1.0,
+                )
+
+
+                # ========================================================
+                # Correspondence confidence
+                #
+                # strong peak:
+                #     max_weight high
+                #
+                # unambiguous distribution:
+                #     entropy low
+                #
+                # confidence =
+                #     0.5 * max probability
+                #   + 0.5 * (1 - normalized entropy)
+                # ========================================================
+
+                corr_confidence_filtered = (
+                    0.5
+                    * corr_max_weight
+
+                    +
+
+                    0.5
+                    * (
+                        1.0
+                        - corr_entropy
+                    )
+                ).clamp(
+                    min=0.05,
+                    max=1.0,
+                )
+
+
+            # ============================================================
+            # In inference there is no need for gradient anyway.
+            #
+            # Also makes the intended role explicit:
+            # measurement confidence only.
+            # ============================================================
+
+            corr_confidence_filtered = (
+                corr_confidence_filtered.detach()
+            )
+
             # s1_end.record()
             # torch.cuda.synchronize() # LGPC 연산 완료 대기
             
@@ -9838,6 +10618,7 @@ class BEVFusion(Base3DDetector):
                     camera_intrinsics=camera_intrinsics_filtered,
                     camera2lidar_context=(camera2lidar_context_filtered),
                     point_valid_mask=calib_point_valid_mask,
+                    corr_confidence=corr_confidence_filtered,
                 )
 
             # Convert 4D enc_out to 3D for storage

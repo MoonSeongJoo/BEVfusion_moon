@@ -1944,6 +1944,7 @@ class CalibrationCorrectionHead(BaseModule):
         camera_intrinsics: torch.Tensor,
         camera2lidar_context: torch.Tensor,
         point_valid_mask: torch.Tensor,
+        corr_confidence=None,
     ):
         """
         CalibrationCorrectionHead V2 forward.
@@ -2146,6 +2147,60 @@ class CalibrationCorrectionHead(BaseModule):
 
 
         point_valid_mask = point_valid_mask.bool()
+
+        # ============================================================
+        # Correspondence confidence
+        #
+        # [M,Q]
+        #
+        # This is measurement reliability,
+        # NOT output calibration gating.
+        # ============================================================
+
+        if corr_confidence is None:
+
+            corr_confidence = torch.ones(
+                point_valid_mask.shape,
+                device=point_valid_mask.device,
+                dtype=corrs_pred_3d.dtype,
+            )
+
+        else:
+
+            if (
+                corr_confidence.ndim == 3
+                and
+                corr_confidence.shape[-1] == 1
+            ):
+
+                corr_confidence = (
+                    corr_confidence.squeeze(-1)
+                )
+
+
+            if (
+                corr_confidence.shape
+                !=
+                point_valid_mask.shape
+            ):
+
+                raise RuntimeError(
+                    '[CalibHead] '
+                    'corr_confidence shape mismatch: '
+                    f'{corr_confidence.shape} '
+                    f'vs {point_valid_mask.shape}'
+                )
+
+
+            corr_confidence = torch.nan_to_num(
+                corr_confidence,
+                nan=0.05,
+                posinf=1.0,
+                neginf=0.05,
+            ).clamp(
+                min=0.05,
+                max=1.0,
+            )
 
 
         # ============================================================
@@ -2816,21 +2871,37 @@ class CalibrationCorrectionHead(BaseModule):
         # [M,Q,69]
 
 
-        # ============================================================
-        # 21. Rotation reliability
-        # ============================================================
-
         rot_logits = self.rot_score_head(
             score_input
         )
-        # [M,Q,1]
+
+        # ============================================================
+        # Explicit correspondence reliability prior
+        #
+        # exp(logit + log(conf))
+        # =
+        # exp(logit) * conf
+        # ============================================================
+
+        corr_log_prior = torch.log(
+            corr_confidence
+            .clamp_min(
+                1e-4
+            )
+        ).unsqueeze(-1)
+
+
+        rot_logits = (
+            rot_logits
+            +
+            corr_log_prior
+        )
 
 
         rot_weight = self._masked_softmax(
             rot_logits,
             point_valid_mask,
         )
-        # [M,Q]
 
 
         # ============================================================
@@ -2943,19 +3014,20 @@ class CalibrationCorrectionHead(BaseModule):
         )
         # [M,Q,85]
 
-
         trans_logits = self.trans_score_head(
             trans_score_input
         )
-        # [M,Q,1]
 
+        trans_logits = (
+            trans_logits
+            +
+            corr_log_prior
+        )
 
         trans_weight = self._masked_softmax(
             trans_logits,
             point_valid_mask,
         )
-        # [M,Q]
-
 
         # ============================================================
         # 27. Translation SET aggregation
@@ -3134,6 +3206,20 @@ class CalibrationCorrectionHead(BaseModule):
                 geo_score_input
             )
 
+            # ============================================================
+            # Correspondence uncertainty for Candidate-B
+            #
+            # Same measurement prior used by:
+            #   - rotation
+            #   - neural translation
+            #   - geometric residual translation
+            # ============================================================
+
+            geo_logits = (
+                geo_logits
+                +
+                corr_log_prior
+            )
 
             geo_weight = self._masked_softmax(
                 geo_logits,

@@ -57,14 +57,26 @@ class LocalCorrRefinementHead(nn.Module):
     def __init__(
         self,
         in_channels=512,
+        high_in_channels=312,
+
         proj_dim=64,
         hidden_dim=128,
+
+        patch_embed_dim=32,
+        patch_grid_size=3,
+
+        patch_radius_l2_px=24.0,
+        patch_radius_high_px=48.0,
+
         radius_px=64.0,
         grid_size=5,
+
         image_width=1600.0,
         image_height=900.0,
+
         temperature=1.0,
     ):
+
         super().__init__()
 
         # ============================================================
@@ -105,6 +117,26 @@ class LocalCorrRefinementHead(nn.Module):
 
         self.in_channels = int(
             in_channels
+        )
+
+        self.high_in_channels = int(
+            high_in_channels
+        )
+
+        self.patch_embed_dim = int(
+            patch_embed_dim
+        )
+
+        self.patch_grid_size = int(
+            patch_grid_size
+        )
+
+        self.patch_radius_l2_px = float(
+            patch_radius_l2_px
+        )
+
+        self.patch_radius_high_px = float(
+            patch_radius_high_px
         )
 
         self.proj_dim = int(
@@ -163,24 +195,81 @@ class LocalCorrRefinementHead(nn.Module):
             nn.GELU(),
         )
 
+        # ============================================================
+        # V1.2:
+        # high-level / layer3-scale feature projection
+        #
+        # enc_out:
+        #     [B,312,12,80]
+        #
+        # projected:
+        #     [B,64,12,80]
+        # ============================================================
+
+        self.high_feature_proj = nn.Sequential(
+
+            nn.Conv2d(
+                self.high_in_channels,
+                self.proj_dim,
+                kernel_size=1,
+                bias=False,
+            ),
+
+            nn.GroupNorm(
+                num_groups=8,
+                num_channels=self.proj_dim,
+            ),
+
+            nn.GELU(),
+        )
 
         # ============================================================
-        # 2. Candidate score MLP
+        # V1.2 Multi-scale candidate descriptor
         #
-        # For each local candidate:
+        # Layer2:
+        #   source        D
+        #   target        D
+        #   abs diff      D
+        #   product       D
         #
-        # source feature         D
-        # target feature         D
-        # abs(source-target)     D
-        # source*target          D
-        # normalized offset      2
+        # High-scale:
+        #   source        D
+        #   target        D
+        #   abs diff      D
+        #   product       D
         #
-        # input = 4*D + 2
+        # Patch embeddings:
+        #   layer2        patch_embed_dim
+        #   high          patch_embed_dim
+        #
+        # Geometry:
+        #   offset        2
+        #
+        # total =
+        #   8*D
+        #   + 2*patch_embed_dim
+        #   + 2
         # ============================================================
 
         score_input_dim = (
-            4 * self.proj_dim
-            + 2
+
+            8
+            * self.proj_dim
+
+            +
+
+            2
+            * self.patch_embed_dim
+
+            +
+
+            2
+        )
+
+
+        self.score_input_dim = (
+
+            score_input_dim
         )
 
 
@@ -205,7 +294,6 @@ class LocalCorrRefinementHead(nn.Module):
                 1,
             ),
         )
-
 
         # ============================================================
         # CRITICAL R2.1:
@@ -296,6 +384,140 @@ class LocalCorrRefinementHead(nn.Module):
             persistent=False,
         )
 
+        # ============================================================
+        # V1.2 Multi-scale patch offsets
+        # ============================================================
+
+        def _make_patch_offsets(
+            radius_px,
+            grid_size,
+        ):
+
+            axis_patch = torch.linspace(
+
+                -radius_px,
+                radius_px,
+
+                steps=grid_size,
+            )
+
+            try:
+
+                yy_patch, xx_patch = torch.meshgrid(
+                    axis_patch,
+                    axis_patch,
+                    indexing='ij',
+                )
+
+            except TypeError:
+
+                yy_patch, xx_patch = torch.meshgrid(
+                    axis_patch,
+                    axis_patch,
+                )
+
+            return torch.stack(
+                [
+                    xx_patch.reshape(-1),
+                    yy_patch.reshape(-1),
+                ],
+                dim=-1,
+            )
+
+
+        patch_offsets_l2_px = _make_patch_offsets(
+
+            self.patch_radius_l2_px,
+            self.patch_grid_size,
+        )
+
+
+        patch_offsets_high_px = _make_patch_offsets(
+
+            self.patch_radius_high_px,
+            self.patch_grid_size,
+        )
+
+
+        self.register_buffer(
+
+            'patch_offsets_l2_px',
+
+            patch_offsets_l2_px,
+
+            persistent=False,
+        )
+
+
+        self.register_buffer(
+
+            'patch_offsets_high_px',
+
+            patch_offsets_high_px,
+
+            persistent=False,
+        )
+
+
+        self.patch_points = (
+
+            self.patch_grid_size
+            *
+            self.patch_grid_size
+        )
+
+        # ============================================================
+        # 5. V1.2 Patch relation encoders
+        # ============================================================
+
+        patch_relation_dim = (
+
+            3
+            *
+            self.patch_points
+        )
+
+
+        self.patch_relation_dim = (
+
+            patch_relation_dim
+        )
+
+
+        self.patch_encoder_l2 = nn.Sequential(
+
+            nn.Linear(
+                patch_relation_dim,
+                self.patch_embed_dim,
+            ),
+
+            nn.GELU(),
+
+            nn.Linear(
+                self.patch_embed_dim,
+                self.patch_embed_dim,
+            ),
+
+            nn.GELU(),
+        )
+
+
+        self.patch_encoder_high = nn.Sequential(
+
+            nn.Linear(
+                patch_relation_dim,
+                self.patch_embed_dim,
+            ),
+
+            nn.GELU(),
+
+            nn.Linear(
+                self.patch_embed_dim,
+                self.patch_embed_dim,
+            ),
+
+            nn.GELU(),
+        )
 
     # ================================================================
     # Feature sampling
@@ -345,6 +567,552 @@ class LocalCorrRefinementHead(nn.Module):
 
         return sampled
 
+    # ================================================================
+    # V1.2:
+    # Source local-patch sampling
+    # ================================================================
+
+    def _sample_source_patch(
+        self,
+        feature,
+        center_x01,
+        center_y01,
+        patch_offsets_px,
+    ):
+        """
+        feature:
+            [B,D,H,W]
+
+        center_x01:
+            [B,Q]
+
+        center_y01:
+            [B,Q]
+
+        patch_offsets_px:
+            [P,2]
+
+        Returns
+        -------
+        sampled:
+            [B,Q,P,D]
+
+        valid:
+            [B,Q,P]
+        """
+
+        offsets = patch_offsets_px.to(
+
+            device=center_x01.device,
+            dtype=center_x01.dtype,
+        )
+
+
+        P = offsets.shape[0]
+
+
+        # ------------------------------------------------------------
+        # Original-image pixel offset
+        # -> normalized coordinate inside one LEFT/RIGHT image.
+        # ------------------------------------------------------------
+
+        patch_x01 = (
+
+            center_x01.unsqueeze(-1)
+
+            +
+
+            offsets[
+                :,
+                0
+            ].view(
+                1,
+                1,
+                P,
+            )
+
+            / self.image_width
+        )
+
+
+        patch_y01 = (
+
+            center_y01.unsqueeze(-1)
+
+            +
+
+            offsets[
+                :,
+                1
+            ].view(
+                1,
+                1,
+                P,
+            )
+
+            / self.image_height
+        )
+
+
+        # ------------------------------------------------------------
+        # Patch-point validity
+        # ------------------------------------------------------------
+
+        valid = (
+
+            torch.isfinite(
+                patch_x01
+            )
+
+            &
+
+            torch.isfinite(
+                patch_y01
+            )
+
+            &
+
+            (
+                patch_x01 >= 0.0
+            )
+
+            &
+
+            (
+                patch_x01 <= 1.0
+            )
+
+            &
+
+            (
+                patch_y01 >= 0.0
+            )
+
+            &
+
+            (
+                patch_y01 <= 1.0
+            )
+        )
+
+
+        # ------------------------------------------------------------
+        # [0,1]
+        # ->
+        # grid_sample coordinate [-1,+1]
+        # ------------------------------------------------------------
+
+        grid = torch.stack(
+
+            [
+                patch_x01 * 2.0 - 1.0,
+                patch_y01 * 2.0 - 1.0,
+            ],
+
+            dim=-1,
+        )
+
+        # [B,Q,P,2]
+
+
+        sampled = self._sample_feature(
+
+            feature,
+            grid,
+        )
+
+        # [B,Q,P,D]
+
+
+        return (
+            sampled,
+            valid,
+        )
+
+
+    # ================================================================
+    # V1.2:
+    # Candidate local-patch sampling
+    # ================================================================
+
+    def _sample_candidate_patch(
+        self,
+        feature,
+        center_x01,
+        center_y01,
+        patch_offsets_px,
+    ):
+        """
+        feature:
+            [B,D,H,W]
+
+        center_x01:
+            [B,Q,K]
+
+        center_y01:
+            [B,Q,K]
+
+        patch_offsets_px:
+            [P,2]
+
+        Returns
+        -------
+        sampled:
+            [B,Q,K,P,D]
+
+        valid:
+            [B,Q,K,P]
+        """
+
+        offsets = patch_offsets_px.to(
+
+            device=center_x01.device,
+            dtype=center_x01.dtype,
+        )
+
+
+        B, Q, K = (
+            center_x01.shape
+        )
+
+
+        P = offsets.shape[0]
+
+
+        patch_x01 = (
+
+            center_x01.unsqueeze(-1)
+
+            +
+
+            offsets[
+                :,
+                0
+            ].view(
+                1,
+                1,
+                1,
+                P,
+            )
+
+            / self.image_width
+        )
+
+
+        patch_y01 = (
+
+            center_y01.unsqueeze(-1)
+
+            +
+
+            offsets[
+                :,
+                1
+            ].view(
+                1,
+                1,
+                1,
+                P,
+            )
+
+            / self.image_height
+        )
+
+
+        valid = (
+
+            torch.isfinite(
+                patch_x01
+            )
+
+            &
+
+            torch.isfinite(
+                patch_y01
+            )
+
+            &
+
+            (
+                patch_x01 >= 0.0
+            )
+
+            &
+
+            (
+                patch_x01 <= 1.0
+            )
+
+            &
+
+            (
+                patch_y01 >= 0.0
+            )
+
+            &
+
+            (
+                patch_y01 <= 1.0
+            )
+        )
+
+
+        grid = torch.stack(
+
+            [
+                patch_x01 * 2.0 - 1.0,
+                patch_y01 * 2.0 - 1.0,
+            ],
+
+            dim=-1,
+        )
+
+        # [B,Q,K,P,2]
+
+
+        # ------------------------------------------------------------
+        # Existing _sample_feature() expects:
+        #
+        #     [B,Q,N,2]
+        #
+        # so flatten K and P temporarily.
+        # ------------------------------------------------------------
+
+        grid_flat = grid.reshape(
+
+            B,
+            Q,
+            K * P,
+            2,
+        )
+
+
+        sampled_flat = self._sample_feature(
+
+            feature,
+            grid_flat,
+        )
+
+        # [B,Q,K*P,D]
+
+
+        D = (
+            sampled_flat.shape[-1]
+        )
+
+
+        sampled = sampled_flat.reshape(
+
+            B,
+            Q,
+            K,
+            P,
+            D,
+        )
+
+        # [B,Q,K,P,D]
+
+
+        return (
+            sampled,
+            valid,
+        )
+
+
+    # ================================================================
+    # V1.2:
+    # Build local patch relation descriptor
+    # ================================================================
+
+    def _build_patch_relation(
+        self,
+        source_patch,
+        target_patch,
+        source_valid,
+        target_valid,
+        encoder,
+    ):
+        """
+        source_patch:
+            [B,Q,P,D]
+
+        target_patch:
+            [B,Q,K,P,D]
+
+        source_valid:
+            [B,Q,P]
+
+        target_valid:
+            [B,Q,K,P]
+
+        Returns
+        -------
+        patch_embedding:
+            [B,Q,K,patch_embed_dim]
+        """
+
+        K = (
+            target_patch.shape[2]
+        )
+
+
+        # ------------------------------------------------------------
+        # Expand source patch across K candidates
+        # ------------------------------------------------------------
+
+        source_expand = (
+
+            source_patch
+            .unsqueeze(2)
+            .expand(
+                -1,
+                -1,
+                K,
+                -1,
+                -1,
+            )
+        )
+
+        # [B,Q,K,P,D]
+
+
+        # ------------------------------------------------------------
+        # 1. Cosine similarity for each corresponding patch point
+        # ------------------------------------------------------------
+
+        source_norm = F.normalize(
+
+            source_expand,
+
+            p=2,
+            dim=-1,
+
+            eps=1.0e-6,
+        )
+
+
+        target_norm = F.normalize(
+
+            target_patch,
+
+            p=2,
+            dim=-1,
+
+            eps=1.0e-6,
+        )
+
+
+        patch_cos = (
+
+            source_norm
+            *
+            target_norm
+
+        ).sum(
+            dim=-1
+        )
+
+        # [B,Q,K,P]
+
+
+        # ------------------------------------------------------------
+        # 2. Feature absolute difference at each patch point
+        # ------------------------------------------------------------
+
+        patch_absdiff = (
+
+            torch.abs(
+
+                source_expand
+                -
+                target_patch
+            )
+
+            .mean(
+                dim=-1
+            )
+        )
+
+        # [B,Q,K,P]
+
+
+        # ------------------------------------------------------------
+        # 3. Pair validity
+        # ------------------------------------------------------------
+
+        pair_valid = (
+
+            source_valid
+            .unsqueeze(2)
+
+            &
+
+            target_valid
+        )
+
+        # [B,Q,K,P]
+
+
+        pair_valid_float = (
+
+            pair_valid.to(
+                dtype=patch_cos.dtype
+            )
+        )
+
+
+        # Invalid patch samples should contribute no feature evidence.
+        patch_cos = (
+
+            patch_cos
+            *
+            pair_valid_float
+        )
+
+
+        patch_absdiff = (
+
+            patch_absdiff
+            *
+            pair_valid_float
+        )
+
+
+        # ------------------------------------------------------------
+        # Per patch point:
+        #
+        # cosine      P
+        # absdiff     P
+        # validity    P
+        #
+        # total = 3*P
+        #
+        # P=9 -> 27 dim
+        # ------------------------------------------------------------
+
+        patch_relation = torch.cat(
+
+            [
+                patch_cos,
+                patch_absdiff,
+                pair_valid_float,
+            ],
+
+            dim=-1,
+        )
+
+        # [B,Q,K,3*P]
+
+
+        patch_embedding = encoder(
+
+            patch_relation
+        )
+
+        # [B,Q,K,patch_embed_dim]
+
+
+        return patch_embedding
 
     # ================================================================
     # Forward
@@ -353,6 +1121,7 @@ class LocalCorrRefinementHead(nn.Module):
     def forward(
         self,
         local_feature,
+        high_feature,
         query_input,
         coarse_corr,
     ):
@@ -414,49 +1183,154 @@ class LocalCorrRefinementHead(nn.Module):
                 '[R2.1 LocalRefiner] '
                 f'SBS width must be even: {W_sbs}'
             )
+        
+        # ============================================================
+        # V1.2:
+        # high-level feature validation
+        # ============================================================
 
+        if high_feature.ndim != 4:
+
+            raise RuntimeError(
+                'high_feature must be [B,C,H,2W], '
+                f'actual={tuple(high_feature.shape)}'
+            )
+
+
+        if (
+            high_feature.shape[0]
+            != local_feature.shape[0]
+        ):
+
+            raise RuntimeError(
+                '[V1.2 LocalRefiner] '
+                'local/high batch mismatch: '
+                f'local={tuple(local_feature.shape)}, '
+                f'high={tuple(high_feature.shape)}'
+            )
+
+
+        if (
+            high_feature.shape[1]
+            != self.high_in_channels
+        ):
+
+            raise RuntimeError(
+                '[V1.2 LocalRefiner] '
+                'high feature channel mismatch: '
+                f'expected={self.high_in_channels}, '
+                f'actual={high_feature.shape[1]}'
+            )
+
+
+        if (
+            high_feature.shape[-1]
+            % 2
+            != 0
+        ):
+
+            raise RuntimeError(
+                '[V1.2 LocalRefiner] '
+                'high SBS width must be even: '
+                f'{tuple(high_feature.shape)}'
+            )
 
         # ============================================================
-        # 1. Project frozen layer2 feature
+        # 1. V1.2 Multi-scale feature projection
         # ============================================================
 
-        projected = self.feature_proj(
+        projected_l2 = self.feature_proj(
+
             local_feature
         )
 
         # expected:
-        #
         # [B,64,24,160]
 
 
-        half_w = (
-            projected.shape[-1]
+        projected_high = self.high_feature_proj(
+
+            high_feature
+        )
+
+        # expected:
+        # [B,64,12,80]
+
+
+        # ============================================================
+        # 2. LEFT / RIGHT split - Layer2
+        # ============================================================
+
+        half_w_l2 = (
+
+            projected_l2.shape[-1]
             // 2
         )
 
 
-        # ============================================================
-        # 2. LEFT / RIGHT feature split
-        # ============================================================
+        left_l2 = (
 
-        left_feature = (
-            projected[
+            projected_l2[
                 ...,
-                :half_w
+                :half_w_l2
             ]
         )
 
-        right_feature = (
-            projected[
+
+        right_l2 = (
+
+            projected_l2[
                 ...,
-                half_w:
+                half_w_l2:
             ]
         )
+
 
         # expected:
         #
-        # [B,64,24,80]
-        # [B,64,24,80]
+        # left_l2:
+        #     [B,64,24,80]
+        #
+        # right_l2:
+        #     [B,64,24,80]
+
+
+        # ============================================================
+        # 3. LEFT / RIGHT split - high-level feature
+        # ============================================================
+
+        half_w_high = (
+
+            projected_high.shape[-1]
+            // 2
+        )
+
+
+        left_high = (
+
+            projected_high[
+                ...,
+                :half_w_high
+            ]
+        )
+
+
+        right_high = (
+
+            projected_high[
+                ...,
+                half_w_high:
+            ]
+        )
+
+
+        # expected:
+        #
+        # left_high:
+        #     [B,64,12,40]
+        #
+        # right_high:
+        #     [B,64,12,40]
 
 
         # ============================================================
@@ -494,14 +1368,34 @@ class LocalCorrRefinementHead(nn.Module):
         # [B,Q,1,2]
 
 
-        source_feat = self._sample_feature(
+        # ============================================================
+        # V1.2 Source point feature - Layer2
+        # ============================================================
 
-            left_feature,
+        source_feat_l2 = self._sample_feature(
+
+            left_l2,
 
             source_grid,
+
         ).squeeze(2)
 
-        # [B,Q,D]
+        # [B,Q,64]
+
+
+        # ============================================================
+        # V1.2 Source point feature - high-level
+        # ============================================================
+
+        source_feat_high = self._sample_feature(
+
+            left_high,
+
+            source_grid,
+
+        ).squeeze(2)
+
+        # [B,Q,64]
 
 
         # ============================================================
@@ -645,23 +1539,148 @@ class LocalCorrRefinementHead(nn.Module):
         # [B,Q,K,2]
 
 
-        target_feat = self._sample_feature(
+        # ============================================================
+        # V1.2 Candidate point feature - Layer2
+        # ============================================================
 
-            right_feature,
+        target_feat_l2 = self._sample_feature(
+
+            right_l2,
 
             candidate_grid,
         )
 
-        # [B,Q,K,D]
+        # [B,Q,K,64]
 
 
         # ============================================================
-        # 8. Candidate descriptor
+        # V1.2 Candidate point feature - high-level
         # ============================================================
 
-        source_expand = (
+        target_feat_high = self._sample_feature(
 
-            source_feat
+            right_high,
+
+            candidate_grid,
+        )
+
+        # [B,Q,K,64]
+
+        # ============================================================
+        # 8. V1.2 Layer2 local patch matching
+        # ============================================================
+
+        (
+            source_patch_l2,
+            source_patch_valid_l2,
+        ) = self._sample_source_patch(
+
+            left_l2,
+
+            source_x01,
+            source_y01,
+
+            self.patch_offsets_l2_px,
+        )
+
+        # source_patch_l2:
+        #     [B,Q,9,64]
+
+
+        (
+            target_patch_l2,
+            target_patch_valid_l2,
+        ) = self._sample_candidate_patch(
+
+            right_l2,
+
+            candidate_x01,
+            candidate_y01,
+
+            self.patch_offsets_l2_px,
+        )
+
+        # target_patch_l2:
+        #     [B,Q,K,9,64]
+
+
+        patch_embedding_l2 = (
+
+            self._build_patch_relation(
+
+                source_patch_l2,
+                target_patch_l2,
+
+                source_patch_valid_l2,
+                target_patch_valid_l2,
+
+                self.patch_encoder_l2,
+            )
+        )
+
+        # [B,Q,K,32]
+
+
+        # ============================================================
+        # 9. V1.2 High-level local patch matching
+        # ============================================================
+
+        (
+            source_patch_high,
+            source_patch_valid_high,
+        ) = self._sample_source_patch(
+
+            left_high,
+
+            source_x01,
+            source_y01,
+
+            self.patch_offsets_high_px,
+        )
+
+
+        (
+            target_patch_high,
+            target_patch_valid_high,
+        ) = self._sample_candidate_patch(
+
+            right_high,
+
+            candidate_x01,
+            candidate_y01,
+
+            self.patch_offsets_high_px,
+        )
+
+
+        patch_embedding_high = (
+
+            self._build_patch_relation(
+
+                source_patch_high,
+                target_patch_high,
+
+                source_patch_valid_high,
+                target_patch_valid_high,
+
+                self.patch_encoder_high,
+            )
+        )
+
+        # [B,Q,K,32]
+
+        # ============================================================
+        # 10. V1.2 Multi-scale candidate descriptor
+        # ============================================================
+
+
+        # ------------------------------------------------------------
+        # A. Layer2 point relation
+        # ------------------------------------------------------------
+
+        source_expand_l2 = (
+
+            source_feat_l2
             .unsqueeze(2)
             .expand(
                 -1,
@@ -671,25 +1690,69 @@ class LocalCorrRefinementHead(nn.Module):
             )
         )
 
+        # [B,Q,K,64]
 
-        abs_diff = torch.abs(
 
-            source_expand
-            - target_feat
+        abs_diff_l2 = torch.abs(
+
+            source_expand_l2
+            -
+            target_feat_l2
         )
 
 
-        product = (
+        product_l2 = (
 
-            source_expand
-            * target_feat
+            source_expand_l2
+            *
+            target_feat_l2
         )
 
+
+        # ------------------------------------------------------------
+        # B. High-level point relation
+        # ------------------------------------------------------------
+
+        source_expand_high = (
+
+            source_feat_high
+            .unsqueeze(2)
+            .expand(
+                -1,
+                -1,
+                K,
+                -1,
+            )
+        )
+
+        # [B,Q,K,64]
+
+
+        abs_diff_high = torch.abs(
+
+            source_expand_high
+            -
+            target_feat_high
+        )
+
+
+        product_high = (
+
+            source_expand_high
+            *
+            target_feat_high
+        )
+
+
+        # ------------------------------------------------------------
+        # C. Candidate geometric offset
+        # ------------------------------------------------------------
 
         offset_norm = (
 
             offsets_px
-            / self.radius_px
+            /
+            self.radius_px
         )
 
 
@@ -711,18 +1774,74 @@ class LocalCorrRefinementHead(nn.Module):
         )
 
 
+        # ------------------------------------------------------------
+        # D. Final V1.2 descriptor
+        #
+        # Layer2 point:
+        #     4*64 = 256
+        #
+        # High point:
+        #     4*64 = 256
+        #
+        # Layer2 patch:
+        #     32
+        #
+        # High patch:
+        #     32
+        #
+        # Offset:
+        #     2
+        #
+        # TOTAL:
+        #     578
+        # ------------------------------------------------------------
+
         candidate_descriptor = torch.cat(
 
             [
-                source_expand,
-                target_feat,
-                abs_diff,
-                product,
+                # Layer2 fine-scale point evidence
+                source_expand_l2,
+                target_feat_l2,
+                abs_diff_l2,
+                product_l2,
+
+                # High-level semantic point evidence
+                source_expand_high,
+                target_feat_high,
+                abs_diff_high,
+                product_high,
+
+                # Multi-scale patch context
+                patch_embedding_l2,
+                patch_embedding_high,
+
+                # Geometric candidate location
                 offset_norm,
             ],
 
             dim=-1,
         )
+
+
+        # ------------------------------------------------------------
+        # Safety check
+        # ------------------------------------------------------------
+
+        if (
+            candidate_descriptor.shape[-1]
+            != self.score_input_dim
+        ):
+
+            raise RuntimeError(
+
+                '[V1.2 LocalRefiner] '
+                'candidate descriptor dim mismatch: '
+
+                f'expected={self.score_input_dim}, '
+
+                f'actual='
+                f'{candidate_descriptor.shape[-1]}'
+            )
 
 
         # ============================================================
