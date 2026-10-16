@@ -248,6 +248,7 @@ class BEVFusion(Base3DDetector):
             'joint',
             'rrrf',
             'rrrf_pred_only',   # NEW
+            'rrrf_adapter',   # EXP1
             'rrrf_v2_geo',   # V2 SE(3) geometry training
             'rrrf_v2',       # V2 SE(3) + refined attention
             'rrrf_full',
@@ -263,6 +264,7 @@ class BEVFusion(Base3DDetector):
         self.rrrf_training_stages = {
             'rrrf',
             'rrrf_pred_only',   # NEW
+            'rrrf_adapter',   # EXP1
             'rrrf_v2_geo',
             'rrrf_v2',
             'rrrf_full',
@@ -992,6 +994,91 @@ class BEVFusion(Base3DDetector):
             )
 
             return
+        
+        # ============================================================
+        # EXP1: RRRF Residual Adapter Only Training
+        # ============================================================
+
+        if stage == 'rrrf_adapter':
+
+            # Adapter 활성화 여부 확인
+            if not getattr(
+                self.bbox_head,
+                'rrrf_adapter_enabled',
+                False
+            ):
+                raise RuntimeError(
+                    '[EXP1] rrrf_adapter_enabled must be True'
+                )
+
+            # 기존 ORIGINAL RRRF V1 기준
+            if self.bbox_head.rrrf_mode != 'residual_se3':
+                raise RuntimeError(
+                    '[EXP1] Expected rrrf_mode=residual_se3, '
+                    f'got {self.bbox_head.rrrf_mode}'
+                )
+
+            # ========================================================
+            # 기존 모듈은 이미 모두 Freeze된 상태
+            #
+            # 새로운 Adapter만 학습 가능하도록 변경
+            # ========================================================
+
+            trainable(
+                self.bbox_head.rrrf_adapter
+            )
+
+            # ========================================================
+            # Freeze Verification
+            # ========================================================
+
+            trainable_names = [
+                name
+                for name, p in self.named_parameters()
+                if p.requires_grad
+            ]
+
+            unexpected = [
+                name
+                for name in trainable_names
+                if not name.startswith(
+                    'bbox_head.rrrf_adapter.'
+                )
+            ]
+
+            if unexpected:
+                raise RuntimeError(
+                    '[EXP1] Unexpected trainable parameters: '
+                    + str(unexpected[:20])
+                )
+
+            adapter_params = sum(
+                p.numel()
+                for p in self.bbox_head.rrrf_adapter.parameters()
+                if p.requires_grad
+            )
+
+            assert adapter_params == 65792, (
+                f'Unexpected adapter parameter count: '
+                f'{adapter_params}'
+            )
+
+            print(
+                '\n'
+                '========================================\n'
+                '[EXP1] RRRF RESIDUAL ADAPTER TRAINING\n'
+                '========================================\n'
+                'LGPC                  : FROZEN\n'
+                'RRRF Coarse Fusion    : FROZEN\n'
+                'RRRF 2nd Predictor    : FROZEN\n'
+                'RRRF Refined Fusion   : FROZEN\n'
+                '3D Detection Decoder  : FROZEN\n'
+                'RRRF Adapter          : TRAINABLE\n'
+                f'Trainable Parameters  : {adapter_params:,}\n'
+                '========================================'
+            )
+
+            return
 
         # ============================================================
         # 4. Common RRRF front-end
@@ -1348,6 +1435,27 @@ class BEVFusion(Base3DDetector):
             if stage != 'rrrf_full':
 
                 self.bbox_head.eval()
+            
+            # ========================================================
+            # EXP1: Freeze all existing modules in eval mode
+            # ========================================================
+
+            if stage == 'rrrf_adapter':
+
+                # 기존 feature projector는 평가 모드
+                self.feat_projector.eval()
+
+                # 기존 RRRF/Decoder 전체는 평가 모드
+                self.bbox_head.eval()
+
+                # 신규 Adapter만 Training Mode
+                self.bbox_head.rrrf_adapter.train()
+
+                # 안전성 검증
+                assert self.bbox_head.training is False
+                assert self.bbox_head.rrrf_adapter.training is True
+
+                return self
             
             # ========================================================
             # RRRF V1 predictor-only adaptation
@@ -8870,6 +8978,21 @@ class BEVFusion(Base3DDetector):
 
                     if key in keep_rrrf_v2_keys
                 } 
+            
+            # ============================================================
+            # EXP1: Detection Loss Only
+            #
+            # Calibration Predictor는 Frozen
+            # Calibration Loss는 학습 대상에서 제외
+            # ============================================================
+
+            if self.lgpc_train_stage == 'rrrf_adapter':
+
+                bbox_loss = {
+                    key: value
+                    for key, value in bbox_loss.items()
+                    if not key.startswith('loss_calib')
+                }
             
             losses.update(bbox_loss)
 

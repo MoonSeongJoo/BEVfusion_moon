@@ -2164,6 +2164,12 @@ class TransFusionHead(nn.Module):
         rrrf_num_cams=6,
         rrrf_detach_geometry=True,
 
+        # ============================================
+        # EXP1: Residual Feature Adapter
+        # ============================================
+        rrrf_adapter_enabled=False,
+        rrrf_adapter_scale=1.0,
+
         train_cfg=None,
         test_cfg=None,
         bbox_coder=None,
@@ -2183,6 +2189,10 @@ class TransFusionHead(nn.Module):
         self.rrrf_mode = rrrf_mode
         self.rrrf_num_cams = rrrf_num_cams
         self.rrrf_detach_geometry = rrrf_detach_geometry
+
+        # EXP1
+        self.rrrf_adapter_enabled = bool(rrrf_adapter_enabled)
+        self.rrrf_adapter_scale = float(rrrf_adapter_scale)
 
         assert self.rrrf_mode in [
             'residual_se3',
@@ -2391,45 +2401,6 @@ class TransFusionHead(nn.Module):
             for param in self.calibration_predictor.parameters():
                 param.requires_grad = False
 
-        # # 🛑 1. 특징 추출기 (SHARED HEAD) - Input -> Hidden
-        # self.calib_shared_fc = nn.Sequential(
-        #     nn.Linear(calibration_input_dim, calibration_hidden_dim),
-        #     nn.ReLU() # Or nn.LeakyReLU(0.01)
-        # )
-
-        # # 🛑 수정 후 (Capacity 및 Stability 증가):
-        # # 🛑 2. 회전 예측 브랜치 (DECOUPLED ROTATION)
-        # self.calib_rot_predictor = nn.Sequential(
-        #     nn.Linear(calibration_hidden_dim, 512),
-        #     nn.GroupNorm(32, 512),
-        #     nn.ReLU(),
-        #     nn.Linear(512, 256),
-        #     nn.GroupNorm(32, 256),
-        #     nn.ReLU(),
-        #     nn.Linear(256, 3) # 최종 Axis-Angle 출력
-        # )
-
-        # # 🛑 3. 이동 예측 브랜치 (DECOUPLED TRANSLATION)
-        # self.calib_trans_predictor = nn.Sequential(
-        #     nn.Linear(calibration_hidden_dim, 512),
-        #     nn.GroupNorm(32, 512),
-        #     nn.ReLU(),
-        #     nn.Linear(512, 256),
-        #     nn.GroupNorm(32, 256),
-        #     nn.ReLU(),
-        #     nn.Linear(256, 3) # 최종 Delta XYZ 출력
-        # )
-
-        # # --- ✨ 4. Zero Initialization 적용 위치 ---
-        # # nn.Sequential 내부의 마지막 Linear 레이어에 적용해야 합니다.
-        # torch.nn.init.constant_(self.calib_rot_predictor[-1].weight.data, 0.)
-        # torch.nn.init.constant_(self.calib_rot_predictor[-1].bias.data, 0.)
-
-        # torch.nn.init.constant_(self.calib_trans_predictor[-1].weight.data, 0.)
-        # torch.nn.init.constant_(self.calib_trans_predictor[-1].bias.data, 0.)
-
-
-
         # --- ✨ 추가: 2단계 정제 퓨전을 위한 레이어들 ✨ ---
         self.refined_attention = nn.MultiheadAttention(
             embed_dim=hidden_channel,
@@ -2444,6 +2415,54 @@ class TransFusionHead(nn.Module):
         )
         self.refined_norm1 = nn.LayerNorm(hidden_channel)
         self.refined_norm2 = nn.LayerNorm(hidden_channel)
+
+        # ============================================================
+        # EXP1: RRRF Residual Feature Adapter
+        #
+        # Input:
+        #   refined_query_feat       [B, C, Nquery]
+        #   coarse_fused_query_feat  [B, C, Nquery]
+        #   lidar_only_query_feat    [B, C, Nquery]
+        #
+        # Output:
+        #   delta_feat               [B, C, Nquery]
+        # ============================================================
+
+        if self.rrrf_adapter_enabled:
+
+            self.rrrf_adapter = nn.Sequential(
+
+                # 3개의 feature를 concatenate
+                # 128 * 3 = 384 channels
+                nn.Conv1d(
+                    in_channels=hidden_channel * 3,
+                    out_channels=hidden_channel,
+                    kernel_size=1,
+                ),
+
+                nn.ReLU(inplace=True),
+
+                # 출력: 128 channels
+                nn.Conv1d(
+                    in_channels=hidden_channel,
+                    out_channels=hidden_channel,
+                    kernel_size=1,
+                ),
+            )
+
+            # ========================================================
+            # Zero Initialization
+            #
+            # 처음에는 adapter 출력이 정확히 0
+            # ========================================================
+
+            nn.init.zeros_(
+                self.rrrf_adapter[-1].weight
+            )
+
+            nn.init.zeros_(
+                self.rrrf_adapter[-1].bias
+            )
 
         # --- ✨ 추가: 2단계 퓨전 결과를 평가하기 위한 보조 헤드 ✨ ---
         # 기존 prediction_heads의 마지막 레이어와 유사한 구조 사용
@@ -3366,11 +3385,37 @@ class TransFusionHead(nn.Module):
             
         
         # --- 시각화용: 중간 퓨전 결과 저장 ---
-        # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
-        fused_query_feat_for_vis = refined_query_feat 
+        fused_query_feat_for_vis = refined_query_feat
+
+        # ============================================================
+        # EXP1: Apply Residual Feature Adapter
+        #
+        # 반드시 기존 Refined Attention 이후,
+        # Transformer Decoder 이전에 적용
+        # ============================================================
+
+        if self.rrrf_adapter_enabled:
+
+            adapter_input = torch.cat(
+                [
+                    refined_query_feat,
+                    coarse_fused_query_feat,
+                    lidar_only_query_feat,
+                ],
+                dim=1,
+            )
+
+            delta_feat = self.rrrf_adapter(
+                adapter_input
+            )
+
+            refined_query_feat = (
+                refined_query_feat
+                + self.rrrf_adapter_scale * delta_feat
+            )
 
         # --- 3. Transformer Decoder 정제 ---
-        decoder_input_feat = refined_query_feat # 퓨전 결과가 디코더 입력
+        decoder_input_feat = refined_query_feat
         
         ret_dicts = []
         current_query_pos = query_pos # 초기 위치로 시작
@@ -4553,39 +4598,6 @@ class TransFusionHead(nn.Module):
         preds_dict = preds_dicts[0][0]
         loss_dict = dict()
 
-        # # --- ✨ 추가: 캘리브레이션 오차 예측 Loss 계산 ✨ ---
-        # # forward_single에서 반환된 예측값 사용
-        # pred_delta_rot_2nd = preds_dict['pred_delta_rot']
-        # pred_delta_trans_2nd = preds_dict['pred_delta_trans']
-
-        # # 1단계 예측값 (detach()로 그래디언트 차단)
-        # pred_delta_rot_1st_per_cam = pred_delta_rot.detach()
-        # pred_delta_trans_1st_per_cam = pred_delta_trans.detach()
-
-        # # [수정] 1단계 예측값도 6개 카메라에 대해 평균을 냅니다.
-        # pred_delta_rot_1st_mean = pred_delta_rot_1st_per_cam.mean(dim=1) # Shape [1, 3]
-        # pred_delta_trans_1st_mean = pred_delta_trans_1st_per_cam.mean(dim=1) # Shape [1, 3]
-
-        # # 전체 GT
-        # gt_delta_rot_mean = gt_delta_rot.mean(dim=1)
-        # gt_delta_trans_mean = gt_delta_trans.mean(dim=1)
-        
-        # # Loss 계산 (배치 전체에 대해 mean)
-        # R_pred_1st = axis_angle_to_matrix(pred_delta_rot_1st_mean)
-        # R_gt_total = axis_angle_to_matrix(gt_delta_rot_mean)
-        # R_gt_residual = R_gt_total @ R_pred_1st.transpose(1, 2)
-        # # T_gt_residual = T_gt_total - T_pred_1st
-        # T_gt_residual = gt_delta_trans_mean - pred_delta_trans_1st_mean
-
-        # R_pred_2nd = axis_angle_to_matrix(pred_delta_rot_2nd)
-
-        # loss_calib_rot_pred= identity_matrix_loss(R_pred_2nd, R_gt_residual)
-        # loss_calib_trans_pred = F.smooth_l1_loss(pred_delta_trans_2nd, T_gt_residual, reduction='mean')
-
-        # loss_dict['loss_calib_rot_pred'] = loss_calib_rot_pred * 100.0 # 가중치
-        # loss_dict['loss_calib_trans_pred'] = loss_calib_trans_pred * 50.0 # 가중치
-        # ----------------------------------------------------
-
         # ============================================================
         # Stage-2 residual SE(3) supervision
         # ============================================================
@@ -4627,16 +4639,29 @@ class TransFusionHead(nn.Module):
                 gt_delta_rot_mean
             )
 
+            # R_gt_residual = (
+            #     R_gt_total
+            #     @ R_pred_1st.transpose(1, 2)
+            # )
+
             R_gt_residual = (
-                R_gt_total
-                @ R_pred_1st.transpose(1, 2)
+                R_pred_1st.transpose(1, 2)
+                @ R_gt_total
             )
 
             # Residual translation target
+            # T_gt_residual = (
+            #     gt_delta_trans_mean
+            #     - pred_delta_trans_1st_mean
+            # )
+
             T_gt_residual = (
-                gt_delta_trans_mean
-                - pred_delta_trans_1st_mean
-            )
+                R_pred_1st.transpose(1, 2)
+                @ (
+                    gt_delta_trans_mean
+                    - pred_delta_trans_1st_mean
+                ).unsqueeze(-1)
+            ).squeeze(-1)
 
             R_pred_2nd = axis_angle_to_matrix(
                 pred_delta_rot_2nd
