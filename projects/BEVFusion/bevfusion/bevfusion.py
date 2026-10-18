@@ -253,6 +253,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_v2',       # V2 SE(3) + refined attention
             'rrrf_full',
             'rrrf_decoder_tail',
+            'rrrf_query_select',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -270,6 +271,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_v2',
             'rrrf_full',
             'rrrf_decoder_tail',
+            'rrrf_query_select',
         }
 
         self.is_rrrf_training_stage = (
@@ -1174,6 +1176,84 @@ class BEVFusion(Base3DDetector):
             )
 
             return
+        
+        # ============================================================
+        # EXP3: Query-selective attention ONLY
+        # ============================================================
+
+        if stage == 'rrrf_query_select':
+
+            if self.bbox_head.rrrf_mode != 'residual_se3_v2':
+                raise RuntimeError(
+                    '[EXP3] RRRF V2 required'
+                )
+
+            if not getattr(
+                self.bbox_head,
+                'rrrf_query_select_enabled',
+                False
+            ):
+                raise RuntimeError(
+                    '[EXP3] Query selector must be enabled'
+                )
+
+            if self.bbox_head.rrrf_adapter_scale != 0.0:
+                raise RuntimeError(
+                    '[EXP3] Residual adapter must be OFF'
+                )
+
+            # All modules were frozen earlier.
+            # Reopen ONLY the new geometry selector.
+
+            trainable(
+                self.bbox_head.rrrf_query_selector
+            )
+
+            # Verify trainable parameters
+            names = [
+                name
+                for name, param in self.named_parameters()
+                if param.requires_grad
+            ]
+
+            unexpected = [
+                name
+                for name in names
+                if not name.startswith(
+                    'bbox_head.rrrf_query_selector.'
+                )
+            ]
+
+            if unexpected or not names:
+                raise RuntimeError(
+                    '[EXP3] Freeze policy violation: '
+                    + str(unexpected[:30])
+                )
+
+            trainable_count = sum(
+                p.numel()
+                for p in self.parameters()
+                if p.requires_grad
+            )
+
+            print(
+                '\n'
+                '========================================\n'
+                '[EXP3] QUERY-SELECTIVE ATTENTION\n'
+                '========================================\n'
+                'LGPC               : FROZEN\n'
+                'RRRF V2 Predictor  : FROZEN\n'
+                'Coarse Fusion      : FROZEN\n'
+                'Refined Fusion     : FROZEN\n'
+                'Residual Adapter   : OFF / FROZEN\n'
+                '20K Decoder        : FROZEN\n'
+                'Prediction Head    : FROZEN\n'
+                'Query Selector     : TRAINABLE\n'
+                f'Trainable Params   : {trainable_count:,}\n'
+                '========================================'
+            )
+
+            return
 
         # ============================================================
         # 4. Common RRRF front-end
@@ -1530,6 +1610,30 @@ class BEVFusion(Base3DDetector):
             if stage != 'rrrf_full':
 
                 self.bbox_head.eval()
+            
+            # ============================================================
+            # EXP3: Freeze pretrained network, train selector only
+            # ============================================================
+
+            if stage == 'rrrf_query_select':
+
+                # Frozen feature projector
+                self.feat_projector.eval()
+
+                # Frozen pretrained TransFusionHead
+                self.bbox_head.eval()
+
+                # Only newly added selector is trainable
+                self.bbox_head.rrrf_query_selector.train()
+
+                assert self.bbox_head.training is False
+
+                assert (
+                    self.bbox_head.rrrf_query_selector.training
+                    is True
+                )
+
+                return self
 
             # ========================================================
             # EXP2: Decoder Tail train/eval mode
@@ -9112,6 +9216,39 @@ class BEVFusion(Base3DDetector):
                     key: value
                     for key, value in bbox_loss.items()
                     if not key.startswith('loss_calib')
+                }
+            
+            # ============================================================
+            # EXP3: Detection supervision only
+            #
+            # Gradient:
+            # Final Loss
+            # -> Frozen Decoder
+            # -> Geometry-Selective Attention
+            #
+            # Only Selector parameters are updated.
+            # ============================================================
+
+            if self.lgpc_train_stage == 'rrrf_query_select':
+
+                required = {
+                    'layer_-1_loss_cls',
+                    'layer_-1_loss_bbox',
+                }
+
+                missing = required - set(bbox_loss)
+
+                if missing:
+                    raise RuntimeError(
+                        '[EXP3] Missing decoder losses: '
+                        + str(sorted(missing))
+                    )
+
+                bbox_loss = {
+                    key: value
+                    for key, value in bbox_loss.items()
+                    if key in required
+                    or 'loss' not in key
                 }
             
             # ========================================================

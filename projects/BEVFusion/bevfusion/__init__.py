@@ -15,6 +15,7 @@ from .cotr import COTR
 from .corr_refiner import LocalCorrRefinementHead
 from .zestimator import ZEstimator
 from .calib_head import CalibrationCorrectionHead
+from .geometry_selective_attention import GeometrySelectiveAttention
 
 __all__ = [
     'BEVFusion', 'TransFusionHead', 'ConvFuser', 'ImageAug3D', 'GridMask',
@@ -23,5 +24,5 @@ __all__ = [
     'BEVLoadMultiViewImageFromFiles', 'BEVFusionSparseEncoder',
     'TransformerDecoderLayer', 'BEVFusionRandomFlip3D',
     'BEVFusionGlobalRotScaleTrans' ,'custom_collate', 'CustomDet3DDataPreprocessor','COTR'
-    ,'ZEstimator' ,'CalibrationCorrectionHead' ,'LocalCorrRefinementHead'
+    ,'ZEstimator' ,'CalibrationCorrectionHead' ,'LocalCorrRefinementHead' ,'GeometrySelectiveAttention'
 ]

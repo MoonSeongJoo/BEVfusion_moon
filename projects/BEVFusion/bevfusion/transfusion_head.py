@@ -22,6 +22,7 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures import xywhr2xyxyr
 from .imageprocessing_unit import visualize_full_pipeline_enhanced,project_points_to_image,visualize_calibration_effect
 from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,correct_camera_proposals,correct_camera_proposals_per_camera,quaternion_to_matrix,identity_matrix_loss
+from .geometry_selective_attention import GeometrySelectiveAttention
 from mmengine.evaluator import BaseMetric
 from mmdet3d.registry import METRICS
 
@@ -2170,6 +2171,16 @@ class TransFusionHead(nn.Module):
         rrrf_adapter_enabled=False,
         rrrf_adapter_scale=1.0,
 
+        # ============================================================
+        # EXP3: Query-wise Geometry-Selective Attention
+        # ============================================================
+
+        rrrf_query_select_enabled=False,
+        rrrf_query_select_scale=1.0,
+        rrrf_query_select_topk=16,
+        rrrf_query_select_radius_m=4.0,
+        rrrf_query_select_sigma_m=2.0,
+
         train_cfg=None,
         test_cfg=None,
         bbox_coder=None,
@@ -2193,6 +2204,26 @@ class TransFusionHead(nn.Module):
         # EXP1
         self.rrrf_adapter_enabled = bool(rrrf_adapter_enabled)
         self.rrrf_adapter_scale = float(rrrf_adapter_scale)
+
+        # ============================================================
+        # EXP3: selector configuration
+        # ============================================================
+        self.rrrf_query_select_enabled = bool(
+            rrrf_query_select_enabled
+        )
+
+        self.rrrf_query_select_scale = float(
+            rrrf_query_select_scale
+        )
+
+        if (
+            self.rrrf_query_select_enabled
+            and self.rrrf_mode != 'residual_se3_v2'
+        ):
+            raise RuntimeError(
+                '[EXP3] Query-selective attention requires '
+                'rrrf_mode=residual_se3_v2'
+            )
 
         assert self.rrrf_mode in [
             'residual_se3',
@@ -2462,6 +2493,27 @@ class TransFusionHead(nn.Module):
 
             nn.init.zeros_(
                 self.rrrf_adapter[-1].bias
+            )
+        
+        # ============================================================
+        # EXP3: Geometry-Selective Attention
+        # ============================================================
+
+        if self.rrrf_query_select_enabled:
+
+            self.rrrf_query_selector = (
+                GeometrySelectiveAttention(
+
+                    channels=hidden_channel,
+
+                    num_heads=num_heads,
+
+                    topk=rrrf_query_select_topk,
+
+                    radius_m=rrrf_query_select_radius_m,
+
+                    sigma_m=rrrf_query_select_sigma_m,
+                )
             )
 
         # --- ✨ 추가: 2단계 퓨전 결과를 평가하기 위한 보조 헤드 ✨ ---
@@ -3386,6 +3438,83 @@ class TransFusionHead(nn.Module):
         
         # --- 시각화용: 중간 퓨전 결과 저장 ---
         fused_query_feat_for_vis = refined_query_feat
+
+        # ============================================================
+        # EXP3: Query-wise Geometry-Selective Attention
+        #
+        # Input:
+        #   refined_query_feat         [B,C,Nq]
+        #   query_pos                  [B,Nq,2]
+        #   cam_proposal_feat          [B,Np,C]
+        #   det_xyz_corrected_norm     [B,Np,3]
+        #
+        # Output:
+        #   geometry_delta             [B,C,Nq]
+        # ============================================================
+
+        if (
+            self.rrrf_query_select_enabled
+            and self.rrrf_query_select_scale != 0.0
+            and det_xyz is not None
+            and det_feats is not None
+        ):
+
+            if self.rrrf_mode != 'residual_se3_v2':
+                raise RuntimeError(
+                    '[EXP3] RRRF V2 mode required'
+                )
+
+            geometry_delta = self.rrrf_query_selector(
+
+                query_chw=refined_query_feat,
+
+                query_grid_xy=query_pos,
+
+                camera_feat=cam_proposal_feat,
+
+                # IMPORTANT:
+                # V2-corrected 3D positions, not raw det_xyz
+                corrected_cam_xyz_norm=det_xyz_corrected_norm,
+
+                pc_range=self.train_cfg[
+                    'point_cloud_range'
+                ],
+
+                voxel_size=self.train_cfg[
+                    'voxel_size'
+                ],
+
+                out_size_factor=self.train_cfg[
+                    'out_size_factor'
+                ],
+
+                proposal_valid_mask=(
+                    camera_proposal_valid_mask
+                ),
+
+                active_cam_mask=(
+                    stage1_active_cam_mask
+                ),
+            )
+
+            refined_query_feat = (
+                refined_query_feat
+                + self.rrrf_query_select_scale
+                * geometry_delta
+            )
+
+            if not hasattr(
+                self,
+                '_exp3_select_debug_printed'
+            ):
+
+                print(
+                    '[EXP3] Query-selective first forward:',
+                    self.rrrf_query_selector.last_stats
+                )
+
+                self._exp3_select_debug_printed = True
+
 
         # ============================================================
         # EXP1: Apply Residual Feature Adapter
