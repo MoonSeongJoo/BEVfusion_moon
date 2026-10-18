@@ -252,6 +252,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_v2_geo',   # V2 SE(3) geometry training
             'rrrf_v2',       # V2 SE(3) + refined attention
             'rrrf_full',
+            'rrrf_decoder_tail',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -268,6 +269,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_v2_geo',
             'rrrf_v2',
             'rrrf_full',
+            'rrrf_decoder_tail',
         }
 
         self.is_rrrf_training_stage = (
@@ -1001,7 +1003,6 @@ class BEVFusion(Base3DDetector):
 
         if stage == 'rrrf_adapter':
 
-            # Adapter 활성화 여부 확인
             if not getattr(
                 self.bbox_head,
                 'rrrf_adapter_enabled',
@@ -1011,12 +1012,30 @@ class BEVFusion(Base3DDetector):
                     '[EXP1] rrrf_adapter_enabled must be True'
                 )
 
-            # 기존 ORIGINAL RRRF V1 기준
-            if self.bbox_head.rrrf_mode != 'residual_se3':
+            # ========================================================
+            # EXP1 Adapter supports V1 and V2.
+            #
+            # This stage trains ONLY the new feature Adapter.
+            # Stage-2 Calibration Predictor remains FROZEN.
+            # ========================================================
+
+            allowed_modes = {
+                'residual_se3',
+                'residual_se3_v2',
+            }
+
+            current_mode = self.bbox_head.rrrf_mode
+
+            if current_mode not in allowed_modes:
                 raise RuntimeError(
-                    '[EXP1] Expected rrrf_mode=residual_se3, '
-                    f'got {self.bbox_head.rrrf_mode}'
+                    '[EXP1] Unsupported RRRF mode: '
+                    f'{current_mode}'
                 )
+
+            print(
+                '[EXP1] Adapter-only training with RRRF mode = '
+                f'{current_mode}'
+            )
 
             # ========================================================
             # 기존 모듈은 이미 모두 Freeze된 상태
@@ -1076,6 +1095,82 @@ class BEVFusion(Base3DDetector):
                 'RRRF Adapter          : TRAINABLE\n'
                 f'Trainable Parameters  : {adapter_params:,}\n'
                 '========================================'
+            )
+
+            return
+        
+
+        # ============================================================
+        # EXP2: V2 Decoder Tail Fine-Tuning
+        # ============================================================
+
+        if stage == 'rrrf_decoder_tail':
+
+            if self.bbox_head.rrrf_mode != 'residual_se3_v2':
+                raise RuntimeError(
+                    '[EXP2] RRRF V2 mode is required'
+                )
+
+            if self.bbox_head.num_decoder_layers != 1:
+                raise RuntimeError(
+                    '[EXP2] Expected one Decoder Layer'
+                )
+
+            # Everything has already been frozen above.
+
+            # Train ONLY the final Transformer Decoder.
+            trainable(
+                self.bbox_head.decoder[-1]
+            )
+
+            # Train ONLY its final prediction head.
+            trainable(
+                self.bbox_head.prediction_heads[-1]
+            )
+
+            # Prevent BatchNorm running-statistics drift.
+            for module in self.bbox_head.prediction_heads[-1].modules():
+                if isinstance(
+                    module,
+                    nn.modules.batchnorm._BatchNorm
+                ):
+                    module.eval()
+
+            allowed = (
+                'bbox_head.decoder.0.',
+                'bbox_head.prediction_heads.0.',
+            )
+
+            trainable_names = [
+                name
+                for name, p in self.named_parameters()
+                if p.requires_grad
+            ]
+
+            unexpected = [
+                name
+                for name in trainable_names
+                if not name.startswith(allowed)
+            ]
+
+            if unexpected:
+                raise RuntimeError(
+                    '[EXP2] Unexpected trainable params: '
+                    + str(unexpected[:20])
+                )
+
+            n_trainable = sum(
+                p.numel()
+                for p in self.parameters()
+                if p.requires_grad
+            )
+
+            print(
+                '[EXP2] RRRF V2 Decoder Tail Training\n'
+                f'Trainable Parameters: {n_trainable:,}\n'
+                'Decoder[0]: TRAIN\n'
+                'PredictionHead[0]: TRAIN\n'
+                'LGPC / RRRF V2 / Fusion / Adapter: FROZEN'
             )
 
             return
@@ -1435,6 +1530,31 @@ class BEVFusion(Base3DDetector):
             if stage != 'rrrf_full':
 
                 self.bbox_head.eval()
+
+            # ========================================================
+            # EXP2: Decoder Tail train/eval mode
+            # ========================================================
+
+            if stage == 'rrrf_decoder_tail':
+
+                self.feat_projector.eval()
+
+                # Entire head is frozen by default.
+                self.bbox_head.eval()
+
+                # Only decoder and prediction head use train mode.
+                self.bbox_head.decoder[-1].train()
+                self.bbox_head.prediction_heads[-1].train()
+
+                # Keep existing BN running statistics.
+                for module in self.bbox_head.prediction_heads[-1].modules():
+                    if isinstance(
+                        module,
+                        nn.modules.batchnorm._BatchNorm
+                    ):
+                        module.eval()
+
+                return self
             
             # ========================================================
             # EXP1: Freeze all existing modules in eval mode
@@ -8992,6 +9112,32 @@ class BEVFusion(Base3DDetector):
                     key: value
                     for key, value in bbox_loss.items()
                     if not key.startswith('loss_calib')
+                }
+            
+            # ========================================================
+            # EXP2: Optimize only final decoder detection losses.
+            # ========================================================
+
+            if self.lgpc_train_stage == 'rrrf_decoder_tail':
+
+                expected_losses = {
+                    'layer_-1_loss_cls',
+                    'layer_-1_loss_bbox',
+                }
+
+                missing = expected_losses - set(bbox_loss)
+
+                if missing:
+                    raise RuntimeError(
+                        '[EXP2] Missing decoder losses: '
+                        + str(sorted(missing))
+                    )
+
+                bbox_loss = {
+                    key: value
+                    for key, value in bbox_loss.items()
+                    if key in expected_losses
+                    or 'loss' not in key
                 }
             
             losses.update(bbox_loss)
