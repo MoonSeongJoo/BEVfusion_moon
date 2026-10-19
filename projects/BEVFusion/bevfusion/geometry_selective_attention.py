@@ -357,5 +357,139 @@ class GeometrySelectiveAttention(nn.Module):
             }
 
             self._stats_recorded = True
+        
+
+        # ============================================================
+        # EXP3: Geometry-Selective Attention Evaluation Diagnostics
+        #
+        # Execute ONLY during evaluation.
+        # No changes to Attention output or model parameters.
+        # ============================================================
+
+        if not self.training:
+
+            with torch.no_grad():
+
+                # --------------------------------------------
+                # 1. Query Coverage
+                # --------------------------------------------
+
+                active = has_neighbor.float()
+
+                active_count = active.sum().clamp_min(1.0)
+
+                coverage = active.mean()
+
+                # --------------------------------------------
+                # 2. Valid Neighbor Count
+                # --------------------------------------------
+
+                mean_neighbors = (
+                    neighbors_valid.float()
+                    .sum(dim=-1)
+                    .mean()
+                )
+
+                # --------------------------------------------
+                # 3. Gate Value for Valid Queries
+                # --------------------------------------------
+
+                gate_valid = (
+                    gate.detach().float().squeeze(-1)
+                    * active
+                ).sum() / active_count
+
+                # --------------------------------------------
+                # 4. Residual Feature Magnitude
+                # --------------------------------------------
+
+                delta_abs = (
+                    delta.detach().float().abs().mean()
+                )
+
+                query_abs = (
+                    query_chw.detach().float().abs().mean()
+                ).clamp_min(1e-8)
+
+                relative_delta_pct = (
+                    100.0 * delta_abs / query_abs
+                )
+
+                # --------------------------------------------
+                # 5. Attention Peak
+                # --------------------------------------------
+
+                # weights shape:
+                # [B, Nq, K, H]
+
+                attention_peak = (
+                    weights.detach().float()
+                    .amax(dim=2)
+                    .mean(dim=-1)
+                )
+
+                attention_peak_valid = (
+                    attention_peak * active
+                ).sum() / active_count
+
+                # --------------------------------------------
+                # 6. Accumulate Statistics
+                # --------------------------------------------
+
+                current_metrics = torch.stack([
+                    coverage,
+                    mean_neighbors,
+                    gate_valid,
+                    delta_abs,
+                    relative_delta_pct,
+                    attention_peak_valid,
+                ]).detach()
+
+                if not hasattr(self, "_exp3_eval_sum"):
+
+                    self._exp3_eval_sum = (
+                        torch.zeros_like(current_metrics)
+                    )
+
+                    self._exp3_eval_steps = 0
+
+                self._exp3_eval_sum += current_metrics
+
+                self._exp3_eval_steps += 1
+
+                # --------------------------------------------
+                # 7. Print Every 200 Forward Steps
+                # --------------------------------------------
+
+                if (
+                    self._exp3_eval_steps == 1
+                    or self._exp3_eval_steps % 200 == 0
+                ):
+
+                    avg = (
+                        self._exp3_eval_sum
+                        / self._exp3_eval_steps
+                    ).cpu().tolist()
+
+                    rank = 0
+
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                    ):
+
+                        rank = torch.distributed.get_rank()
+
+                    print(
+                        f"[EXP3-EVAL] rank={rank} "
+                        f"steps={self._exp3_eval_steps} "
+                        f"coverage={avg[0]:.4f} "
+                        f"neighbors={avg[1]:.4f} "
+                        f"gate_valid={avg[2]:.5f} "
+                        f"delta_abs={avg[3]:.6f} "
+                        f"relative_delta_pct={avg[4]:.4f} "
+                        f"attention_peak={avg[5]:.4f}",
+                        flush=True,
+                    )
 
         return delta.transpose(1, 2).contiguous()
