@@ -254,6 +254,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_full',
             'rrrf_decoder_tail',
             'rrrf_query_select',
+            'rrrf_joint_fresh',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -272,6 +273,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_full',
             'rrrf_decoder_tail',
             'rrrf_query_select',
+            'rrrf_joint_fresh',
         }
 
         self.is_rrrf_training_stage = (
@@ -1178,6 +1180,95 @@ class BEVFusion(Base3DDetector):
             return
         
         # ============================================================
+        # EXP4: Joint Training — PRE-20K Reference
+        # ============================================================
+
+        if stage == 'rrrf_joint_fresh':
+
+            head = self.bbox_head
+
+            if head.rrrf_mode != 'residual_se3_v2':
+                raise RuntimeError(
+                    '[EXP4] RRRF V2 is required'
+                )
+
+            if head.num_decoder_layers != 1:
+                raise RuntimeError(
+                    '[EXP4] Expected one decoder layer'
+                )
+
+            if (
+                not head.rrrf_adapter_enabled
+                or not head.rrrf_query_select_enabled
+            ):
+                raise RuntimeError(
+                    '[EXP4] Adapter and Selector must be enabled'
+                )
+
+            # Only these four groups may update.
+            trainable(head.rrrf_query_selector)
+            trainable(head.rrrf_adapter)
+            trainable(head.decoder[0])
+            trainable(head.prediction_heads[0])
+
+            # Freeze BN running statistics while
+            # allowing affine weights to train.
+            for module in head.prediction_heads[0].modules():
+                if isinstance(
+                    module,
+                    nn.modules.batchnorm._BatchNorm
+                ):
+                    module.eval()
+
+            allowed = (
+                'bbox_head.rrrf_query_selector.',
+                'bbox_head.rrrf_adapter.',
+                'bbox_head.decoder.0.',
+                'bbox_head.prediction_heads.0.',
+            )
+
+            names = [
+                name
+                for name, p in self.named_parameters()
+                if p.requires_grad
+            ]
+
+            unexpected = [
+                name for name in names
+                if not name.startswith(allowed)
+            ]
+
+            missing = [
+                prefix for prefix in allowed
+                if not any(
+                    name.startswith(prefix)
+                    for name in names
+                )
+            ]
+
+            if unexpected or missing:
+                raise RuntimeError(
+                    '[EXP4] Freeze policy error: '
+                    f'unexpected={unexpected[:15]}, '
+                    f'missing={missing}'
+                )
+
+            total = sum(
+                p.numel()
+                for p in self.parameters()
+                if p.requires_grad
+            )
+
+            print(
+                '[EXP4] Joint Training: '
+                'Selector + Adapter + Decoder + Prediction Head'
+            )
+            print('[EXP4] Trainable Parameters:', total)
+
+            return
+
+        
+        # ============================================================
         # EXP3: Query-selective attention ONLY
         # ============================================================
 
@@ -1610,6 +1701,36 @@ class BEVFusion(Base3DDetector):
             if stage != 'rrrf_full':
 
                 self.bbox_head.eval()
+            
+            
+            # ============================================================
+            # EXP4: Restore joint training mode
+            # ============================================================
+
+            if stage == 'rrrf_joint_fresh':
+
+                self.feat_projector.eval()
+                self.bbox_head.eval()
+
+                head = self.bbox_head
+
+                head.rrrf_query_selector.train()
+                head.rrrf_adapter.train()
+                head.decoder[0].train()
+                head.prediction_heads[0].train()
+
+                # Prevent BN running-statistics drift
+                for module in head.prediction_heads[0].modules():
+                    if isinstance(
+                        module,
+                        nn.modules.batchnorm._BatchNorm
+                    ):
+                        module.eval()
+
+                assert head.training is False
+
+                return self
+
             
             # ============================================================
             # EXP3: Freeze pretrained network, train selector only
@@ -9217,6 +9338,33 @@ class BEVFusion(Base3DDetector):
                     for key, value in bbox_loss.items()
                     if not key.startswith('loss_calib')
                 }
+            
+
+            # ============================================================
+            # EXP4: Final Detection Loss Only
+            # ============================================================
+
+            if self.lgpc_train_stage == 'rrrf_joint_fresh':
+
+                required = {
+                    'layer_-1_loss_cls',
+                    'layer_-1_loss_bbox',
+                }
+
+                missing = required - set(bbox_loss)
+
+                if missing:
+                    raise RuntimeError(
+                        '[EXP4] Missing detection losses: '
+                        + str(sorted(missing))
+                    )
+
+                bbox_loss = {
+                    name: value
+                    for name, value in bbox_loss.items()
+                    if name in required or 'loss' not in name
+                }
+
             
             # ============================================================
             # EXP3: Detection supervision only
