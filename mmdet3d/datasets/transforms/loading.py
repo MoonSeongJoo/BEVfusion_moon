@@ -29,6 +29,7 @@ from .image_display import (points2depthmap_cpu,points2depthmap_gpu,
                                                              enhanced_geometric_propagation,direction_aware_completion,direction_aware_bilateral_filter,
                                                              rotation_matrix_to_axis_angle,
                                                              )
+from projects.drift_eval.protocol import DriftLookup
 
 
 @TRANSFORMS.register_module()
@@ -1379,6 +1380,7 @@ class PointToMultiViewDepth(object):
         deterministic_perturb=False,
         perturb_seed=20260811,
         debug_calib_consistency=False,
+        drift_manifest=None,
     ):
         self.downsample = downsample
         self.grid_config = grid_config
@@ -1393,6 +1395,16 @@ class PointToMultiViewDepth(object):
 
         self.deterministic_perturb = deterministic_perturb
         self.perturb_seed = perturb_seed
+
+        # =====================================================
+        # IV2027 Temporal / Shock Drift
+        # =====================================================
+
+        self.drift_lookup = (
+            DriftLookup(drift_manifest)
+            if drift_manifest is not None
+            else None
+        )
 
         # =====================================================
         # STEP-0 debug
@@ -1907,6 +1919,66 @@ class PointToMultiViewDepth(object):
         Training:
             random samples from the same uniform range.
         """
+
+        # ============================================================
+        # IV2027: Temporal / Shock Drift
+        #
+        # - Manifest가 있으면 시간 의존 Drift 사용
+        # - 없으면 기존 Random Perturbation 사용
+        # ============================================================
+
+        if self.drift_lookup is not None:
+
+            # 현재 nuScenes sample token
+            token = results.get('token')
+
+            if not isinstance(token, str) or len(token) < 20:
+                raise RuntimeError(
+                    'Temporal drift requires nuScenes token: '
+                    f'{token!r}'
+                )
+
+            # 실제 Camera 순서 확보
+            images = results.get('images')
+
+            if not isinstance(images, dict):
+                raise RuntimeError(
+                    'results["images"] is missing'
+                )
+
+            camera_names = list(images.keys())
+
+            if len(camera_names) != len(results['lidar2img']):
+                raise RuntimeError(
+                    'Camera count/order mismatch'
+                )
+
+            camera_name = camera_names[cam_idx]
+
+            # Manifest에서 동일 sample/camera의 Drift 조회
+            delta_numpy = self.drift_lookup.get(
+                token,
+                camera_name,
+            )
+
+            extrinsic_perturb = torch.as_tensor(
+                delta_numpy,
+                dtype=like_tensor.dtype,
+                device=like_tensor.device,
+            )
+
+            # Debug 정보
+            item = self.drift_lookup.samples[token][camera_name]
+
+            perturb_params = {
+                'camera': camera_name,
+                'scenario': self.drift_lookup.manifest['scenario'],
+                'drift_alpha': item['drift_alpha'],
+                'rot_deg': item['rot_deg'],
+                'trans_m': item['trans_m'],
+            }
+
+            return extrinsic_perturb, perturb_params
 
         # =========================================================
         # 1. Generate six normalized random values

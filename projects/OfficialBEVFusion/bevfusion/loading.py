@@ -150,6 +150,9 @@ class BEVLoadMultiViewImageFromFiles(LoadMultiViewImageFromFiles):
                 np.float32)
             cam2img.append(cam2img_array)
             lidar2img.append(cam2img_array @ lidar2cam_array)
+        
+        # IV2027: 실제 camera order 전달
+        results['camera_names'] = list(results['images'].keys())
 
         results['img_path'] = filename
         results['cam2img'] = np.stack(cam2img, axis=0)

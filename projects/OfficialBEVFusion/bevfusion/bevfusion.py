@@ -19,6 +19,7 @@ from projects.LCCNetModern.lie import se3
 from projects.LCCNetModern.calib_geometry import (
     project_lidar_to_sparse_depth,
 )
+from projects.drift_eval.protocol import DriftLookup
 
 
 @MODELS.register_module()
@@ -43,6 +44,9 @@ class BEVFusion(Base3DDetector):
         perturb_max_trans_m=0.75,
         perturb_seed=20260811,
 
+        # IV2027 신규 인자
+        drift_manifest=None,
+
         lccnet_checkpoint=None,
         lccnet_use_feat_from=1,
         lccnet_depth_scale=50.0,
@@ -57,6 +61,12 @@ class BEVFusion(Base3DDetector):
         self.perturb_max_rot_deg = perturb_max_rot_deg
         self.perturb_max_trans_m = perturb_max_trans_m
         self.perturb_seed = perturb_seed
+
+        self.drift_lookup = (
+            DriftLookup(drift_manifest)
+            if drift_manifest is not None
+            else None
+        )
 
         self.lccnet_checkpoint = lccnet_checkpoint
         self.lccnet_use_feat_from = int(lccnet_use_feat_from)
@@ -589,13 +599,60 @@ class BEVFusion(Base3DDetector):
 
             for cam_idx in range(N):
 
-                delta, params = (
-                    self._sample_calibration_delta(
-                        sample_key,
-                        cam_idx,
-                        camera2lidar_gt,
+                # =====================================================
+                # IV2027 Temporal / Shock Drift
+                # =====================================================
+
+                if self.drift_lookup is not None:
+
+                    token = meta.get('token')
+                    camera_names = meta.get('camera_names')
+
+                    if not isinstance(token, str) or len(token) < 20:
+                        raise RuntimeError(
+                            'Missing nuScenes token in Official metadata'
+                        )
+
+                    if camera_names is None or len(camera_names) != N:
+                        raise RuntimeError(
+                            'Missing or invalid camera_names'
+                        )
+
+                    camera_name = camera_names[cam_idx]
+
+                    delta_numpy = self.drift_lookup.get(
+                        token,
+                        camera_name,
                     )
-                )
+
+                    delta = torch.as_tensor(
+                        delta_numpy,
+                        dtype=camera2lidar_gt.dtype,
+                        device=camera2lidar_gt.device,
+                    )
+
+                    item = self.drift_lookup.samples[token][camera_name]
+
+                    params = {
+                        'camera': camera_name,
+                        'drift_alpha': item['drift_alpha'],
+                        'rot_deg': item['rot_deg'],
+                        'trans_m': item['trans_m'],
+                    }
+
+                # =====================================================
+                # 기존 Random SE(3) 유지
+                # =====================================================
+
+                else:
+
+                    delta, params = (
+                        self._sample_calibration_delta(
+                            sample_key,
+                            cam_idx,
+                            camera2lidar_gt,
+                        )
+                    )
 
                 # ==================================================
                 # IMPORTANT benchmark convention
@@ -860,10 +917,28 @@ class BEVFusion(Base3DDetector):
             camera_intrinsics = calib['cam2img']
             camera2lidar = calib['cam2lidar']
 
-            if not hasattr(
-                self,
-                '_gate_o3_checked'
-            ):
+            # =====================================================
+            # IV2027 Zero / Temporal / Shock Drift Gate
+            # =====================================================
+
+            injected_deviation = (
+                delta_gt - torch.eye(
+                    4,
+                    dtype=delta_gt.dtype,
+                    device=delta_gt.device
+                )
+            ).abs().max().item()
+
+            drift_case = (
+                'zero'
+                if injected_deviation <= 1e-7
+                else 'nonzero'
+            )
+
+            if not hasattr(self, '_gate_o3_checked_cases'):
+                self._gate_o3_checked_cases = set()
+
+            if drift_case not in self._gate_o3_checked_cases:
 
                 # ------------------------------------------------------
                 # Check 1:
@@ -930,6 +1005,22 @@ class BEVFusion(Base3DDetector):
                 err_lidar2img_change = (
                     lidar2image
                     - lidar2image_meta
+                ).abs().max().item()
+
+                # =====================================================
+                # IV2027: Reconstructed Clean Projection Reference
+                # =====================================================
+
+                clean_calib_for_gate = (
+                    self._build_calib_dict_from_cam2lidar(
+                        camera2lidar_gt,
+                        camera_intrinsics
+                    )
+                )
+
+                err_injected_projection_change = (
+                    lidar2image
+                    - clean_calib_for_gate['lidar2img']
                 ).abs().max().item()
 
 
@@ -1001,12 +1092,50 @@ class BEVFusion(Base3DDetector):
                     "Oracle algebra mismatch"
                 )
 
-                assert err_lidar2img_change > 1e-3, (
-                    "Gate O-3 FAILED: "
-                    "Broken projection did not change"
+                # =====================================================
+                # IV2027: Scenario-dependent Geometry Gate
+                # =====================================================
+
+                print(
+                    f"[GATE O-3] drift case = {drift_case}, "
+                    f"max |Delta-I| = {injected_deviation:.8e}, "
+                    f"projection change vs reconstructed clean = "
+                    f"{err_injected_projection_change:.8e}"
                 )
 
-                self._gate_o3_checked = True
+                if drift_case == 'zero':
+
+                    # Identity perturbation must preserve GT geometry
+                    assert err_broken_vs_clean < 1e-5, (
+                        'Gate O-3 ZERO FAILED: C2L differs from GT'
+                    )
+
+                    assert err_injected_projection_change < 1e-3, (
+                        'Gate O-3 ZERO FAILED: '
+                        'reconstructed projection differs'
+                    )
+
+                else:
+
+                    # Nonzero perturbation must actually change geometry
+                    assert err_broken_vs_clean > 1e-7, (
+                        'Gate O-3 NONZERO FAILED: broken C2L unchanged'
+                    )
+
+                    assert err_injected_projection_change > 1e-6, (
+                        'Gate O-3 NONZERO FAILED: '
+                        'injected projection unchanged'
+                    )
+
+                    # Preserve the old Random O-3 safety check
+                    if self.drift_lookup is None:
+
+                        assert err_lidar2img_change > 1e-3, (
+                            'Gate O-3 FAILED: '
+                            'Broken projection did not change'
+                        )
+
+                self._gate_o3_checked_cases.add(drift_case)
         
         elif self.calibration_mode == 'oracle':
 
@@ -1060,10 +1189,24 @@ class BEVFusion(Base3DDetector):
             camera_intrinsics = calib['cam2img']
             camera2lidar = calib['cam2lidar']
         
-            if not hasattr(
-                self,
-                '_gate_o4_checked'
-            ):
+            injected_deviation = (
+                delta_gt - torch.eye(
+                    4,
+                    dtype=delta_gt.dtype,
+                    device=delta_gt.device
+                )
+            ).abs().max().item()
+
+            drift_case = (
+                'zero'
+                if injected_deviation <= 1e-7
+                else 'nonzero'
+            )
+
+            if not hasattr(self, '_gate_o4_checked_cases'):
+                self._gate_o4_checked_cases = set()
+
+            if drift_case not in self._gate_o4_checked_cases:
 
                 # ------------------------------------------------------
                 # Check 1:
@@ -1147,10 +1290,23 @@ class BEVFusion(Base3DDetector):
                 )
 
 
-                assert err_broken_vs_gt > 1e-3, (
-                    "Gate O-4 FAILED: "
-                    "Broken perturbation is not active"
-                )
+                if drift_case == 'zero':
+
+                    assert err_broken_vs_gt < 1e-5, (
+                        'Gate O-4 ZERO FAILED: C2L should match GT'
+                    )
+
+                else:
+
+                    assert err_broken_vs_gt > 1e-7, (
+                        'Gate O-4 NONZERO FAILED: broken C2L unchanged'
+                    )
+
+                    if self.drift_lookup is None:
+                        assert err_broken_vs_gt > 1e-3, (
+                            'Gate O-4 FAILED: '
+                            'Broken perturbation is not active'
+                        )
 
                 assert err_oracle_c2l < 1e-5, (
                     "Gate O-4 FAILED: "
@@ -1162,7 +1318,7 @@ class BEVFusion(Base3DDetector):
                     "Oracle projection did not recover Clean"
                 )
 
-                self._gate_o4_checked = True
+                self._gate_o4_checked_cases.add(drift_case)
         
         elif self.calibration_mode == 'lccnet_depth_debug':
 
@@ -1458,356 +1614,357 @@ class BEVFusion(Base3DDetector):
             camera2lidar = (
                 corrected_calib['cam2lidar']
             )
-        # ============================================================
-        # O-5B LCCNet physical calibration evaluation
-        #
-        # IMPORTANT:
-        # This must run for EVERY frame.
-        # The previous implementation calculated residuals only
-        # for the first frame.
-        # ============================================================
 
-        broken_rot, broken_trans = (
-            self._compute_c2l_residual(
-                broken_camera2lidar,
-                camera2lidar_gt,
-            )
-        )
+            # ============================================================
+            # O-5B LCCNet physical calibration evaluation
+            #
+            # IMPORTANT:
+            # This must run for EVERY frame.
+            # The previous implementation calculated residuals only
+            # for the first frame.
+            # ============================================================
 
-        pred_rot, pred_trans = (
-            self._compute_c2l_residual(
-                corrected_camera2lidar,
-                camera2lidar_gt,
-            )
-        )
-
-
-        # ============================================================
-        # Initialize running statistics only once
-        # ============================================================
-
-        if not hasattr(
-            self,
-            '_lccnet_running_frames'
-        ):
-            self._lccnet_running_frames = 0
-
-            self._lccnet_broken_rot_all = []
-            self._lccnet_pred_rot_all = []
-
-            self._lccnet_broken_trans_all = []
-            self._lccnet_pred_trans_all = []
-
-
-        # ============================================================
-        # Accumulate current batch
-        #
-        # batch_size = 1 in current validation config.
-        # Each frame has N=6 cameras.
-        # ============================================================
-
-        self._lccnet_running_frames += B
-
-        self._lccnet_broken_rot_all.extend(
-            broken_rot.detach()
-            .cpu()
-            .reshape(-1)
-            .tolist()
-        )
-
-        self._lccnet_pred_rot_all.extend(
-            pred_rot.detach()
-            .cpu()
-            .reshape(-1)
-            .tolist()
-        )
-
-        self._lccnet_broken_trans_all.extend(
-            broken_trans.detach()
-            .cpu()
-            .reshape(-1)
-            .tolist()
-        )
-
-        self._lccnet_pred_trans_all.extend(
-            pred_trans.detach()
-            .cpu()
-            .reshape(-1)
-            .tolist()
-        )
-
-
-        # ============================================================
-        # First-frame detailed integration gate
-        # ============================================================
-
-        if not hasattr(
-            self,
-            '_lccnet_gate_checked'
-        ):
-
-            print(
-                '\n'
-                '====================================================\n'
-                '[O-5 LCCNET + OFFICIAL BEVFUSION GATE]'
+            broken_rot, broken_trans = (
+                self._compute_c2l_residual(
+                    broken_camera2lidar,
+                    camera2lidar_gt,
+                )
             )
 
-            print(
-                'checkpoint =',
-                self.lccnet_checkpoint,
-            )
-
-            print(
-                'use_feat_from =',
-                self.lccnet_use_feat_from,
-            )
-
-            print(
-                'first O-3 perturb =',
-                first_debug_params,
-            )
-
-            print(
-                'RGB shape =',
-                tuple(rgb_flat.shape),
-            )
-
-            print(
-                'Depth shape =',
-                tuple(depth_flat.shape),
-            )
-
-            print(
-                'pred_x shape =',
-                tuple(pred_x.shape),
-            )
-
-            print(
-                'pred_x finite =',
-                torch.isfinite(
-                    pred_x
-                ).all().item(),
-            )
-
-            print(
-                f'BROKEN rot = '
-                f'{broken_rot.mean().item():.6f} deg'
-            )
-
-            print(
-                f'LCCNET rot = '
-                f'{pred_rot.mean().item():.6f} deg'
-            )
-
-            print(
-                f'BROKEN trans = '
-                f'{broken_trans.mean().item():.6f} m'
-            )
-
-            print(
-                f'LCCNET trans = '
-                f'{pred_trans.mean().item():.6f} m'
+            pred_rot, pred_trans = (
+                self._compute_c2l_residual(
+                    corrected_camera2lidar,
+                    camera2lidar_gt,
+                )
             )
 
 
-            # --------------------------------------------------------
-            # Per-camera debug for first frame
-            # --------------------------------------------------------
+            # ============================================================
+            # Initialize running statistics only once
+            # ============================================================
 
-            camera_names = [
-                'CAM_FRONT',
-                'CAM_FRONT_RIGHT',
-                'CAM_FRONT_LEFT',
-                'CAM_BACK',
-                'CAM_BACK_LEFT',
-                'CAM_BACK_RIGHT',
-            ]
+            if not hasattr(
+                self,
+                '_lccnet_running_frames'
+            ):
+                self._lccnet_running_frames = 0
 
-            print(
-                '\n'
-                '[PER-CAMERA LCCNET GATE]'
+                self._lccnet_broken_rot_all = []
+                self._lccnet_pred_rot_all = []
+
+                self._lccnet_broken_trans_all = []
+                self._lccnet_pred_trans_all = []
+
+
+            # ============================================================
+            # Accumulate current batch
+            #
+            # batch_size = 1 in current validation config.
+            # Each frame has N=6 cameras.
+            # ============================================================
+
+            self._lccnet_running_frames += B
+
+            self._lccnet_broken_rot_all.extend(
+                broken_rot.detach()
+                .cpu()
+                .reshape(-1)
+                .tolist()
             )
 
-            for cam_idx in range(N):
+            self._lccnet_pred_rot_all.extend(
+                pred_rot.detach()
+                .cpu()
+                .reshape(-1)
+                .tolist()
+            )
 
-                if cam_idx < len(camera_names):
-                    cam_name = camera_names[cam_idx]
-                else:
-                    cam_name = f'CAM_{cam_idx}'
+            self._lccnet_broken_trans_all.extend(
+                broken_trans.detach()
+                .cpu()
+                .reshape(-1)
+                .tolist()
+            )
+
+            self._lccnet_pred_trans_all.extend(
+                pred_trans.detach()
+                .cpu()
+                .reshape(-1)
+                .tolist()
+            )
+
+
+            # ============================================================
+            # First-frame detailed integration gate
+            # ============================================================
+
+            if not hasattr(
+                self,
+                '_lccnet_gate_checked'
+            ):
 
                 print(
-                    f'{cam_name:16s} | '
-                    f'Rot '
-                    f'{broken_rot[0, cam_idx].item():7.3f}'
-                    f' -> '
-                    f'{pred_rot[0, cam_idx].item():7.3f} deg | '
-                    f'Trans '
-                    f'{broken_trans[0, cam_idx].item():6.3f}'
-                    f' -> '
-                    f'{pred_trans[0, cam_idx].item():6.3f} m'
+                    '\n'
+                    '====================================================\n'
+                    '[O-5 LCCNET + OFFICIAL BEVFUSION GATE]'
+                )
+
+                print(
+                    'checkpoint =',
+                    self.lccnet_checkpoint,
+                )
+
+                print(
+                    'use_feat_from =',
+                    self.lccnet_use_feat_from,
+                )
+
+                print(
+                    'first O-3 perturb =',
+                    first_debug_params,
+                )
+
+                print(
+                    'RGB shape =',
+                    tuple(rgb_flat.shape),
+                )
+
+                print(
+                    'Depth shape =',
+                    tuple(depth_flat.shape),
+                )
+
+                print(
+                    'pred_x shape =',
+                    tuple(pred_x.shape),
+                )
+
+                print(
+                    'pred_x finite =',
+                    torch.isfinite(
+                        pred_x
+                    ).all().item(),
+                )
+
+                print(
+                    f'BROKEN rot = '
+                    f'{broken_rot.mean().item():.6f} deg'
+                )
+
+                print(
+                    f'LCCNET rot = '
+                    f'{pred_rot.mean().item():.6f} deg'
+                )
+
+                print(
+                    f'BROKEN trans = '
+                    f'{broken_trans.mean().item():.6f} m'
+                )
+
+                print(
+                    f'LCCNET trans = '
+                    f'{pred_trans.mean().item():.6f} m'
                 )
 
 
-            print(
-                '===================================================='
-            )
+                # --------------------------------------------------------
+                # Per-camera debug for first frame
+                # --------------------------------------------------------
 
-            self._lccnet_gate_checked = True
+                camera_names = [
+                    'CAM_FRONT',
+                    'CAM_FRONT_RIGHT',
+                    'CAM_FRONT_LEFT',
+                    'CAM_BACK',
+                    'CAM_BACK_LEFT',
+                    'CAM_BACK_RIGHT',
+                ]
 
-
-        # ============================================================
-        # Running calibration report
-        #
-        # The main checkpoint validation used 512 frames.
-        # We print intermediate checkpoints so that we can tell
-        # whether the first frame was simply an outlier.
-        # ============================================================
-
-        frames = self._lccnet_running_frames
-
-        report_frames = {
-            1,
-            10,
-            50,
-            100,
-            200,
-            512,
-        }
-
-        if (
-            frames in report_frames
-            or (
-                frames > 512
-                and frames % 500 == 0
-            )
-        ):
-
-            br = torch.tensor(
-                self._lccnet_broken_rot_all,
-                dtype=torch.float32,
-            )
-
-            pr = torch.tensor(
-                self._lccnet_pred_rot_all,
-                dtype=torch.float32,
-            )
-
-            bt = torch.tensor(
-                self._lccnet_broken_trans_all,
-                dtype=torch.float32,
-            )
-
-            pt = torch.tensor(
-                self._lccnet_pred_trans_all,
-                dtype=torch.float32,
-            )
-
-
-            # --------------------------------------------------------
-            # Means
-            # --------------------------------------------------------
-
-            br_mean = br.mean().item()
-            pr_mean = pr.mean().item()
-
-            bt_mean = bt.mean().item()
-            pt_mean = pt.mean().item()
-
-
-            # --------------------------------------------------------
-            # Median
-            # --------------------------------------------------------
-
-            br_median = br.median().item()
-            pr_median = pr.median().item()
-
-            bt_median = bt.median().item()
-            pt_median = pt.median().item()
-
-
-            # --------------------------------------------------------
-            # P90
-            # --------------------------------------------------------
-
-            br_p90 = torch.quantile(
-                br,
-                0.90,
-            ).item()
-
-            pr_p90 = torch.quantile(
-                pr,
-                0.90,
-            ).item()
-
-            bt_p90 = torch.quantile(
-                bt,
-                0.90,
-            ).item()
-
-            pt_p90 = torch.quantile(
-                pt,
-                0.90,
-            ).item()
-
-
-            # --------------------------------------------------------
-            # Recovery percentages
-            # --------------------------------------------------------
-
-            rot_recovery = (
-                100.0
-                * (
-                    br_mean
-                    - pr_mean
+                print(
+                    '\n'
+                    '[PER-CAMERA LCCNET GATE]'
                 )
-                / max(
-                    br_mean,
-                    1e-8,
-                )
-            )
 
-            trans_recovery = (
-                100.0
-                * (
-                    bt_mean
-                    - pt_mean
-                )
-                / max(
-                    bt_mean,
-                    1e-8,
-                )
-            )
+                for cam_idx in range(N):
+
+                    if cam_idx < len(camera_names):
+                        cam_name = camera_names[cam_idx]
+                    else:
+                        cam_name = f'CAM_{cam_idx}'
+
+                    print(
+                        f'{cam_name:16s} | '
+                        f'Rot '
+                        f'{broken_rot[0, cam_idx].item():7.3f}'
+                        f' -> '
+                        f'{pred_rot[0, cam_idx].item():7.3f} deg | '
+                        f'Trans '
+                        f'{broken_trans[0, cam_idx].item():6.3f}'
+                        f' -> '
+                        f'{pred_trans[0, cam_idx].item():6.3f} m'
+                    )
 
 
-            print(
-                '\n'
-                '====================================================\n'
-                '[O-3 LCCNET RUNNING CALIBRATION]\n'
-                f'Frames = {frames}\n'
-                f'Camera predictions = {len(br)}\n'
-                '\n'
-                '[BROKEN]\n'
-                f'Rot   mean={br_mean:.6f} deg  '
-                f'median={br_median:.6f} deg  '
-                f'P90={br_p90:.6f} deg\n'
-                f'Trans mean={bt_mean:.6f} m    '
-                f'median={bt_median:.6f} m    '
-                f'P90={bt_p90:.6f} m\n'
-                '\n'
-                '[LCCNET]\n'
-                f'Rot   mean={pr_mean:.6f} deg  '
-                f'median={pr_median:.6f} deg  '
-                f'P90={pr_p90:.6f} deg\n'
-                f'Trans mean={pt_mean:.6f} m    '
-                f'median={pt_median:.6f} m    '
-                f'P90={pt_p90:.6f} m\n'
-                '\n'
-                f'Rotation recovery    = '
-                f'{rot_recovery:.2f}%\n'
-                f'Translation recovery = '
-                f'{trans_recovery:.2f}%\n'
-                '===================================================='
-            )
+                print(
+                    '===================================================='
+                )
+
+                self._lccnet_gate_checked = True
+
+
+            # ============================================================
+            # Running calibration report
+            #
+            # The main checkpoint validation used 512 frames.
+            # We print intermediate checkpoints so that we can tell
+            # whether the first frame was simply an outlier.
+            # ============================================================
+
+            frames = self._lccnet_running_frames
+
+            report_frames = {
+                1,
+                10,
+                50,
+                100,
+                200,
+                512,
+            }
+
+            if (
+                frames in report_frames
+                or (
+                    frames > 512
+                    and frames % 500 == 0
+                )
+            ):
+
+                br = torch.tensor(
+                    self._lccnet_broken_rot_all,
+                    dtype=torch.float32,
+                )
+
+                pr = torch.tensor(
+                    self._lccnet_pred_rot_all,
+                    dtype=torch.float32,
+                )
+
+                bt = torch.tensor(
+                    self._lccnet_broken_trans_all,
+                    dtype=torch.float32,
+                )
+
+                pt = torch.tensor(
+                    self._lccnet_pred_trans_all,
+                    dtype=torch.float32,
+                )
+
+
+                # --------------------------------------------------------
+                # Means
+                # --------------------------------------------------------
+
+                br_mean = br.mean().item()
+                pr_mean = pr.mean().item()
+
+                bt_mean = bt.mean().item()
+                pt_mean = pt.mean().item()
+
+
+                # --------------------------------------------------------
+                # Median
+                # --------------------------------------------------------
+
+                br_median = br.median().item()
+                pr_median = pr.median().item()
+
+                bt_median = bt.median().item()
+                pt_median = pt.median().item()
+
+
+                # --------------------------------------------------------
+                # P90
+                # --------------------------------------------------------
+
+                br_p90 = torch.quantile(
+                    br,
+                    0.90,
+                ).item()
+
+                pr_p90 = torch.quantile(
+                    pr,
+                    0.90,
+                ).item()
+
+                bt_p90 = torch.quantile(
+                    bt,
+                    0.90,
+                ).item()
+
+                pt_p90 = torch.quantile(
+                    pt,
+                    0.90,
+                ).item()
+
+
+                # --------------------------------------------------------
+                # Recovery percentages
+                # --------------------------------------------------------
+
+                rot_recovery = (
+                    100.0
+                    * (
+                        br_mean
+                        - pr_mean
+                    )
+                    / max(
+                        br_mean,
+                        1e-8,
+                    )
+                )
+
+                trans_recovery = (
+                    100.0
+                    * (
+                        bt_mean
+                        - pt_mean
+                    )
+                    / max(
+                        bt_mean,
+                        1e-8,
+                    )
+                )
+
+
+                print(
+                    '\n'
+                    '====================================================\n'
+                    '[O-3 LCCNET RUNNING CALIBRATION]\n'
+                    f'Frames = {frames}\n'
+                    f'Camera predictions = {len(br)}\n'
+                    '\n'
+                    '[BROKEN]\n'
+                    f'Rot   mean={br_mean:.6f} deg  '
+                    f'median={br_median:.6f} deg  '
+                    f'P90={br_p90:.6f} deg\n'
+                    f'Trans mean={bt_mean:.6f} m    '
+                    f'median={bt_median:.6f} m    '
+                    f'P90={bt_p90:.6f} m\n'
+                    '\n'
+                    '[LCCNET]\n'
+                    f'Rot   mean={pr_mean:.6f} deg  '
+                    f'median={pr_median:.6f} deg  '
+                    f'P90={pr_p90:.6f} deg\n'
+                    f'Trans mean={pt_mean:.6f} m    '
+                    f'median={pt_median:.6f} m    '
+                    f'P90={pt_p90:.6f} m\n'
+                    '\n'
+                    f'Rotation recovery    = '
+                    f'{rot_recovery:.2f}%\n'
+                    f'Translation recovery = '
+                    f'{trans_recovery:.2f}%\n'
+                    '===================================================='
+                )
 
         else:
 
