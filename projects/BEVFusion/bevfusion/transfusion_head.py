@@ -1569,25 +1569,24 @@ class CalibLCCNetMetric(BaseMetric):
                 )
 
 
-            elif calibration_mode in {
-                'pcc_calib_only',
-                'pcc_full',
-            }:
+            elif calibration_mode == 'pcc_calib_only':
 
-                # PCC Stage1 physically applied
+                # LGPC Stage-1 correction only.
+                correction_final = correction1
+
+            elif calibration_mode == 'pcc_full':
+
+                # Diagnostic composition of Stage-1 and
+                # Stage-2 predicted SE(3) corrections.
+                # Stage-2 is applied to proposal geometry,
+                # not as a second global camera reprojection.
 
                 if has_s2:
-
                     correction_final = (
-                        correction2
-                        @ correction1
+                        correction2 @ correction1
                     )
-
                 else:
-
-                    correction_final = (
-                        correction1
-                    )
+                    correction_final = correction1
 
 
             else:
@@ -2181,6 +2180,9 @@ class TransFusionHead(nn.Module):
         rrrf_query_select_radius_m=4.0,
         rrrf_query_select_sigma_m=2.0,
 
+        rrrf_ablation_identity_geometry=False,
+        rrrf_ablation_skip_refined_attention=False,
+
         train_cfg=None,
         test_cfg=None,
         bbox_coder=None,
@@ -2200,6 +2202,25 @@ class TransFusionHead(nn.Module):
         self.rrrf_mode = rrrf_mode
         self.rrrf_num_cams = rrrf_num_cams
         self.rrrf_detach_geometry = rrrf_detach_geometry
+
+        # ============================================
+        # Ablation switches
+        # ============================================
+        self.rrrf_ablation_identity_geometry = bool(
+            rrrf_ablation_identity_geometry
+        )
+
+        self.rrrf_ablation_skip_refined_attention = bool(
+            rrrf_ablation_skip_refined_attention
+        )
+
+        print(
+            '[PGFR ABLATION] '
+            f'identity_geometry='
+            f'{self.rrrf_ablation_identity_geometry}, '
+            f'skip_refined_attention='
+            f'{self.rrrf_ablation_skip_refined_attention}'
+        )
 
         # EXP1
         self.rrrf_adapter_enabled = bool(rrrf_adapter_enabled)
@@ -3331,19 +3352,27 @@ class TransFusionHead(nn.Module):
                 )
 
 
-                det_xyz_corrected_norm = (
-                    correct_camera_proposals_per_camera(
+                # ============================================
+                # PGFR-Det Ablation D:
+                # Remove Stage-2 residual geometry application
+                # ============================================
 
-                        det_xyz,
+                if self.rrrf_ablation_identity_geometry:
 
-                        geom_rot,
+                    # LGPC Stage-1 proposal geometry only
+                    det_xyz_corrected_norm = det_xyz
 
-                        geom_trans,
+                else:
 
-                        pc_range_tensor,
+                    # Original Full PGFR-Det behavior
+                    det_xyz_corrected_norm = (
+                        correct_camera_proposals_per_camera(
+                            det_xyz,
+                            geom_rot,
+                            geom_trans,
+                            pc_range_tensor,
+                        )
                     )
-                )
-
 
                 cam_proposal_pos_embed_refined = (
                     self.camera_proposal_pos_embedding(
@@ -3436,6 +3465,17 @@ class TransFusionHead(nn.Module):
                     ).contiguous()
             
         
+            # ============================================
+            # PGFR-Det Ablation C/E:
+            # Bypass refined-attention output
+            # ============================================
+
+            if self.rrrf_ablation_skip_refined_attention:
+
+                # Use the first cross-attention result
+                # instead of the refined-attention result.
+                refined_query_feat = coarse_fused_query_feat
+
         # --- 시각화용: 중간 퓨전 결과 저장 ---
         fused_query_feat_for_vis = refined_query_feat
 
