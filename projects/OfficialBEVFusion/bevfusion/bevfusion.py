@@ -13,6 +13,7 @@ from .ops import Voxelization
 
 import hashlib
 import math
+import json
 
 from projects.LCCNetModern.lccnet import LCCNet
 from projects.LCCNetModern.lie import se3
@@ -47,6 +48,9 @@ class BEVFusion(Base3DDetector):
         # IV2027 신규 인자
         drift_manifest=None,
 
+        # NEW: LGPC offline calibration manifest
+        lgpc_manifest_path=None,
+
         lccnet_checkpoint=None,
         lccnet_use_feat_from=1,
         lccnet_depth_scale=50.0,
@@ -67,6 +71,51 @@ class BEVFusion(Base3DDetector):
             if drift_manifest is not None
             else None
         )
+
+        # ==========================================================
+        # LGPC Offline Calibration Manifest
+        # ==========================================================
+
+        self.lgpc_manifest_path = lgpc_manifest_path
+        self.lgpc_records = None
+
+        if self.calibration_mode in (
+            "lgpc_manifest",
+            "broken_manifest",
+        ):
+
+            if lgpc_manifest_path is None:
+                raise RuntimeError(
+                    "lgpc_manifest_path must be provided"
+                )
+
+            with open(
+                lgpc_manifest_path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                manifest = json.load(f)
+
+            self.lgpc_records = manifest["records"]
+
+            if (
+                len(self.lgpc_records)
+                != manifest["num_samples"]
+            ):
+                raise RuntimeError(
+                    "LGPC manifest sample count mismatch"
+                )
+
+            print(
+                "[LGPC MANIFEST] Loaded",
+                len(self.lgpc_records),
+                "frames"
+            )
+
+            print(
+                "[LGPC MANIFEST] Mode:",
+                self.calibration_mode
+            )
 
         self.lccnet_checkpoint = lccnet_checkpoint
         self.lccnet_use_feat_from = int(lccnet_use_feat_from)
@@ -862,8 +911,238 @@ class BEVFusion(Base3DDetector):
         # ==========================================================
         # Calibration routing
         # ==========================================================
+        # ==========================================================
+        # LGPC Manifest Calibration Routing
+        # ==========================================================
 
-        if self.calibration_mode == 'gt_reinject':
+        if self.calibration_mode in (
+            "lgpc_manifest",
+            "broken_manifest",
+        ):
+
+            selected_cam2lidar = []
+
+            for b, meta in enumerate(batch_input_metas):
+
+                # ============================================================
+                # FIX: LGPC Manifest Sample ID Matching
+                #
+                # Important:
+                #   sample_idx = 0 is a valid frame ID.
+                #   Do NOT use Python's `or` for numeric sample_idx.
+                # ============================================================
+
+                raw_sample_idx = meta.get("sample_idx", None)
+                raw_token = meta.get("token", None)
+
+                # Debug the first sample
+                if not hasattr(self, "_lgpc_id_debugged"):
+
+                    print("\n========================================")
+                    print("[LGPC MANIFEST] FRAME ID DEBUG")
+
+                    print("Metadata keys:", list(meta.keys()))
+
+                    print(
+                        "sample_idx:",
+                        repr(raw_sample_idx),
+                        "type:",
+                        type(raw_sample_idx).__name__,
+                    )
+
+                    print(
+                        "token:",
+                        repr(raw_token),
+                    )
+
+                    print(
+                        "lidar_path:",
+                        repr(meta.get("lidar_path")),
+                    )
+
+                    print(
+                        "Manifest first keys:",
+                        list(self.lgpc_records.keys())[:5],
+                    )
+
+                    print("========================================\n")
+
+                    self._lgpc_id_debugged = True
+
+                # ------------------------------------------------------------
+                # Select a non-empty identifier, preserving integer zero.
+                # ------------------------------------------------------------
+
+                sample_idx = None
+
+                for candidate in (raw_sample_idx, raw_token):
+
+                    if candidate is not None and str(candidate).strip() != "":
+                        sample_idx = str(candidate)
+                        break
+
+                if sample_idx is None:
+                    raise RuntimeError(
+                        "[LGPC MANIFEST] No valid sample_idx or token. "
+                        f"Metadata keys={list(meta.keys())}"
+                    )
+
+                # ------------------------------------------------------------
+                # Match LGPC export record
+                # ------------------------------------------------------------
+
+                if sample_idx not in self.lgpc_records:
+
+                    raise RuntimeError(
+                        f"[LGPC MANIFEST] Missing sample: {sample_idx}. "
+                        f"Available keys (first 10): "
+                        f"{list(self.lgpc_records.keys())[:10]}"
+                    )
+
+                record = self.lgpc_records[sample_idx]
+
+                print(
+                    f"[LGPC MANIFEST] Matched sample_idx={sample_idx}"
+                ) if not hasattr(self, "_lgpc_match_logged") else None
+
+                self._lgpc_match_logged = True
+
+                # ----------------------------------------------
+                # 1. Validate original clean extrinsic
+                # ----------------------------------------------
+
+                clean_from_manifest = imgs.new_tensor(
+                    record["clean_cam2lidar"]
+                )
+
+                clean_from_official = camera2lidar[b]
+
+                if (
+                    clean_from_manifest.shape
+                    != clean_from_official.shape
+                ):
+                    raise RuntimeError(
+                        "Camera extrinsic shape mismatch"
+                    )
+
+                clean_err = (
+                    clean_from_manifest
+                    - clean_from_official
+                ).abs().max().item()
+
+                if clean_err > 1e-3:
+                    raise RuntimeError(
+                        f"[LGPC] Clean extrinsic mismatch: "
+                        f"sample={sample_idx}, err={clean_err}"
+                    )
+
+                # ----------------------------------------------
+                # 2. Validate camera intrinsic
+                # ----------------------------------------------
+
+                K_manifest = imgs.new_tensor(
+                    record["cam2img"]
+                )
+
+                K_official = camera_intrinsics[b]
+
+                if K_manifest.shape != K_official.shape:
+                    raise RuntimeError(
+                        "Camera intrinsic shape mismatch"
+                    )
+
+                K_err = (
+                    K_manifest - K_official
+                ).abs().max().item()
+
+                if K_err > 1e-3:
+                    raise RuntimeError(
+                        f"[LGPC] Intrinsic mismatch: "
+                        f"sample={sample_idx}, err={K_err}"
+                    )
+
+                # ----------------------------------------------
+                # 3. Select LGPC or Broken extrinsic
+                # ----------------------------------------------
+
+                if self.calibration_mode == "lgpc_manifest":
+
+                    selected = record[
+                        "corrected_cam2lidar"
+                    ]
+
+                else:
+
+                    selected = record[
+                        "broken_cam2lidar"
+                    ]
+
+                selected_cam2lidar.append(
+                    imgs.new_tensor(selected)
+                )
+
+            # --------------------------------------------------
+            # 4. Batch: [B,6,4,4]
+            # --------------------------------------------------
+
+            selected_cam2lidar = torch.stack(
+                selected_cam2lidar,
+                dim=0,
+            )
+
+            # --------------------------------------------------
+            # 5. Rebuild projection matrices
+            #
+            # Important:
+            #   lidar2img = K @ inverse(camera2lidar)
+            # --------------------------------------------------
+
+            calib = self._build_calib_dict_from_cam2lidar(
+                selected_cam2lidar,
+                camera_intrinsics,
+            )
+
+            lidar2image = calib["lidar2img"]
+
+            camera2lidar = calib["cam2lidar"]
+
+            camera_intrinsics = calib["cam2img"]
+
+            # --------------------------------------------------
+            # 6. First-batch sanity logs
+            # --------------------------------------------------
+
+            if not hasattr(
+                self,
+                "_lgpc_manifest_debugged",
+            ):
+
+                print(
+                    "\n========================================"
+                )
+
+                print(
+                    "[LGPC MANIFEST] Active mode:",
+                    self.calibration_mode
+                )
+
+                print(
+                    "[LGPC MANIFEST] camera2lidar shape:",
+                    tuple(camera2lidar.shape)
+                )
+
+                print(
+                    "[LGPC MANIFEST] lidar2img shape:",
+                    tuple(lidar2image.shape)
+                )
+
+                print(
+                    "========================================\n"
+                )
+
+                self._lgpc_manifest_debugged = True
+
+        elif self.calibration_mode == 'gt_reinject':
 
             # ------------------------------------------------------
             # Gate O-2

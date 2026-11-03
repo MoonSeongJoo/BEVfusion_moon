@@ -163,6 +163,7 @@ class BEVFusion(Base3DDetector):
             'broken',
             'oracle',
             'pcc_calib_only',
+            'lgpc_export',  # NEW
             'pcc_full',
             'lccnet',
             # NEW:
@@ -9604,6 +9605,7 @@ class BEVFusion(Base3DDetector):
 
         if self.calibration_mode not in {
             'pcc_calib_only',
+            'lgpc_export',  # NEW
             'pcc_full',
             'lccnet',
             # NEW
@@ -10465,6 +10467,73 @@ class BEVFusion(Base3DDetector):
                     '[GEO ORACLE] No active camera / no oracle summary was produced.'
                 )
             return batch_data_samples
+        
+        # ============================================================
+        # NEW: LGPC Stage-1 Calibration Export ONLY
+        #
+        # Purpose:
+        #   - Run CorrNet
+        #   - Run Z-Estimator
+        #   - Run CalibHead
+        #   - Export Stage-1 6-DoF prediction
+        #
+        # IMPORTANT:
+        #   - NO BEVFusion Detection Head
+        #   - NO RRRF Stage-2
+        #   - NO bbox_head.predict()
+        # ============================================================
+
+        if self.calibration_mode == 'lgpc_export':
+
+            # Stage-1 predictions are already available here:
+            #
+            # pred_delta_rot    : [B, 6, 3]
+            # pred_delta_trans  : [B, 6, 3]
+            # active_cam_indices: [N_active]
+
+            if not hasattr(self, '_lgpc_export_debugged'):
+
+                print(
+                    "\n========================================"
+                )
+
+                print("[LGPC EXPORT] Stage-1 ONLY")
+
+                print(
+                    "[LGPC EXPORT] Rotation shape:",
+                    tuple(pred_delta_rot.shape)
+                )
+
+                print(
+                    "[LGPC EXPORT] Translation shape:",
+                    tuple(pred_delta_trans.shape)
+                )
+
+                print(
+                    "[LGPC EXPORT] Active cameras:",
+                    active_cam_indices.tolist()
+                )
+
+                print("[LGPC EXPORT] RRRF bypassed")
+
+                print("[LGPC EXPORT] Detection Head bypassed")
+
+                print(
+                    "========================================\n"
+                )
+
+                self._lgpc_export_debugged = True
+
+            # Save Stage-1 predictions in DataSample metadata.
+            # LGPCManifestMetric will construct the corrected
+            # extrinsics using these predictions.
+
+            return self._attach_calib_prediction_meta(
+                batch_data_samples,
+                pred_delta_rot,
+                pred_delta_trans,
+                active_cam_indices,
+            )
 
         # ===================== END: LOGIC ALIGNMENT WITH LOSS FUNCTION =====================
 
