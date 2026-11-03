@@ -2237,14 +2237,28 @@ class TransFusionHead(nn.Module):
             rrrf_query_select_scale
         )
 
-        if (
-            self.rrrf_query_select_enabled
-            and self.rrrf_mode != 'residual_se3_v2'
-        ):
-            raise RuntimeError(
-                '[EXP3] Query-selective attention requires '
-                'rrrf_mode=residual_se3_v2'
-            )
+        # ============================================================
+        # PGFR-Det: Query-selective attention mode validation
+        #
+        # Supported:
+        #   residual_se3_v2 : Legacy RRRF V2
+        #   feature_refine  : No-Residual-Pose RRRF
+        # ============================================================
+
+        if self.rrrf_query_select_enabled:
+
+            allowed_selector_modes = {
+                'residual_se3_v2',
+                'feature_refine',
+            }
+
+            if self.rrrf_mode not in allowed_selector_modes:
+
+                raise RuntimeError(
+                    '[PGFR] GeometrySelectiveAttention requires '
+                    'residual_se3_v2 or feature_refine. '
+                    f'Current mode={self.rrrf_mode}'
+                )
 
         assert self.rrrf_mode in [
             'residual_se3',
@@ -3139,17 +3153,217 @@ class TransFusionHead(nn.Module):
             # --- 2a. 1단계: 거친 퓨전 ---
             bev_query_feat_stage1 = query_feat.permute(0, 2, 1) # [B, Nq, C]
             bev_query_pos_embed = self.bev_query_pos_embedding(query_pos)
-            cam_proposal_feat = det_feats # [B, Nc, C]
-            cam_proposal_pos_embed = self.camera_proposal_pos_embedding(det_xyz) # det_xyz는 [0,1] 정규화 상태 가정
+            # ============================================================
+            # PGFR: Prepare Masked Camera Proposals
+            # ============================================================
+
+            cam_proposal_feat = det_feats
+
+            B_cam, Np, C = cam_proposal_feat.shape
+
+            rrrf_key_padding_mask = None
+            rrrf_has_valid_proposal = None
+
+            if self.rrrf_mode == 'feature_refine':
+
+                if camera_proposal_valid_mask is None:
+
+                    raise RuntimeError(
+                        '[PGFR] camera_proposal_valid_mask '
+                        'is required in feature_refine mode.'
+                    )
+
+                # --------------------------------------------------------
+                # 1. Mask shape validation
+                # --------------------------------------------------------
+
+                mask = camera_proposal_valid_mask.to(
+                    device=cam_proposal_feat.device,
+                    dtype=torch.bool,
+                )
+
+                if mask.ndim != 3:
+
+                    raise RuntimeError(
+                        '[PGFR] Expected proposal mask [B,Ncam,Q], '
+                        f'got {tuple(mask.shape)}'
+                    )
+
+                if mask.shape[0] != B_cam:
+
+                    raise RuntimeError(
+                        '[PGFR] Proposal mask batch mismatch'
+                    )
+
+                if mask.shape[1] != self.rrrf_num_cams:
+
+                    raise RuntimeError(
+                        '[PGFR] Proposal mask camera mismatch'
+                    )
+
+                # --------------------------------------------------------
+                # 2. Active camera filtering
+                # --------------------------------------------------------
+
+                if stage1_active_cam_mask is not None:
+
+                    active_mask = stage1_active_cam_mask.to(
+                        device=cam_proposal_feat.device,
+                        dtype=torch.bool,
+                    )
+
+                    assert active_mask.shape == mask.shape[:2]
+
+                    mask = (
+                        mask
+                        & active_mask.unsqueeze(-1)
+                    )
+
+                # [B, Ncam*Q]
+                proposal_valid = mask.reshape(
+                    B_cam,
+                    -1,
+                )
+
+                assert proposal_valid.shape == (
+                    B_cam,
+                    Np,
+                )
+
+                # --------------------------------------------------------
+                # 3. Extra numerical validity
+                # --------------------------------------------------------
+
+                proposal_valid = (
+                    proposal_valid
+                    & torch.isfinite(det_xyz).all(dim=-1)
+                    & torch.isfinite(
+                        cam_proposal_feat
+                    ).all(dim=-1)
+                )
+
+                # --------------------------------------------------------
+                # 4. Sanitize invalid camera features/coordinates
+                # --------------------------------------------------------
+
+                cam_proposal_feat = torch.where(
+                    proposal_valid.unsqueeze(-1),
+                    cam_proposal_feat,
+                    torch.zeros_like(cam_proposal_feat),
+                )
+
+                cam_proposal_xyz = torch.where(
+                    proposal_valid.unsqueeze(-1),
+                    det_xyz,
+                    torch.full_like(det_xyz, 0.5),
+                )
+
+                # --------------------------------------------------------
+                # 5. key_padding_mask
+                #
+                # PyTorch MultiheadAttention convention:
+                #   True  = Ignore this key
+                #   False = Use this key
+                # --------------------------------------------------------
+
+                rrrf_key_padding_mask = (
+                    ~proposal_valid
+                ).clone()
+
+                rrrf_has_valid_proposal = (
+                    proposal_valid.any(dim=1)
+                )
+
+                # --------------------------------------------------------
+                # 6. All-invalid batch safety
+                #
+                # MultiheadAttention with every key masked can
+                # produce NaN. Temporarily expose one zero-valued
+                # dummy key and discard its attention output later.
+                # --------------------------------------------------------
+
+                empty_batch = ~rrrf_has_valid_proposal
+
+                if empty_batch.any():
+
+                    if Np == 0:
+
+                        raise RuntimeError(
+                            '[PGFR] Expected fixed proposal slots, got Np=0'
+                        )
+
+                    rrrf_key_padding_mask[
+                        empty_batch, 0
+                    ] = False
+
+                # --------------------------------------------------------
+                # 7. Positional embedding
+                # --------------------------------------------------------
+
+                cam_proposal_pos_embed = (
+                    self.camera_proposal_pos_embedding(
+                        cam_proposal_xyz
+                    )
+                )
+
+            else:
+
+                # Preserve the legacy modes
+                cam_proposal_pos_embed = (
+                    self.camera_proposal_pos_embedding(
+                        det_xyz
+                    )
+                )
+
+            # ============================================================
+            # PGFR: Coarse Cross-Attention
+            # ============================================================
 
             fused_feat_stage1 = self.fusion_cross_attention(
-                query=bev_query_feat_stage1 +  bev_query_pos_embed,
-                key=cam_proposal_feat +  cam_proposal_pos_embed,
-                value=cam_proposal_feat
+
+                query=(
+                    bev_query_feat_stage1
+                    + bev_query_pos_embed
+                ),
+
+                key=(
+                    cam_proposal_feat
+                    + cam_proposal_pos_embed
+                ),
+
+                value=cam_proposal_feat,
+
+                key_padding_mask=rrrf_key_padding_mask,
+
+                need_weights=False,
+
             )[0]
+
+            # No valid camera proposals:
+            # suppress dummy attention output.
+            if self.rrrf_mode == 'feature_refine':
+
+                fused_feat_stage1 = torch.where(
+                    rrrf_has_valid_proposal[:, None, None],
+                    fused_feat_stage1,
+                    torch.zeros_like(fused_feat_stage1),
+                )
             bev_query_feat_stage1 = self.fusion_norm1(bev_query_feat_stage1 +  fused_feat_stage1)
             bev_query_feat_stage1 = self.fusion_norm2(bev_query_feat_stage1 +  self.fusion_ffn(bev_query_feat_stage1))
             coarse_fused_query_feat = bev_query_feat_stage1.permute(0, 2, 1).contiguous() # [B, C, Nq]
+
+            # ------------------------------------------------------------
+            # No-camera fallback:
+            # Preserve the initial BEV query.
+            # ------------------------------------------------------------
+
+            if self.rrrf_mode == 'feature_refine':
+
+                coarse_fused_query_feat = torch.where(
+                    rrrf_has_valid_proposal[:, None, None],
+                    coarse_fused_query_feat,
+                    lidar_only_query_feat,
+                )
 
             # --- 시각화용: 중간 퓨전 결과 저장 ---
             # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
@@ -3433,7 +3647,12 @@ class TransFusionHead(nn.Module):
                         0, 2, 1
                     )
 
+                # ============================================================
+                # PGFR: Refined Cross-Attention
+                # ============================================================
+
                 refined_fused_feat = self.refined_attention(
+
                     query=(
                         refined_bev_query_feat
                         + bev_query_pos_embed
@@ -3444,8 +3663,21 @@ class TransFusionHead(nn.Module):
                         + cam_proposal_pos_embed_refined
                     ),
 
-                    value=cam_proposal_feat
+                    value=cam_proposal_feat,
+
+                    key_padding_mask=rrrf_key_padding_mask,
+
+                    need_weights=False,
+
                 )[0]
+
+                if self.rrrf_mode == 'feature_refine':
+
+                    refined_fused_feat = torch.where(
+                        rrrf_has_valid_proposal[:, None, None],
+                        refined_fused_feat,
+                        torch.zeros_like(refined_fused_feat),
+                    )
 
                 refined_bev_query_feat = self.refined_norm1(
                     refined_bev_query_feat
@@ -3463,8 +3695,15 @@ class TransFusionHead(nn.Module):
                     refined_bev_query_feat.permute(
                         0, 2, 1
                     ).contiguous()
+                
+                if self.rrrf_mode == 'feature_refine':
+
+                    refined_query_feat = torch.where(
+                        rrrf_has_valid_proposal[:, None, None],
+                        refined_query_feat,
+                        coarse_fused_query_feat,
+                    )
             
-        
             # ============================================
             # PGFR-Det Ablation C/E:
             # Bypass refined-attention output
@@ -3499,10 +3738,46 @@ class TransFusionHead(nn.Module):
             and det_feats is not None
         ):
 
-            if self.rrrf_mode != 'residual_se3_v2':
+            # ============================================================
+            # PGFR: Support feature_refine local attention
+            # ============================================================
+
+            if self.rrrf_mode not in {
+                'residual_se3_v2',
+                'feature_refine',
+            }:
+
                 raise RuntimeError(
-                    '[EXP3] RRRF V2 mode required'
+                    '[PGFR] Unsupported local attention mode: '
+                    f'{self.rrrf_mode}'
                 )
+            
+            # ============================================================
+            # PGFR: Select Local Attention Geometry
+            # ============================================================
+
+            if self.rrrf_mode == 'feature_refine':
+
+                # det_xyz:
+                # Already corrected by Stage-1 LGPC.
+                #
+                # No Stage-2 SE(3) correction.
+                local_proposal_xyz = det_xyz
+
+            elif self.rrrf_mode == 'residual_se3_v2':
+
+                # Preserve legacy V2 behavior.
+                local_proposal_xyz = det_xyz_corrected_norm
+
+            else:
+
+                raise RuntimeError(
+                    '[PGFR] Invalid local attention mode'
+                )
+
+            # ============================================================
+            # PGFR: Geometry-Selective Local Proposal Fusion
+            # ============================================================
 
             geometry_delta = self.rrrf_query_selector(
 
@@ -3512,9 +3787,7 @@ class TransFusionHead(nn.Module):
 
                 camera_feat=cam_proposal_feat,
 
-                # IMPORTANT:
-                # V2-corrected 3D positions, not raw det_xyz
-                corrected_cam_xyz_norm=det_xyz_corrected_norm,
+                corrected_cam_xyz_norm=local_proposal_xyz,
 
                 pc_range=self.train_cfg[
                     'point_cloud_range'
@@ -3537,6 +3810,7 @@ class TransFusionHead(nn.Module):
                 ),
             )
 
+            # Residual Feature Fusion
             refined_query_feat = (
                 refined_query_feat
                 + self.rrrf_query_select_scale
@@ -4448,16 +4722,66 @@ class TransFusionHead(nn.Module):
         """
         # change preds_dict into list of dict (index by batch_id)
         # preds_dict[0]['center'].shape [bs, 3, num_proposal]
+
+        # ============================================================
+        # PGFR: Detection Target Key Filtering
+        #
+        # Do not process:
+        #   pred_delta_rot       (None in feature_refine)
+        #   pred_delta_trans     (None in feature_refine)
+        #   refined_query_feat   (auxiliary feature)
+        #   dense_heatmap        (handled separately)
+        #   query_heatmap_score  (not used by target assignment)
+        #
+        # Only detection prediction tensors are needed here.
+        # ============================================================
+
+        target_keys = (
+            'heatmap',
+            'center',
+            'height',
+            'dim',
+            'rot',
+        )
+
+        # nuScenes velocity prediction is optional.
+        if 'vel' in preds_dict[0]:
+            target_keys += ('vel',)
+
         list_of_pred_dict = []
+
         for batch_idx in range(len(batch_gt_instances_3d)):
+
             pred_dict = {}
-            for key in preds_dict[0].keys():
+
+            for key in target_keys:
+
                 preds = []
+
                 for i in range(self.num_decoder_layers):
-                    pred_one_layer = preds_dict[i][key][batch_idx:batch_idx +
-                                                        1]
+
+                    pred_value = preds_dict[i].get(key, None)
+
+                    if not isinstance(pred_value, torch.Tensor):
+
+                        raise RuntimeError(
+                            '[PGFR get_targets] '
+                            f'Expected Tensor for key={key}, '
+                            f'layer={i}, '
+                            f'got {type(pred_value).__name__}'
+                        )
+
+                    pred_one_layer = pred_value[
+                        batch_idx:batch_idx + 1
+                    ]
+
                     preds.append(pred_one_layer)
-                pred_dict[key] = torch.cat(preds)
+
+                pred_dict[key] = torch.cat(
+                    preds,
+                    dim=0,
+                )
+
             list_of_pred_dict.append(pred_dict)
 
         assert len(batch_gt_instances_3d) == len(list_of_pred_dict)

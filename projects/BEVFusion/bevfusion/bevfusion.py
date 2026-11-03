@@ -1188,9 +1188,14 @@ class BEVFusion(Base3DDetector):
 
             head = self.bbox_head
 
-            if head.rrrf_mode != 'residual_se3_v2':
+            if head.rrrf_mode not in {
+                'residual_se3_v2',
+                'feature_refine',
+            }:
+
                 raise RuntimeError(
-                    '[EXP4] RRRF V2 is required'
+                    '[PGFR] Unsupported RRRF mode: '
+                    f'{head.rrrf_mode}'
                 )
 
             if head.num_decoder_layers != 1:
@@ -1198,35 +1203,51 @@ class BEVFusion(Base3DDetector):
                     '[EXP4] Expected one decoder layer'
                 )
 
-            if (
-                not head.rrrf_adapter_enabled
-                or not head.rrrf_query_select_enabled
-            ):
+            if not head.rrrf_query_select_enabled:
+
                 raise RuntimeError(
-                    '[EXP4] Adapter and Selector must be enabled'
+                    '[PGFR] Geometry Selector must be enabled'
                 )
 
-            # Only these four groups may update.
+            # ============================================================
+            # PGFR: No-Residual-Pose RRRF Training Policy
+            # ============================================================
+
             trainable(head.rrrf_query_selector)
-            trainable(head.rrrf_adapter)
+
+            if head.rrrf_adapter_enabled:
+                trainable(head.rrrf_adapter)
+
             trainable(head.decoder[0])
             trainable(head.prediction_heads[0])
 
-            # Freeze BN running statistics while
-            # allowing affine weights to train.
+            # Freeze BatchNorm running statistics
             for module in head.prediction_heads[0].modules():
+
                 if isinstance(
                     module,
                     nn.modules.batchnorm._BatchNorm
                 ):
+
                     module.eval()
 
-            allowed = (
+            # ------------------------------------------------------------
+            # Verify trainable parameter names
+            # ------------------------------------------------------------
+
+            allowed = [
                 'bbox_head.rrrf_query_selector.',
-                'bbox_head.rrrf_adapter.',
                 'bbox_head.decoder.0.',
                 'bbox_head.prediction_heads.0.',
-            )
+            ]
+
+            if head.rrrf_adapter_enabled:
+
+                allowed.append(
+                    'bbox_head.rrrf_adapter.'
+                )
+
+            allowed = tuple(allowed)
 
             names = [
                 name
@@ -1235,12 +1256,14 @@ class BEVFusion(Base3DDetector):
             ]
 
             unexpected = [
-                name for name in names
+                name
+                for name in names
                 if not name.startswith(allowed)
             ]
 
             missing = [
-                prefix for prefix in allowed
+                prefix
+                for prefix in allowed
                 if not any(
                     name.startswith(prefix)
                     for name in names
@@ -1248,8 +1271,9 @@ class BEVFusion(Base3DDetector):
             ]
 
             if unexpected or missing:
+
                 raise RuntimeError(
-                    '[EXP4] Freeze policy error: '
+                    '[PGFR] Freeze policy error: '
                     f'unexpected={unexpected[:15]}, '
                     f'missing={missing}'
                 )
@@ -1261,14 +1285,24 @@ class BEVFusion(Base3DDetector):
             )
 
             print(
-                '[EXP4] Joint Training: '
-                'Selector + Adapter + Decoder + Prediction Head'
+                '\n'
+                '========================================\n'
+                '[PGFR FEATURE REFINE TRAINING]\n'
+                '========================================\n'
+                f'RRRF mode          : {head.rrrf_mode}\n'
+                'LGPC               : FROZEN\n'
+                'Coarse Attention   : FROZEN\n'
+                'Refined Attention  : FROZEN\n'
+                'Geometry Selector  : TRAINABLE\n'
+                f'Adapter Enabled    : {head.rrrf_adapter_enabled}\n'
+                'Detection Decoder  : TRAINABLE\n'
+                'Prediction Head    : TRAINABLE\n'
+                f'Trainable Params   : {total:,}\n'
+                '========================================'
             )
-            print('[EXP4] Trainable Parameters:', total)
 
             return
 
-        
         # ============================================================
         # EXP3: Query-selective attention ONLY
         # ============================================================
@@ -1714,9 +1748,11 @@ class BEVFusion(Base3DDetector):
                 self.bbox_head.eval()
 
                 head = self.bbox_head
-
                 head.rrrf_query_selector.train()
-                head.rrrf_adapter.train()
+
+                if head.rrrf_adapter_enabled:
+                    head.rrrf_adapter.train()
+
                 head.decoder[0].train()
                 head.prediction_heads[0].train()
 
@@ -8842,8 +8878,72 @@ class BEVFusion(Base3DDetector):
                     self.pc_range[4] - self.pc_range[1])
             det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
                     self.pc_range[5] - self.pc_range[2])
-            det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
-            
+            # det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
+
+            # ============================================================
+            # PGFR Step 2: Camera Proposal Geometry Validity
+            #
+            # det_xyz_ref:
+            #   [B*N_cam, Q, 3]
+            #
+            # Expected:
+            #   B     = 1 (current LGPC implementation)
+            #   N_cam = 6
+            #   Q     = 200
+            # ============================================================
+
+            # 1. NaN / Inf 확인
+            proposal_finite = torch.isfinite(
+                det_xyz_ref
+            ).all(dim=-1)
+
+            # 2. 정규화된 Detection Range 확인
+            proposal_in_range = (
+                (det_xyz_ref >= 0.0).all(dim=-1)
+                &
+                (det_xyz_ref <= 1.0).all(dim=-1)
+            )
+
+            # 3. Camera-axis Depth 확인
+            # esitmated_uvz: [B*N_cam, Q, 3]
+            proposal_depth_valid = (
+                torch.isfinite(
+                    esitmated_uvz
+                ).all(dim=-1)
+                &
+                (esitmated_uvz[..., 2] > 1e-3)
+            )
+
+            # 4. 최종 Geometry Valid Mask
+            proposal_geometry_valid = (
+                proposal_finite
+                & proposal_in_range
+                & proposal_depth_valid
+            )
+
+            # [B*N_cam, Q]
+
+            # 5. NaN / Inf 안전 처리 후 Clamp
+            # Clamp는 MLP/Embedding 연산의 안전한 입력을 위한 것.
+            # 실제 유효 여부는 위의 Valid Mask를 사용.
+            det_xyz_ref_clamped = torch.nan_to_num(
+                det_xyz_ref,
+                nan=0.5,
+                posinf=0.5,
+                neginf=0.5,
+            ).clamp(min=0.0, max=1.0)
+
+            # 6. Camera별 Valid Mask 복원
+            proposal_geometry_valid = (
+                proposal_geometry_valid.reshape(
+                    B,
+                    N,
+                    -1,
+                )
+            )
+
+            # [B, N_cam, Q]
+                        
             det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
             det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz_ref_clamped,det_feat_sampled,B=B,N_cam=N)
 
@@ -9245,11 +9345,63 @@ class BEVFusion(Base3DDetector):
 
                 self._rrrf_s1_consistency_debug_count += 1
 
-            camera_proposal_valid_mask = (
+            # ============================================================
+            # PGFR: Final Proposal Valid Mask
+            #
+            # Combine:
+            #   1. Real 2D Detection Query
+            #   2. Geometry / Depth Validity
+            #   3. Active Camera
+            # ============================================================
+
+            # query_unique_mask: [N_cam, Q]
+            query_valid = (
                 query_unique_mask
                 .unsqueeze(0)
+                .expand(B, -1, -1)
             )
-            # [B=1, Ncam, Q]
+
+            # stage1_active_cam_mask: [B, N_cam]
+            active_valid = (
+                stage1_active_cam_mask
+                .unsqueeze(-1)
+            )
+
+            # Final valid mask: [B, N_cam, Q]
+            camera_proposal_valid_mask = (
+                query_valid
+                & proposal_geometry_valid
+                & active_valid
+            )
+
+            # Safety checks
+            assert camera_proposal_valid_mask.shape == (
+                B, N, query_unique_mask.shape[-1]
+            )
+
+            assert (
+                camera_proposal_valid_mask.reshape(B, -1).shape[1]
+                == det_xyz_proc.shape[1]
+            )
+
+            # One-time debug
+            if not hasattr(self, '_pgfr_mask_debug_done'):
+
+                total = camera_proposal_valid_mask.numel()
+
+                valid = (
+                    camera_proposal_valid_mask
+                    .sum()
+                    .item()
+                )
+
+                print(
+                    '[PGFR PROPOSAL MASK] '
+                    f'valid={valid}/{total}, '
+                    f'ratio={valid / max(total, 1):.4f}'
+                )
+
+                self._pgfr_mask_debug_done = True
 
             if self.with_bbox_head:
                 bbox_loss = self.bbox_head.loss(
@@ -10655,8 +10807,61 @@ class BEVFusion(Base3DDetector):
                 self.pc_range[4] - self.pc_range[1])
         det_xyz_ref[..., 2:3] = (det_xyz_ref[..., 2:3] - self.pc_range[2]) / (
                 self.pc_range[5] - self.pc_range[2])
-        det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
+        # det_xyz_ref_clamped = det_xyz_ref.clamp(min=0, max=1)
         # --- ✨ END: Logic copied from loss function ---
+
+        # ============================================================
+        # PGFR: Proposal Validity (Inference)
+        #
+        # Must be identical to Training.
+        # ============================================================
+
+        # 1. Finite geometry
+        proposal_finite = (
+            torch.isfinite(det_xyz_ref)
+            .all(dim=-1)
+        )
+
+        # 2. In-range geometry before clamp
+        proposal_in_range = (
+            (det_xyz_ref >= 0.0).all(dim=-1)
+            &
+            (det_xyz_ref <= 1.0).all(dim=-1)
+        )
+
+        # 3. Positive camera-axis depth
+        proposal_depth_valid = (
+            torch.isfinite(esitmated_uvz).all(dim=-1)
+            &
+            (esitmated_uvz[..., 2] > 1e-3)
+        )
+
+        # 4. Geometry validity
+        proposal_geometry_valid = (
+            proposal_finite
+            & proposal_in_range
+            & proposal_depth_valid
+        )
+
+        # 5. Safe geometry for feature processing
+        det_xyz_ref_clamped = (
+            torch.nan_to_num(
+                det_xyz_ref,
+                nan=0.5,
+                posinf=0.5,
+                neginf=0.5,
+            )
+            .clamp(min=0.0, max=1.0)
+        )
+
+        # 6. Restore camera dimension
+        proposal_geometry_valid = (
+            proposal_geometry_valid.reshape(
+                B,
+                N,
+                -1,
+            )
+        )
         
         det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
         det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(
@@ -10743,11 +10948,63 @@ class BEVFusion(Base3DDetector):
             active_cam_indices,
         ] = True
 
-        camera_proposal_valid_mask = (
+        # ============================================================
+        # PGFR: Final Proposal Valid Mask
+        #
+        # Combine:
+        #   1. Real 2D Detection Query
+        #   2. Geometry / Depth Validity
+        #   3. Active Camera
+        # ============================================================
+
+        # query_unique_mask: [N_cam, Q]
+        query_valid = (
             query_unique_mask
             .unsqueeze(0)
+            .expand(B, -1, -1)
         )
-        # [B=1, Ncam, Q]
+
+        # stage1_active_cam_mask: [B, N_cam]
+        active_valid = (
+            stage1_active_cam_mask
+            .unsqueeze(-1)
+        )
+
+        # Final valid mask: [B, N_cam, Q]
+        camera_proposal_valid_mask = (
+            query_valid
+            & proposal_geometry_valid
+            & active_valid
+        )
+
+        # Safety checks
+        assert camera_proposal_valid_mask.shape == (
+            B, N, query_unique_mask.shape[-1]
+        )
+
+        assert (
+            camera_proposal_valid_mask.reshape(B, -1).shape[1]
+            == det_xyz_proc.shape[1]
+        )
+
+        # One-time debug
+        if not hasattr(self, '_pgfr_mask_debug_done'):
+
+            total = camera_proposal_valid_mask.numel()
+
+            valid = (
+                camera_proposal_valid_mask
+                .sum()
+                .item()
+            )
+
+            print(
+                '[PGFR PROPOSAL MASK] '
+                f'valid={valid}/{total}, '
+                f'ratio={valid / max(total, 1):.4f}'
+            )
+
+            self._pgfr_mask_debug_done = True
                 
         results_list_3d = self.bbox_head.predict(
             feats,
