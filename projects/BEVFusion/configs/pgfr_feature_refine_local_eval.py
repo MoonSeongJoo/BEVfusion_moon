@@ -10,12 +10,6 @@ test_cfg = dict(
     type='TestLoop',
 )
 
-# Lower CPU memory usage for Kubernetes
-test_dataloader = dict(
-    num_workers=0,
-    persistent_workers=False,
-)
-
 # Inherited from training config:
 # calibration_mode = 'pcc_full'
 # rrrf_mode = 'feature_refine'

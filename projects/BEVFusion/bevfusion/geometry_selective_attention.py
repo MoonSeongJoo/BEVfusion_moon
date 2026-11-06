@@ -1,5 +1,6 @@
 
 import math
+import os
 
 import torch
 from torch import nn
@@ -22,6 +23,14 @@ class GeometrySelectiveAttention(nn.Module):
         assert topk > 0
         assert radius_m > 0
         assert sigma_m > 0
+
+        self.gate_logit_offset = float(
+            os.environ.get("PGFR_GATE_LOGIT_OFFSET", "0.0")
+        )
+        print(
+            f"[GATE-ABLATION] "
+            f"logit_offset={self.gate_logit_offset:+.3f}"
+        )
 
         self.channels = channels
         self.num_heads = num_heads
@@ -322,6 +331,7 @@ class GeometrySelectiveAttention(nn.Module):
 
         gate = torch.sigmoid(
             self.gate_net(gate_input)
+            + self.gate_logit_offset
         )
 
         gate = (

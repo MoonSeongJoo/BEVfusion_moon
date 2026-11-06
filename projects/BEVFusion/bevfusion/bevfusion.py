@@ -1309,9 +1309,9 @@ class BEVFusion(Base3DDetector):
 
         if stage == 'rrrf_query_select':
 
-            if self.bbox_head.rrrf_mode != 'residual_se3_v2':
+            if self.bbox_head.rrrf_mode not in {'residual_se3_v2', 'feature_refine'}:
                 raise RuntimeError(
-                    '[EXP3] RRRF V2 required'
+                    '[E1] RRRF V2 or feature_refine required'
                 )
 
             if not getattr(
