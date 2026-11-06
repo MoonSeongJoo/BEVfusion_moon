@@ -256,6 +256,8 @@ class BEVFusion(Base3DDetector):
             'rrrf_decoder_tail',
             'rrrf_query_select',
             'rrrf_joint_fresh',
+            # Ver2.0
+            'rrrf_ablation',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -275,6 +277,8 @@ class BEVFusion(Base3DDetector):
             'rrrf_decoder_tail',
             'rrrf_query_select',
             'rrrf_joint_fresh',
+            # Ver2.0
+            'rrrf_ablation',
         }
 
         self.is_rrrf_training_stage = (
@@ -1184,6 +1188,231 @@ class BEVFusion(Base3DDetector):
         # EXP4: Joint Training — PRE-20K Reference
         # ============================================================
 
+        # ============================================================
+        # Ver2.0: Independent A-E Ablation Training
+        #
+        # B: Decoder + Prediction Head
+        # C: B + Projector + Coarse Fusion
+        # D: C + Refined Fusion
+        # E: D + Local Proposal Fusion
+        # ============================================================
+
+        if stage == 'rrrf_ablation':
+
+            head = self.bbox_head
+
+            # ----------------------------------------
+            # 1. Validate experiment configuration
+            # ----------------------------------------
+
+            if head.rrrf_mode != 'feature_refine':
+                raise RuntimeError(
+                    '[ABLATION] Require feature_refine mode'
+                )
+
+            if head.query_source != 'fused':
+                raise RuntimeError(
+                    '[ABLATION] Require fused BEV query'
+                )
+
+            if head.rrrf_adapter_enabled:
+                raise RuntimeError(
+                    '[ABLATION] Feature adapter must be OFF'
+                )
+
+            if head.num_decoder_layers != 1:
+                raise RuntimeError(
+                    '[ABLATION] Expected one decoder layer'
+                )
+
+            if (
+                head.rrrf_use_refined
+                and not head.rrrf_use_coarse
+            ):
+                raise RuntimeError(
+                    '[ABLATION] Refined requires Coarse'
+                )
+
+            if (
+                head.rrrf_query_select_enabled
+                and not head.rrrf_use_refined
+            ):
+                raise RuntimeError(
+                    '[ABLATION] Local requires Refined'
+                )
+
+            if (
+                head.rrrf_query_select_enabled
+                and head.rrrf_query_select_scale == 0.0
+            ):
+                raise RuntimeError(
+                    '[ABLATION] Local scale must be nonzero'
+                )
+
+            if (
+                head.rrrf_ablation_skip_refined_attention
+                or head.rrrf_ablation_identity_geometry
+            ):
+                raise RuntimeError(
+                    '[ABLATION] Legacy ablation switches '
+                    'must be OFF'
+                )
+
+            # ----------------------------------------
+            # 2. Identify trainable RRRF modules
+            # ----------------------------------------
+
+            coarse_names = (
+                'fusion_cross_attention',
+                'fusion_ffn',
+                'fusion_norm1',
+                'fusion_norm2',
+                'camera_proposal_pos_embedding',
+                'bev_query_pos_embedding',
+            )
+
+            refined_names = (
+                'refined_attention',
+                'refined_ffn',
+                'refined_norm1',
+                'refined_norm2',
+            )
+
+            selected_names = []
+
+            # ----------------------------------------
+            # 3. Coarse Fusion (C/D/E)
+            # ----------------------------------------
+
+            if head.rrrf_use_coarse:
+
+                trainable(self.feat_projector)
+
+                selected_names.extend(
+                    coarse_names
+                )
+
+            # ----------------------------------------
+            # 4. Refined Fusion (D/E)
+            # ----------------------------------------
+
+            if head.rrrf_use_refined:
+
+                selected_names.extend(
+                    refined_names
+                )
+
+            # ----------------------------------------
+            # 5. Local Proposal Fusion (E)
+            # ----------------------------------------
+
+            if head.rrrf_query_select_enabled:
+
+                selected_names.append(
+                    'rrrf_query_selector'
+                )
+
+            # Activate selected RRRF modules
+            for name in selected_names:
+
+                module = getattr(head, name)
+                trainable(module)
+
+            # ----------------------------------------
+            # 6. Decoder/Prediction Head (B/C/D/E)
+            # ----------------------------------------
+
+            trainable(head.decoder[0])
+            trainable(head.prediction_heads[0])
+
+            # Freeze prediction-head BN statistics
+            for module in head.prediction_heads[0].modules():
+
+                if isinstance(
+                    module,
+                    nn.modules.batchnorm._BatchNorm
+                ):
+                    module.eval()
+
+            # ----------------------------------------
+            # 7. Allowed trainable parameters
+            # ----------------------------------------
+
+            allowed = [
+                'bbox_head.' + name + '.'
+                for name in selected_names
+            ]
+
+            if head.rrrf_use_coarse:
+                allowed.append('feat_projector.')
+
+            allowed.extend([
+                'bbox_head.decoder.0.',
+                'bbox_head.prediction_heads.0.',
+            ])
+
+            allowed = tuple(allowed)
+
+            trainable_names = [
+                name
+                for name, param in self.named_parameters()
+                if param.requires_grad
+            ]
+
+            unexpected = [
+                name
+                for name in trainable_names
+                if not name.startswith(allowed)
+            ]
+
+            missing = [
+                prefix
+                for prefix in allowed
+                if not any(
+                    name.startswith(prefix)
+                    for name in trainable_names
+                )
+            ]
+
+            if unexpected or missing:
+                raise RuntimeError(
+                    '[ABLATION] Trainable parameter error: '
+                    f'unexpected={unexpected[:20]}, '
+                    f'missing={missing}'
+                )
+
+            total_params = sum(
+                param.numel()
+                for param in self.parameters()
+                if param.requires_grad
+            )
+
+            # ----------------------------------------
+            # 8. Final configuration log
+            # ----------------------------------------
+
+            print(
+                '\n'
+                '========================================\n'
+                '[RRRF ABLATION TRAINING POLICY]\n'
+                '========================================\n'
+                f'Coarse        : {head.rrrf_use_coarse}\n'
+                f'Refined       : {head.rrrf_use_refined}\n'
+                f'Local         : '
+                f'{head.rrrf_query_select_enabled}\n'
+                f'FeatProjector : '
+                f'{head.rrrf_use_coarse}\n'
+                'LGPC          : FROZEN\n'
+                'Backbone      : FROZEN\n'
+                'Query Gen     : FROZEN\n'
+                'Decoder/Head  : TRAINABLE\n'
+                f'Trainable     : {total_params:,}\n'
+                '========================================'
+            )
+
+            return
+
+
         if stage == 'rrrf_joint_fresh':
 
             head = self.bbox_head
@@ -1725,7 +1954,6 @@ class BEVFusion(Base3DDetector):
 
                         module.eval()
 
-
             # --------------------------------------------------------
             # bbox_head:
             # first set frozen parent mode.
@@ -1738,6 +1966,73 @@ class BEVFusion(Base3DDetector):
                 self.bbox_head.eval()
             
             
+
+            # ========================================================
+            # Ver2.0: Ablation Train/Eval Restoration
+            # ========================================================
+
+            if stage == 'rrrf_ablation':
+
+                head = self.bbox_head
+
+                # Keep projector and entire head frozen
+                # unless explicitly re-enabled.
+                self.feat_projector.eval()
+                head.eval()
+
+                selected_modules = []
+
+                # Coarse / Projector
+                if head.rrrf_use_coarse:
+
+                    self.feat_projector.train()
+
+                    selected_modules.extend([
+                        head.fusion_cross_attention,
+                        head.fusion_ffn,
+                        head.fusion_norm1,
+                        head.fusion_norm2,
+                        head.camera_proposal_pos_embedding,
+                        head.bev_query_pos_embedding,
+                    ])
+
+                # Refined
+                if head.rrrf_use_refined:
+
+                    selected_modules.extend([
+                        head.refined_attention,
+                        head.refined_ffn,
+                        head.refined_norm1,
+                        head.refined_norm2,
+                    ])
+
+                # Local Proposal
+                if head.rrrf_query_select_enabled:
+
+                    selected_modules.append(
+                        head.rrrf_query_selector
+                    )
+
+                # Decoder / Prediction Head
+                selected_modules.extend([
+                    head.decoder[0],
+                    head.prediction_heads[0],
+                ])
+
+                for module in selected_modules:
+                    module.train()
+
+                # Keep pretrained BatchNorm statistics
+                for module in head.prediction_heads[0].modules():
+
+                    if isinstance(
+                        module,
+                        nn.modules.batchnorm._BatchNorm
+                    ):
+                        module.eval()
+
+                return self
+
             # ============================================================
             # EXP4: Restore joint training mode
             # ============================================================
@@ -9497,7 +9792,10 @@ class BEVFusion(Base3DDetector):
             # EXP4: Final Detection Loss Only
             # ============================================================
 
-            if self.lgpc_train_stage == 'rrrf_joint_fresh':
+            if self.lgpc_train_stage in {
+                'rrrf_joint_fresh',
+                'rrrf_ablation',
+            }:
 
                 required = {
                     'layer_-1_loss_cls',

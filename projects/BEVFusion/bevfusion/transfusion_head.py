@@ -2183,6 +2183,12 @@ class TransFusionHead(nn.Module):
         rrrf_ablation_identity_geometry=False,
         rrrf_ablation_skip_refined_attention=False,
 
+        # ============================================
+        # Ver2.0: Independent RRRF Ablation
+        # ============================================
+        rrrf_use_coarse=True,
+        rrrf_use_refined=True,
+
         train_cfg=None,
         test_cfg=None,
         bbox_coder=None,
@@ -2203,6 +2209,31 @@ class TransFusionHead(nn.Module):
         self.rrrf_num_cams = rrrf_num_cams
         self.rrrf_detach_geometry = rrrf_detach_geometry
 
+        # ============================================
+        # Ver2.0: Ablation configuration
+        # ============================================
+
+        self.rrrf_use_coarse = bool(rrrf_use_coarse)
+        self.rrrf_use_refined = bool(rrrf_use_refined)
+
+        # Refined Fusion requires Coarse Fusion.
+        if self.rrrf_use_refined and not self.rrrf_use_coarse:
+            raise ValueError(
+                '[ABLATION] Refined Fusion requires Coarse Fusion'
+            )
+
+        # Local Proposal Fusion requires Refined Fusion.
+        if rrrf_query_select_enabled and not self.rrrf_use_refined:
+            raise ValueError(
+                '[ABLATION] Local Proposal Fusion requires Refined Fusion'
+            )
+
+        print(
+            '[ABLATION CONFIG] '
+            f'Coarse={self.rrrf_use_coarse}, '
+            f'Refined={self.rrrf_use_refined}, '
+            f'Local={bool(rrrf_query_select_enabled)}'
+        )
         # ============================================
         # Ablation switches
         # ============================================
@@ -3144,12 +3175,28 @@ class TransFusionHead(nn.Module):
         # --- 2단계 퓨전 변수 초기화 ---
         coarse_fused_query_feat = lidar_only_query_feat # 카메라 없으면 이게 최종 입력
         refined_query_feat = lidar_only_query_feat      # 카메라 없으면 이게 최종 입력
-        pred_delta_rot = torch.zeros(batch_size, 3, device=fusion_feat.device) # 기본값 0
-        pred_delta_trans = torch.zeros(batch_size, 3, device=fusion_feat.device) # 기본값 0
+        if self.rrrf_mode == 'feature_refine':
+            pred_delta_rot = None
+            pred_delta_trans = None
+        else:
+            pred_delta_rot = torch.zeros(
+                batch_size, 3, device=fusion_feat.device
+            )
+            pred_delta_trans = torch.zeros(
+                batch_size, 3, device=fusion_feat.device
+            )
 
  
         # --- 2. 카메라 정보 퓨전 (있을 경우) ---
-        if det_xyz is not None and det_feats is not None:
+        # ============================================
+        # Ver2.0: Coarse Fusion ON/OFF
+        # ============================================
+
+        if (
+            self.rrrf_use_coarse
+            and det_xyz is not None
+            and det_feats is not None
+        ):
             # --- 2a. 1단계: 거친 퓨전 ---
             bev_query_feat_stage1 = query_feat.permute(0, 2, 1) # [B, Nq, C]
             bev_query_pos_embed = self.bev_query_pos_embedding(query_pos)
@@ -3368,6 +3415,13 @@ class TransFusionHead(nn.Module):
             # --- 시각화용: 중간 퓨전 결과 저장 ---
             # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
             coarse_fused_query_feat_for_vis = coarse_fused_query_feat
+
+            # ============================================
+            # Ver2.0: Coarse-only output
+            # ============================================
+
+            if not self.rrrf_use_refined:
+                refined_query_feat = coarse_fused_query_feat
 
             # # --- 2b. 캘리브레이션 오차 예측 ---
             # # LGPC Only 모드여도 오차 예측은 수행해야 함 (Rotation Loss 계산 및 검증을 위해)
@@ -3636,11 +3690,18 @@ class TransFusionHead(nn.Module):
             # Not used by:
             #   lgpc_only
             # ------------------------------------------------------------
-            if self.rrrf_mode in [
-                'residual_se3',
-                'residual_se3_v2',
-                'feature_refine'
-            ]:
+            # ============================================
+            # Ver2.0: Refined Fusion ON/OFF
+            # ============================================
+
+            if (
+                self.rrrf_use_refined
+                and self.rrrf_mode in [
+                    'residual_se3',
+                    'residual_se3_v2',
+                    'feature_refine',
+                ]
+            ):
 
                 refined_bev_query_feat = \
                     coarse_fused_query_feat.permute(
@@ -4117,6 +4178,63 @@ class TransFusionHead(nn.Module):
                 batch_vel,
                 filter=True,
             )
+
+            # ============================================================
+            # A/B0 Detection Diagnostic - first inference only
+            # ============================================================
+            if not hasattr(self, '_a_det_debug_done'):
+
+                with torch.no_grad():
+
+                    cls_prob = (
+                        preds_dict[0]['heatmap']
+                        [..., -self.num_proposals:]
+                        .sigmoid()
+                    )
+
+                    query_score = preds_dict[0][
+                        'query_heatmap_score'
+                    ]
+
+                    def summary(name, value):
+                        v = value.detach().float()
+                        valid = v[torch.isfinite(v)]
+
+                        if valid.numel() == 0:
+                            print(f'[A DET DEBUG] {name}: ALL NON-FINITE')
+                            return
+
+                        print(
+                            f'[A DET DEBUG] {name}: '
+                            f'min={valid.min().item():.6f}, '
+                            f'mean={valid.mean().item():.6f}, '
+                            f'max={valid.max().item():.6f}'
+                        )
+
+                    summary('Classification probability', cls_prob)
+                    summary('Query heatmap score', query_score)
+                    summary('Combined detection score', batch_score)
+                    summary('Predicted center', batch_center)
+                    summary('Predicted dimension(log)', batch_dim)
+
+                    for i, det in enumerate(temp[:1]):
+
+                        boxes = det['bboxes']
+                        scores = det['scores']
+
+                        print(
+                            f'[A DET DEBUG] sample={i}, '
+                            f'decoded_boxes={boxes.shape[0]}, '
+                            f'scores_above_0.01='
+                            f'{(scores > 0.01).sum().item()}'
+                        )
+
+                        if boxes.numel() > 0:
+                            summary('Decoded XYZ', boxes[:, :3])
+                            summary('Decoded score', scores)
+
+                self._a_det_debug_done = True
+
 
             if self.test_cfg['dataset'] == 'nuScenes':
                 self.tasks = [
