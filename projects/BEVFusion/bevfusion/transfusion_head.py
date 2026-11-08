@@ -1,5 +1,6 @@
 # modify from https://github.com/mit-han-lab/bevfusion
 import copy
+import os
 import math
 from typing import Any, Dict, Optional, Tuple,List
 from collections.abc import Mapping
@@ -5735,6 +5736,22 @@ class TransFusionHead(nn.Module):
             loss_dict[f'{prefix}_loss_cls'] = layer_loss_cls
             loss_dict[f'{prefix}_loss_bbox'] = layer_loss_bbox
             # loss_dict[f'{prefix}_loss_iou'] = layer_loss_iou
+
+        # PGFR_GATE_OPEN_LOSS_V1: selective gate supervision plus detection losses.
+        # The parent TransFusionHead is intentionally in eval() mode during
+        # rrrf_joint_fresh training. Check selector.training, NOT self.training.
+        selector = getattr(self, 'rrrf_query_selector', None)
+        if selector is not None and selector.training:
+            gate_aux = getattr(selector, '_pgfr_gate_aux_loss', None)
+            gate_valid_train = getattr(selector, '_pgfr_gate_valid_train', None)
+            gate_weight = float(os.environ.get('PGFR_LOCAL_GATE_AUX_WEIGHT', '0.0'))
+            if gate_weight < 0.0:
+                raise ValueError('PGFR_LOCAL_GATE_AUX_WEIGHT must be >= 0')
+            if gate_weight > 0.0:
+                if gate_aux is None or gate_valid_train is None:
+                    raise RuntimeError('Gate auxiliary loss missing: selector not executed')
+                loss_dict['loss_local_gate_open'] = gate_weight * gate_aux
+                loss_dict['local_gate_valid_train'] = gate_valid_train
 
         loss_dict['matched_ious'] = layer_loss_cls.new_tensor(matched_ious)
 

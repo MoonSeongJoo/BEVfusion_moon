@@ -92,6 +92,8 @@ class GeometrySelectiveAttention(nn.Module):
         assert corrected_cam_xyz_norm.shape == (B, Np, 3)
 
         if Np == 0:
+            self._pgfr_gate_aux_loss = query_chw.sum() * 0.0
+            self._pgfr_gate_valid_train = query_chw.new_zeros(())
             return torch.zeros_like(query_chw)
 
         device = query_chw.device
@@ -338,6 +340,28 @@ class GeometrySelectiveAttention(nn.Module):
             gate
             * has_neighbor.unsqueeze(-1)
         )
+
+        # PGFR_GATE_OPEN_AUX_V1: differentiable training-only gate target.
+        # This is CONDITIONAL on having a valid geometric neighbor; it
+        # cannot change query coverage, validity masks, or selection radius.
+        self._pgfr_gate_aux_loss = None
+        self._pgfr_gate_valid_train = None
+        if self.training:
+            gate_target = float(os.environ.get("PGFR_LOCAL_GATE_TARGET", "0.99"))
+            if not (0.0 < gate_target < 1.0):
+                raise ValueError("PGFR_LOCAL_GATE_TARGET must be in (0, 1)")
+            gate_values = gate.squeeze(-1)
+            active_float = has_neighbor.to(dtype=gate_values.dtype)
+            active_count_safe = active_float.sum().clamp_min(1.0)
+            self._pgfr_gate_valid_train = (
+                (gate_values * active_float).sum() / active_count_safe
+            ).detach()
+            # One-sided penalty: only gates smaller than target are penalized.
+            # If no valid neighbors exist, the penalty is exactly zero.
+            self._pgfr_gate_aux_loss = (
+                ((gate_target - gate_values).clamp_min(0.0).square())
+                * active_float
+            ).sum() / active_count_safe
 
         # --------------------------------------------
         # STEP G: Residual output
