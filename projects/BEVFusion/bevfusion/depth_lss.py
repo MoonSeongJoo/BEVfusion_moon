@@ -233,7 +233,21 @@ class LSSTransform(BaseViewTransform):
             )
         else:
             self.downsample = nn.Identity()
+    
+    #### ver1.0 old version #####
+    # def get_cam_feats(self, x):
+    #     B, N, C, fH, fW = x.shape
 
+    #     x = x.view(B * N, C, fH, fW)
+
+    #     x = self.depthnet(x)
+    #     depth = x[:, :self.D].softmax(dim=1)
+    #     x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
+
+    #     x = x.view(B, N, self.C, self.D, fH, fW)
+    #     x = x.permute(0, 1, 3, 4, 5, 2)
+    #     return x
+    
     def get_cam_feats(self, x):
         B, N, C, fH, fW = x.shape
 
@@ -241,6 +255,15 @@ class LSSTransform(BaseViewTransform):
 
         x = self.depthnet(x)
         depth = x[:, :self.D].softmax(dim=1)
+
+        # NEW: Depth Probability capture
+        if getattr(
+            self,
+            '_capture_corr_depth_prob',
+            False,
+        ):
+            self._corr_bev_depth_prob = depth.detach()
+        
         x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
 
         x = x.view(B, N, self.C, self.D, fH, fW)

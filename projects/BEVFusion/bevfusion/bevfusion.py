@@ -32,47 +32,12 @@ import matplotlib.patches as patches
 import os
 import math
 from .calib_head import axis_angle_to_matrix,geodesic_distance_loss,quaternion_to_matrix ,identity_matrix_loss
-
-# class CalibrationCorrectionHead(nn.Module):
-#     """
-#     특징 맵을 입력받아 6-DoF 보정 파라미터를 예측하는 헤드.
-
-#     Args:
-#         in_channels (int): 입력 특징 맵의 채널 수.
-#         hidden_dim (int): MLP의 중간층 차원.
-#         out_dim (int): 출력 차원. 기본값은 6 (rot 3 + trans 3).
-#     """
-#     def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
-#         super().__init__()
-        
-#         # 1. 공간 차원(H, W)을 없애고 채널 정보만 남기기 위한 풀링 레이어
-#         self.pool = nn.AdaptiveAvgPool2d(1)
-        
-#         # 2. 풀링된 특징 벡터를 최종 6-DoF 값으로 매핑하는 MLP
-#         self.mlp = nn.Sequential(
-#             nn.Linear(in_channels, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, out_dim)
-#         )
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Args:
-#             x (torch.Tensor): 입력 특징 맵 (B*N, C, H, W)
-        
-#         Returns:
-#             torch.Tensor: 예측된 6-DoF 파라미터 (B*N, 6)
-#         """
-#         # (B*N, C, H, W) -> (B*N, C, 1, 1)
-#         x = self.pool(x)
-        
-#         # (B*N, C, 1, 1) -> (B*N, C)
-#         x = torch.flatten(x, 1)
-        
-#         # (B*N, C) -> (B*N, 6)
-#         pred_delta_6dof = self.mlp(x)
-        
-#         return pred_delta_6dof
+from .coarse_dual_bev import (
+    sample_corrected_camera_bev
+)
+from .corrnet_aligned_bev import (
+    CorrNetAlignedBEVLifter
+)
 
 def chamfer_distance(pred_points, gt_points):
     """
@@ -128,6 +93,10 @@ class BEVFusion(Base3DDetector):
         seg_head: Optional[dict] = None,
         train_cfg=None,  
         test_cfg=None,  
+        # CorrNet -> aligned BEV (optional stream)
+        use_corr_aligned_bev: bool = False,
+        # Ablation control for CorrNet BEV features (0=off, 1=on)
+        corr_bev_feature_scale: float = 1.0,
         **kwargs,
     ) -> None:
         voxelize_cfg = data_preprocessor.pop('voxelize_cfg')
@@ -157,7 +126,6 @@ class BEVFusion(Base3DDetector):
 
         # modified by sjmoon
         self.calibration_mode = calibration_mode
-
         valid_calibration_modes = {
             'clean',
             'broken',
@@ -305,6 +273,50 @@ class BEVFusion(Base3DDetector):
         feat_dim_original = 312 # 입력 차원은 det_feat의 원래 특징 차원입니다 (12 * 64 = 768).
         hidden_channel = bbox_head['hidden_channel'] # (128) 출력 차원은 TransFusionHead의 hidden_channel과 반드시 일치해야 합니다.
         self.feat_projector = nn.Linear(feat_dim_original, hidden_channel)
+
+        # ==================================================
+        # NEW: CorrNet Encoder -> Corrected Camera BEV
+        # ==================================================
+        self.use_corr_aligned_bev = bool(
+            use_corr_aligned_bev
+        )
+        self.corr_bev_feature_scale = float(corr_bev_feature_scale)
+        self.coarse_dual_bev_channels = int(
+            bbox_head.get('rrrf_coarse_dual_bev_channels', 80)
+        )
+        if not (0.0 <= self.corr_bev_feature_scale <= 1.0):
+            raise ValueError('corr_bev_feature_scale must be in [0,1]')
+        if self.use_corr_aligned_bev:
+            if not getattr(self.bbox_head, 'rrrf_coarse_dual_enabled', False):
+                raise RuntimeError('CorrBEV requires Coarse Dual-Source enabled')
+            configured = self.coarse_dual_bev_channels
+            if configured != 2 * self.view_transform.C:
+                raise RuntimeError(
+                    f'CorrBEV+CameraBEV requires coarse BEV channels='
+                    f'{2*self.view_transform.C}, got {configured}'
+                )
+
+        if self.use_corr_aligned_bev:
+
+            if (
+                self.view_transform.__class__.__name__
+                != 'DepthLSSTransform'
+            ):
+                raise RuntimeError(
+                    'CorrBEV requires DepthLSSTransform'
+                )
+
+            self.corr_bev_lifter = (
+                CorrNetAlignedBEVLifter(
+                    in_channels=312,
+                    out_channels=self.view_transform.C,
+                )
+            )
+
+            print(
+                '[CORR-BEV] Aligned BEV lifter enabled',
+                flush=True,
+            )
 
         # ============================================================
         # Configure training stage after ALL modules are constructed.
@@ -964,6 +976,7 @@ class BEVFusion(Base3DDetector):
 
             self.bbox_head,
             self.feat_projector,
+            getattr(self, 'corr_bev_lifter', None),
 
         ]:
 
@@ -1412,6 +1425,132 @@ class BEVFusion(Base3DDetector):
 
             return
 
+
+        # ====================================================
+        # E1: Coarse Dual-Source Fine-tuning
+        # ====================================================
+
+        if (
+            stage == 'rrrf_joint_fresh'
+            and getattr(
+                self.bbox_head,
+                'rrrf_coarse_dual_enabled',
+                False,
+            )
+        ):
+
+            head = self.bbox_head
+
+            if head.rrrf_mode != 'feature_refine':
+                raise RuntimeError(
+                    '[DUAL] feature_refine mode required'
+                )
+
+            if not head.rrrf_use_coarse:
+                raise RuntimeError(
+                    '[DUAL] Coarse Attention must be ON'
+                )
+
+            if head.rrrf_query_select_enabled:
+                raise RuntimeError(
+                    '[DUAL E1] Local must be OFF'
+                )
+
+            # ------------------------------------
+            # New Semantic Adapter / Gate
+            # ------------------------------------
+
+            if self.use_corr_aligned_bev:
+                trainable(self.corr_bev_lifter)
+
+            trainable(head.coarse_bev_adapter)
+            trainable(head.coarse_bev_gate)
+
+            head.coarse_bev_alpha.requires_grad_(True)
+
+            # ------------------------------------
+            # Coarse Cross-Attention
+            # ------------------------------------
+
+            trainable(head.fusion_cross_attention)
+            trainable(head.fusion_ffn)
+            trainable(head.fusion_norm1)
+            trainable(head.fusion_norm2)
+
+            # ------------------------------------
+            # Decoder / Prediction Head
+            # ------------------------------------
+
+            trainable(head.decoder[0])
+            trainable(head.prediction_heads[0])
+
+            # BatchNorm running statistics freeze
+            for module in head.prediction_heads[0].modules():
+
+                if isinstance(
+                    module,
+                    nn.modules.batchnorm._BatchNorm,
+                ):
+                    module.eval()
+
+            # ------------------------------------
+            # Trainable parameter validation
+            # ------------------------------------
+
+            allowed = (
+                'bbox_head.coarse_bev_adapter.',
+                'bbox_head.coarse_bev_gate.',
+                'bbox_head.coarse_bev_alpha',
+                'bbox_head.fusion_cross_attention.',
+                'bbox_head.fusion_ffn.',
+                'bbox_head.fusion_norm1.',
+                'bbox_head.fusion_norm2.',
+                'bbox_head.decoder.0.',
+                'bbox_head.prediction_heads.0.',
+            )
+            if self.use_corr_aligned_bev:
+                allowed += ('corr_bev_lifter.',)
+
+            names = [
+                name
+                for name, p in self.named_parameters()
+                if p.requires_grad
+            ]
+
+            unexpected = [
+                name
+                for name in names
+                if not name.startswith(allowed)
+            ]
+
+            missing = [
+                prefix
+                for prefix in allowed
+                if not any(
+                    name.startswith(prefix)
+                    for name in names
+                )
+            ]
+
+            if unexpected or missing:
+
+                raise RuntimeError(
+                    '[DUAL] Freeze policy error: '
+                    f'unexpected={unexpected[:15]}, '
+                    f'missing={missing}'
+                )
+
+            print(
+                '[DUAL E1 TRAINABLE]',
+                len(names),
+                'parameter tensors',
+                flush=True,
+            )
+
+            for name in names:
+                print('  ', name)
+
+            return
 
         if stage == 'rrrf_joint_fresh':
 
@@ -2043,7 +2182,26 @@ class BEVFusion(Base3DDetector):
                 self.bbox_head.eval()
 
                 head = self.bbox_head
-                head.rrrf_query_selector.train()
+
+                if getattr(
+                    head,
+                    'rrrf_coarse_dual_enabled',
+                    False,
+                ):
+                    if self.use_corr_aligned_bev:
+                        self.corr_bev_lifter.train()
+                    
+                    head.coarse_bev_adapter.train()
+                    head.coarse_bev_gate.train()
+
+                    head.fusion_cross_attention.train()
+                    head.fusion_ffn.train()
+                    head.fusion_norm1.train()
+                    head.fusion_norm2.train()
+
+                else:
+
+                    head.rrrf_query_selector.train()
 
                 if head.rrrf_adapter_enabled:
                     head.rrrf_adapter.train()
@@ -3125,43 +3283,6 @@ class BEVFusion(Base3DDetector):
                 feats = feats.contiguous()
 
         return feats, coords, sizes
-
-    # def predict(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
-    #             batch_data_samples: List[Det3DDataSample],
-    #             **kwargs) -> List[Det3DDataSample]:
-    #     """Forward of testing.
-
-    #     Args:
-    #         batch_inputs_dict (dict): The model input dict which include
-    #             'points' keys.
-
-    #             - points (list[torch.Tensor]): Point cloud of each sample.
-    #         batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
-    #             Samples. It usually includes information such as
-    #             `gt_instance_3d`.
-
-    #     Returns:
-    #         list[:obj:`Det3DDataSample`]: Detection results of the
-    #         input sample. Each Det3DDataSample usually contain
-    #         'pred_instances_3d'. And the ``pred_instances_3d`` usually
-    #         contains following keys.
-
-    #         - scores_3d (Tensor): Classification scores, has a shape
-    #             (num_instances, )
-    #         - labels_3d (Tensor): Labels of bboxes, has a shape
-    #             (num_instances, ).
-    #         - bbox_3d (:obj:`BaseInstance3DBoxes`): Prediction of bboxes,
-    #             contains a tensor with shape (num_instances, 7).
-    #     """
-    #     batch_input_metas = [item.metainfo for item in batch_data_samples]
-    #     feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
-
-    #     if self.with_bbox_head:
-    #         outputs = self.bbox_head.predict(feats, batch_input_metas)
-
-    #     res = self.add_pred_to_datasample(batch_data_samples, outputs)
-
-    #     return res
     
     def extract_feat(
         self,
@@ -3172,6 +3293,7 @@ class BEVFusion(Base3DDetector):
         # ✨ 미리 계산된 이미지 백본 특징을 선택적으로 받음
         precomputed_img_feats: Optional[tuple] = None,
         return_lidar_query_feat=False,
+        return_camera_bev=False,
     ) -> tuple:
         """
         이미지와 포인트 클라우드 특징을 추출하고 융합합니다.
@@ -3278,9 +3400,237 @@ class BEVFusion(Base3DDetector):
         # --- 4. 결과 반환 ---
 
         if return_lidar_query_feat:
+            if return_camera_bev:
+                return x, lidar_query_feat, img_bev_feature
+
             return x, lidar_query_feat
-        
+
+        if return_camera_bev:
+            return x, img_bev_feature
+
         return x
+    
+    def _extract_feat_with_corr_depth_prob(
+        self,
+        **extract_kwargs,
+    ):
+        """
+        Extract fused BEV and capture the DepthLSS
+        depth probability from the SAME forward.
+        """
+
+        vt = self.view_transform
+
+        if (
+            vt is None
+            or not hasattr(vt, 'depthnet')
+            or not hasattr(vt, 'D')
+        ):
+            raise RuntimeError(
+                '[CORR-BEV] DepthLSSTransform required'
+            )
+
+        captured_depth = []
+
+        def capture_depthnet(
+            module,
+            inputs,
+            output,
+        ):
+            # output: [B*N, D+C, H, W]
+            if output.ndim != 4:
+                raise RuntimeError(
+                    'Invalid depthnet output'
+                )
+
+            depth_logits = output[:, :vt.D]
+
+            depth_prob = torch.softmax(
+                depth_logits.float(),
+                dim=1,
+            ).detach()
+
+            captured_depth.append(depth_prob)
+
+        handle = vt.depthnet.register_forward_hook(
+            capture_depthnet
+        )
+
+        try:
+            feat_result = self.extract_feat(
+                **extract_kwargs
+            )
+        finally:
+            handle.remove()
+
+        if len(captured_depth) != 1:
+            raise RuntimeError(
+                '[CORR-BEV] Depth capture failed: '
+                f'count={len(captured_depth)}'
+            )
+
+        return feat_result, captured_depth[0]
+    
+    def _build_corrnet_aligned_bev(
+        self,
+        enc_out,
+        depth_prob,
+        active_calib,
+        batch_inputs_dict,
+        batch_input_metas,
+        active_cam_indices,
+    ):
+        """
+        CorrNet enc_out -> LGPC-corrected LiDAR BEV.
+        """
+
+        device = enc_out.device
+
+        # -----------------------------------
+        # 1. Original image dimensions
+        # -----------------------------------
+
+        if 'img_original' not in batch_inputs_dict:
+            raise RuntimeError(
+                'img_original missing'
+            )
+
+        imgs_orig = batch_inputs_dict[
+            'img_original'
+        ]
+
+        Hraw, Wraw = imgs_orig.shape[-2:]
+
+        # -----------------------------------
+        # 2. Image Augmentation
+        # -----------------------------------
+
+        img_aug = torch.as_tensor(
+            np.asarray([
+                meta.get(
+                    'img_aug_matrix',
+                    np.eye(4),
+                )
+                for meta in batch_input_metas
+            ]),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        # -----------------------------------
+        # 3. LiDAR Augmentation
+        # -----------------------------------
+
+        lidar_aug = torch.as_tensor(
+            np.asarray([
+                meta.get(
+                    'lidar_aug_matrix',
+                    np.eye(4),
+                )
+                for meta in batch_input_metas
+            ]),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        # -----------------------------------
+        # 4. Camera number and active mask
+        # -----------------------------------
+
+        B, N = active_calib[
+            'cam2lidar'
+        ].shape[:2]
+
+        if B != 1:
+            raise RuntimeError(
+                'Current CorrNet active camera '
+                'indexing requires B=1'
+            )
+
+        active_mask = torch.zeros(
+            B, N,
+            device=device,
+            dtype=torch.bool,
+        )
+
+        active_mask[
+            :, active_cam_indices
+        ] = True
+
+        # -----------------------------------
+        # 5. CorrNet BEV lifting
+        # -----------------------------------
+
+        corr_bev, stats = self.corr_bev_lifter(
+            enc_out=enc_out,
+            depth_prob=depth_prob,
+
+            view_transform=self.view_transform,
+
+            camera2lidar=active_calib[
+                'cam2lidar'
+            ],
+
+            camera_intrinsics=active_calib[
+                'cam2img'
+            ],
+
+            img_aug_matrix=img_aug,
+            lidar_aug_matrix=lidar_aug,
+
+            original_hw=(Hraw, Wraw),
+
+            camera_active_mask=active_mask,
+        )
+
+        return corr_bev, stats
+    
+    def _sample_rrrf_coarse_camera_bev(
+        self,
+        camera_bev,
+        det_xyz_proc,
+        batch_input_metas,
+    ):
+        """
+        Camera-only BEV proposal sampling.
+
+        Returns:
+            sampled: [B, Np, Cbev]
+            valid:   [B, Np]
+        """
+
+        mats = []
+
+        for meta in batch_input_metas:
+            mats.append(
+                meta.get(
+                    'lidar_aug_matrix',
+                    np.eye(4),
+                )
+            )
+
+        lidar_aug = camera_bev.new_tensor(
+            np.asarray(mats)
+        )
+
+        sampled, valid = sample_corrected_camera_bev(
+            camera_bev=camera_bev,
+            proposal_xyz_norm=det_xyz_proc,
+            lidar_aug_matrix=lidar_aug,
+            pc_range=self.pc_range,
+            xbound=self.view_transform.xbound,
+            ybound=self.view_transform.ybound,
+        )
+
+        assert sampled.shape[:2] == (
+            det_xyz_proc.shape[:2]
+        )
+
+        assert sampled.shape[-1] == (
+            self.view_transform.C
+        )
+
+        return sampled, valid
     
     def extract_sbs_img(
         self,
@@ -9242,10 +9592,152 @@ class BEVFusion(Base3DDetector):
             det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
             det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(det_xyz_ref_clamped,det_feat_sampled,B=B,N_cam=N)
 
-            feats = self.extract_feat(batch_inputs_dict=batch_inputs_dict,
-                                    batch_input_metas=batch_input_metas,
-                                    corrected_calib=corrected_calib_dict,
-                                    precomputed_img_feats=img_feats)
+            # ==================================================
+            # NEW: CorrNet Aligned BEV for Coarse Dual-Source
+            # ==================================================
+
+            coarse_dual = bool(
+                getattr(
+                    self.bbox_head,
+                    'rrrf_coarse_dual_enabled',
+                    False,
+                )
+            )
+
+            use_corr = bool(
+                coarse_dual
+                and self.use_corr_aligned_bev
+            )
+
+            feat_kwargs = dict(
+                batch_inputs_dict=batch_inputs_dict,
+                batch_input_metas=batch_input_metas,
+                corrected_calib=corrected_calib_dict,
+                precomputed_img_feats=img_feats,
+                return_camera_bev=coarse_dual,
+            )
+
+            if use_corr:
+
+                feat_result, depth_prob = (
+                    self._extract_feat_with_corr_depth_prob(
+                        **feat_kwargs
+                    )
+                )
+
+            else:
+
+                feat_result = self.extract_feat(
+                    **feat_kwargs
+                )
+
+            # ---------------------------------------------
+            # 3. Create CorrNet BEV
+            # ---------------------------------------------
+
+            if coarse_dual:
+
+                feats, camera_bev_for_rrrf = feat_result
+
+                if use_corr:
+
+                    corr_bev, stats = (
+                        self._build_corrnet_aligned_bev(
+                            enc_out=enc_out,
+                            depth_prob=depth_prob,
+                            active_calib=corrected_calib_dict,
+                            batch_inputs_dict=batch_inputs_dict,
+                            batch_input_metas=batch_input_metas,
+                            active_cam_indices=active_cam_indices,
+                        )
+                    )
+
+                    # Both maps must share the same output grid
+                    assert (
+                        corr_bev.shape
+                        == camera_bev_for_rrrf.shape
+                    ), (
+                        corr_bev.shape,
+                        camera_bev_for_rrrf.shape,
+                    )
+
+                    if not hasattr(self, '_corr_bev_train_once'):
+                        print(
+                            '[CORR-BEV TRAIN]',
+                            'corr_bev=', tuple(corr_bev.shape),
+                            'camera_bev=', tuple(camera_bev_for_rrrf.shape),
+                            'stats=', stats,
+                            flush=True,
+                        )
+                        self._corr_bev_train_once = True
+
+                # --------------------------------------------------
+                # NEW: preserve Camera BEV semantic features ALWAYS.
+                # Sample both maps at the SAME physical proposal XYZ.
+                # This produces [B, Np, 80] for each stream.
+                # --------------------------------------------------
+                cam_prop_feats, cam_prop_valid = (
+                    self._sample_rrrf_coarse_camera_bev(
+                        camera_bev_for_rrrf,
+                        det_xyz_proc,
+                        batch_input_metas,
+                    )
+                )
+
+                if use_corr:
+                    corr_prop_feats, corr_prop_valid = (
+                        self._sample_rrrf_coarse_camera_bev(
+                            corr_bev,
+                            det_xyz_proc,
+                            batch_input_metas,
+                        )
+                    )
+                    if not torch.equal(cam_prop_valid, corr_prop_valid):
+                        raise RuntimeError(
+                            '[COARSE 3SRC] Same-XYZ BEV validity mismatch'
+                        )
+                else:
+                    # Maintain 160ch for a same-checkpoint CorrBEV-OFF ablation.
+                    corr_prop_feats = torch.zeros_like(cam_prop_feats)
+
+                # Camera semantic is the FIRST 80 channels.
+                # CorrNet BEV is the LAST 80 channels.
+                if self.coarse_dual_bev_channels == 2 * self.view_transform.C:
+                    coarse_bev_feats = torch.cat(
+                        [
+                            cam_prop_feats,
+                            self.corr_bev_feature_scale * corr_prop_feats,
+                        ],
+                        dim=-1,
+                    )
+                elif self.coarse_dual_bev_channels == self.view_transform.C:
+                    # Compatibility with original Camera-only E1 (80ch).
+                    coarse_bev_feats = cam_prop_feats
+                else:
+                    raise RuntimeError(
+                        '[COARSE] Unsupported BEV adapter channels: '
+                        f'{self.coarse_dual_bev_channels}'
+                    )
+                coarse_bev_valid = cam_prop_valid
+                if coarse_bev_feats.shape[-1] != self.coarse_dual_bev_channels:
+                    raise RuntimeError('[COARSE] K/V channel mismatch')
+
+                if not hasattr(self, '_coarse_3src_train_once'):
+                    print(
+                        '[COARSE 3SRC TRAIN]',
+                        'camera_abs=', float(cam_prop_feats.detach().abs().mean()),
+                        'corrbev_abs=', float(corr_prop_feats.detach().abs().mean()),
+                        'scale=', self.corr_bev_feature_scale,
+                        'combined_shape=', tuple(coarse_bev_feats.shape),
+                        'valid=', float(coarse_bev_valid.float().mean()),
+                        flush=True,
+                    )
+                    self._coarse_3src_train_once = True
+
+            else:
+                feats = feat_result
+                coarse_bev_feats = None
+                coarse_bev_valid = None
             
             stage1_active_cam_mask = torch.zeros(
                 (
@@ -9710,6 +10202,8 @@ class BEVFusion(Base3DDetector):
                                 gt_delta_trans=gt_delta_trans,
                                 stage1_active_cam_mask=stage1_active_cam_mask,
                                 camera_proposal_valid_mask= camera_proposal_valid_mask,
+                                coarse_bev_feats=coarse_bev_feats,
+                                coarse_bev_valid=coarse_bev_valid,
                             )
             
             # --- ✨ 2. 손실과 예측값 분리 ---
@@ -11164,63 +11658,173 @@ class BEVFusion(Base3DDetector):
         det_feat_sampled = self._sample_features_from_grid(feature_map=enc_out, coords=query_input)
         det_xyz_proc, det_feat_proc = self._prepare_camera_proposals(
             det_xyz_ref_clamped, det_feat_sampled, B=B, N_cam=N)
-
-        # --- 7. & 8. Final 3D Detection and Formatting (Same as before) ---
-        # feats = self.extract_feat(
-        #     batch_inputs_dict=batch_inputs_dict,
-        #     batch_input_metas=batch_input_metas,
-        #     corrected_calib=active_calib_dict,
-        #     precomputed_img_feats=img_feats)
+        # ==================================================
+        # NEW: CorrNet Aligned BEV inference path
+        # ==================================================
 
         use_lidar_query = (
             getattr(
                 self.bbox_head,
                 'query_source',
-                'fused'
-            )
-            == 'lidar'
+                'fused',
+            ) == 'lidar'
         )
 
+        coarse_dual = bool(
+            getattr(
+                self.bbox_head,
+                'rrrf_coarse_dual_enabled',
+                False,
+            )
+        )
 
-        if use_lidar_query:
+        use_corr = bool(
+            coarse_dual
+            and self.use_corr_aligned_bev
+        )
 
-            (
-                feats,
-                lidar_query_feats
-            ) = self.extract_feat(
-                batch_inputs_dict=
-                    batch_inputs_dict,
+        # ==================================================
+        # CORR-BEV EVAL: Depth Probability via Forward Hook
+        # ==================================================
 
-                batch_input_metas=
-                    batch_input_metas,
+        feat_kwargs = dict(
+            batch_inputs_dict=batch_inputs_dict,
+            batch_input_metas=batch_input_metas,
+            corrected_calib=active_calib_dict,
+            precomputed_img_feats=img_feats,
+            return_lidar_query_feat=use_lidar_query,
+            return_camera_bev=coarse_dual,
+        )
 
-                corrected_calib=
-                    active_calib_dict,
+        # 1. Extract BEV features and Depth probability
+        if use_corr:
 
-                precomputed_img_feats=
-                    img_feats,
-
-                return_lidar_query_feat=
-                    True,
+            feat_result, depth_prob = (
+                self._extract_feat_with_corr_depth_prob(
+                    **feat_kwargs
+                )
             )
 
         else:
 
-            feats = self.extract_feat(
-                batch_inputs_dict=
-                    batch_inputs_dict,
-
-                batch_input_metas=
-                    batch_input_metas,
-
-                corrected_calib=
-                    active_calib_dict,
-
-                precomputed_img_feats=
-                    img_feats,
+            feat_result = self.extract_feat(
+                **feat_kwargs
             )
 
+        # 2. Unpack features
+        if use_lidar_query:
+
+            if coarse_dual:
+                (
+                    feats,
+                    lidar_query_feats,
+                    camera_bev_for_rrrf,
+                ) = feat_result
+            else:
+                feats, lidar_query_feats = feat_result
+
+        else:
+
+            if coarse_dual:
+                feats, camera_bev_for_rrrf = feat_result
+            else:
+                feats = feat_result
+
             lidar_query_feats = None
+
+        # 3. Build CorrNet Aligned BEV
+        if coarse_dual:
+
+            if use_corr:
+
+                corr_bev, stats = (
+                    self._build_corrnet_aligned_bev(
+                        enc_out=enc_out,
+                        depth_prob=depth_prob,
+                        active_calib=active_calib_dict,
+                        batch_inputs_dict=batch_inputs_dict,
+                        batch_input_metas=batch_input_metas,
+                        active_cam_indices=active_cam_indices,
+                    )
+                )
+
+                assert (
+                    corr_bev.shape
+                    == camera_bev_for_rrrf.shape
+                )
+
+                if not hasattr(self, '_corr_bev_eval_once'):
+                    print(
+                        '[CORR-BEV EVAL]',
+                        'corr_bev=', tuple(corr_bev.shape),
+                        'camera_bev=', tuple(camera_bev_for_rrrf.shape),
+                        'stats=', stats,
+                        flush=True,
+                    )
+                    self._corr_bev_eval_once = True
+
+            # --------------------------------------------------
+            # NEW: Camera semantic BEV is ALWAYS passed to Coarse.
+            # The optional CorrNet BEV is concatenated after it.
+            # --------------------------------------------------
+            cam_prop_feats, cam_prop_valid = (
+                self._sample_rrrf_coarse_camera_bev(
+                    camera_bev_for_rrrf,
+                    det_xyz_proc,
+                    batch_input_metas,
+                )
+            )
+
+            if use_corr:
+                corr_prop_feats, corr_prop_valid = (
+                    self._sample_rrrf_coarse_camera_bev(
+                        corr_bev,
+                        det_xyz_proc,
+                        batch_input_metas,
+                    )
+                )
+                if not torch.equal(cam_prop_valid, corr_prop_valid):
+                    raise RuntimeError(
+                        '[COARSE 3SRC] Same-XYZ BEV validity mismatch'
+                    )
+            else:
+                corr_prop_feats = torch.zeros_like(cam_prop_feats)
+
+            if self.coarse_dual_bev_channels == 2 * self.view_transform.C:
+                coarse_bev_feats = torch.cat(
+                    [
+                        cam_prop_feats,
+                        self.corr_bev_feature_scale * corr_prop_feats,
+                    ],
+                    dim=-1,
+                )
+            elif self.coarse_dual_bev_channels == self.view_transform.C:
+                # Compatibility with original Camera-only E1 (80ch).
+                coarse_bev_feats = cam_prop_feats
+            else:
+                raise RuntimeError(
+                    '[COARSE] Unsupported BEV adapter channels: '
+                    f'{self.coarse_dual_bev_channels}'
+                )
+            coarse_bev_valid = cam_prop_valid
+            if coarse_bev_feats.shape[-1] != self.coarse_dual_bev_channels:
+                raise RuntimeError('[COARSE] K/V channel mismatch')
+
+            if not hasattr(self, '_coarse_3src_eval_once'):
+                print(
+                    '[COARSE 3SRC EVAL]',
+                    'camera_abs=', float(cam_prop_feats.detach().abs().mean()),
+                    'corrbev_abs=', float(corr_prop_feats.detach().abs().mean()),
+                    'scale=', self.corr_bev_feature_scale,
+                    'combined_shape=', tuple(coarse_bev_feats.shape),
+                    'valid=', float(coarse_bev_valid.float().mean()),
+                    flush=True,
+                )
+                self._coarse_3src_eval_once = True
+
+        else:
+            coarse_bev_feats = None
+            coarse_bev_valid = None
         
         # # --- ⏱️ Stage-2 (RRRF) 순수 오버헤드 측정 시작 ---
         # s2_start = torch.cuda.Event(enable_timing=True)
@@ -11324,6 +11928,8 @@ class BEVFusion(Base3DDetector):
 
             camera_proposal_valid_mask=
                 camera_proposal_valid_mask,
+            coarse_bev_feats=coarse_bev_feats,
+            coarse_bev_valid=coarse_bev_valid,
         )
         
         results = self.add_pred_to_datasample(batch_data_samples,

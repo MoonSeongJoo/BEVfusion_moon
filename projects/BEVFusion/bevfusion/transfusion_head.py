@@ -2189,6 +2189,10 @@ class TransFusionHead(nn.Module):
         # ============================================
         rrrf_use_coarse=True,
         rrrf_use_refined=True,
+        # E1: Coarse Dual-Source
+        rrrf_coarse_dual_enabled=False,
+        rrrf_coarse_dual_bev_channels=80,
+        rrrf_coarse_dual_scale=1.0,
 
         train_cfg=None,
         test_cfg=None,
@@ -2216,6 +2220,14 @@ class TransFusionHead(nn.Module):
 
         self.rrrf_use_coarse = bool(rrrf_use_coarse)
         self.rrrf_use_refined = bool(rrrf_use_refined)
+
+        self.rrrf_coarse_dual_enabled = bool(
+            rrrf_coarse_dual_enabled
+        )
+
+        self.rrrf_coarse_dual_scale = float(
+            rrrf_coarse_dual_scale
+        )
 
         # Refined Fusion requires Coarse Fusion.
         if self.rrrf_use_refined and not self.rrrf_use_coarse:
@@ -2392,6 +2404,57 @@ class TransFusionHead(nn.Module):
         )
         self.fusion_norm1 = nn.LayerNorm(hidden_channel)
         self.fusion_norm2 = nn.LayerNorm(hidden_channel)
+
+        # ====================================================
+        # E1: Coarse Dual-Source Semantic Adapter
+        # ====================================================
+
+        if self.rrrf_coarse_dual_enabled:
+
+            Cbev = int(rrrf_coarse_dual_bev_channels)
+
+            # 80ch Camera BEV -> 128ch
+            self.coarse_bev_adapter = nn.Sequential(
+                nn.LayerNorm(Cbev),
+
+                nn.Linear(
+                    Cbev,
+                    hidden_channel,
+                ),
+
+                nn.ReLU(inplace=True),
+
+                nn.Linear(
+                    hidden_channel,
+                    hidden_channel,
+                ),
+            )
+
+            # CorrNet + Camera BEV reliability gate
+            self.coarse_bev_gate = nn.Sequential(
+                nn.Linear(
+                    hidden_channel * 2,
+                    hidden_channel,
+                ),
+
+                nn.ReLU(inplace=True),
+
+                nn.Linear(
+                    hidden_channel,
+                    1,
+                ),
+            )
+
+            # Gate initial bias
+            nn.init.constant_(
+                self.coarse_bev_gate[-1].bias,
+                -2.0,
+            )
+
+            # Residual initialization: 0
+            self.coarse_bev_alpha = nn.Parameter(
+                torch.zeros(())
+            )
 
         # 카메라 제안(det_xyz)의 3D 좌표를 위한 Positional Embedding (유지)
         self.camera_proposal_pos_embedding = nn.Sequential(
@@ -2979,6 +3042,8 @@ class TransFusionHead(nn.Module):
         stage1_pred_delta_trans=None,
         stage1_active_cam_mask=None,
         camera_proposal_valid_mask=None,
+        coarse_bev_feats=None,
+        coarse_bev_valid=None,
     ):
         """Forward function for CenterPoint.
         Args:
@@ -3362,6 +3427,183 @@ class TransFusionHead(nn.Module):
                         det_xyz
                     )
                 )
+            
+            # ====================================================
+            # E1: Dual-Source Camera Proposal Feature
+            #
+            # Only Coarse uses cam_feat_coarse.
+            # Refined and Local use original cam_proposal_feat.
+            # ====================================================
+
+            cam_feat_coarse = cam_proposal_feat
+
+            if self.rrrf_coarse_dual_enabled:
+
+                if (
+                    coarse_bev_feats is None
+                    or coarse_bev_valid is None
+                ):
+                    raise RuntimeError(
+                        '[DUAL] Camera BEV features missing'
+                    )
+
+                if coarse_bev_feats.shape[:2] != (
+                    B_cam, Np
+                ):
+                    raise RuntimeError(
+                        '[DUAL] Proposal shape mismatch'
+                    )
+
+                if coarse_bev_valid.shape != (
+                    B_cam, Np
+                ):
+                    raise RuntimeError(
+                        '[DUAL] Valid mask shape mismatch'
+                    )
+
+                # ------------------------------------
+                # 1. Camera BEV semantic adapter
+                # ------------------------------------
+
+                bev_sem = self.coarse_bev_adapter(
+                    coarse_bev_feats.to(
+                        cam_proposal_feat.dtype
+                    )
+                )
+
+                # [B, Np, 128]
+
+                # ------------------------------------
+                # 2. Proposal-wise semantic gate
+                # ------------------------------------
+
+                gate_input = torch.cat(
+                    [
+                        cam_proposal_feat,
+                        bev_sem,
+                    ],
+                    dim=-1,
+                )
+
+                gate = torch.sigmoid(
+                    self.coarse_bev_gate(gate_input)
+                )
+
+                # [B, Np, 1]
+
+                # ------------------------------------
+                # 3. BEV sampling valid mask
+                # ------------------------------------
+
+                valid_bev = coarse_bev_valid.to(
+                    device=gate.device,
+                    dtype=gate.dtype,
+                ).unsqueeze(-1)
+
+                if self.rrrf_mode == 'feature_refine':
+
+                    valid_bev = (
+                        valid_bev
+                        * proposal_valid[:, :, None].to(
+                            gate.dtype
+                        )
+                    )
+
+                # ------------------------------------
+                # 4. Semantic residual
+                # ------------------------------------
+
+                gamma = torch.tanh(
+                    self.coarse_bev_alpha
+                )
+
+                delta_sem = (
+                    self.rrrf_coarse_dual_scale
+                    * gamma
+                    * gate
+                    * bev_sem
+                    * valid_bev
+                )
+
+                # ------------------------------------
+                # 5. Final Coarse camera K/V
+                # ------------------------------------
+
+                cam_feat_coarse = (
+                    cam_proposal_feat + delta_sem
+                )
+
+                if self.training:
+
+                    if not hasattr(self, '_dual_debug_step'):
+                        self._dual_debug_step = 0
+
+                    self._dual_debug_step += 1
+
+                    if self._dual_debug_step % 100 == 0:
+
+                        corr_abs = (
+                            cam_proposal_feat.detach()
+                            .abs().mean().item()
+                        )
+
+                        bev_abs = (
+                            bev_sem.detach()
+                            .abs().mean().item()
+                        )
+
+                        delta_abs = (
+                            delta_sem.detach()
+                            .abs().mean().item()
+                        )
+
+                        relative_pct = (
+                            100.0 * delta_abs
+                            / (corr_abs + 1e-8)
+                        )
+
+                        print(
+                            '[DUAL E1 TRAIN]',
+                            f'alpha={self.coarse_bev_alpha.item():.6f}',
+                            f'gamma={gamma.item():.6f}',
+                            f'gate={gate.detach().mean().item():.4f}',
+                            f'corr_abs={corr_abs:.6f}',
+                            f'bev_abs={bev_abs:.6f}',
+                            f'delta_abs={delta_abs:.6f}',
+                            f'relative_pct={relative_pct:.4f}%',
+                            flush=True,
+                        )
+
+                # ------------------------------------
+                # 6. Initial debug
+                # ------------------------------------
+
+                if not hasattr(
+                    self,
+                    '_coarse_dual_debug_once'
+                ):
+
+                    print(
+                        '[DUAL E1]',
+                        'corr=', tuple(
+                            cam_proposal_feat.shape
+                        ),
+                        'bev=', tuple(
+                            coarse_bev_feats.shape
+                        ),
+                        'gamma=', float(
+                            gamma.detach()
+                        ),
+                        'sample_valid=', float(
+                            valid_bev.detach().mean()
+                        ),
+                        'delta_abs=', float(
+                            delta_sem.detach().abs().mean()
+                        ),
+                        flush=True,
+                    )
+
+                    self._coarse_dual_debug_once = True
 
             # ============================================================
             # PGFR: Coarse Cross-Attention
@@ -3375,11 +3617,11 @@ class TransFusionHead(nn.Module):
                 ),
 
                 key=(
-                    cam_proposal_feat
+                    cam_feat_coarse
                     + cam_proposal_pos_embed
                 ),
 
-                value=cam_proposal_feat,
+                value=cam_feat_coarse,
 
                 key_padding_mask=rrrf_key_padding_mask,
 
@@ -4002,7 +4244,7 @@ class TransFusionHead(nn.Module):
         return [new_res]
     
     def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None,lidar_query_feats=None,
-                stage1_pred_delta_rot=None,stage1_pred_delta_trans=None,stage1_active_cam_mask=None,camera_proposal_valid_mask=None,):
+                stage1_pred_delta_rot=None,stage1_pred_delta_trans=None,stage1_active_cam_mask=None,camera_proposal_valid_mask=None,coarse_bev_feats=None,coarse_bev_valid=None,):
         if isinstance(feats, torch.Tensor):
             feats = [feats]
 
@@ -4047,6 +4289,10 @@ class TransFusionHead(nn.Module):
             [stage1_pred_delta_trans],
             [stage1_active_cam_mask],
             [camera_proposal_valid_mask],
+
+            # NEW
+            [coarse_bev_feats],
+            [coarse_bev_valid],
         )
         
         assert len(res) == 1, 'only support one level features.'
@@ -4071,6 +4317,8 @@ class TransFusionHead(nn.Module):
         stage1_pred_delta_trans=None,
         stage1_active_cam_mask=None,
         camera_proposal_valid_mask=None,
+        coarse_bev_feats=None,
+        coarse_bev_valid=None,
     ):
 
         preds_dicts = self(
@@ -4093,6 +4341,9 @@ class TransFusionHead(nn.Module):
 
             camera_proposal_valid_mask=
                 camera_proposal_valid_mask,
+            
+            coarse_bev_feats=coarse_bev_feats,
+            coarse_bev_valid=coarse_bev_valid,
         )
 
 
@@ -5106,6 +5357,8 @@ class TransFusionHead(nn.Module):
         gt_delta_trans=None,
         stage1_active_cam_mask=None,
         camera_proposal_valid_mask=None,
+        coarse_bev_feats=None,
+        coarse_bev_valid=None,
     ):
         """Loss function for CenterHead.
 
@@ -5141,6 +5394,8 @@ class TransFusionHead(nn.Module):
 
             camera_proposal_valid_mask=
                 camera_proposal_valid_mask,
+            coarse_bev_feats=coarse_bev_feats,
+            coarse_bev_valid=coarse_bev_valid,
         )
         
         loss = self.loss_by_feat(
