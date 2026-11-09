@@ -4000,22 +4000,6 @@ class TransFusionHead(nn.Module):
         new_res['pred_delta_trans'] = pred_delta_trans
         
         return [new_res]
-
-    # def forward(self, feats, metas):
-    #     """Forward pass.
-
-    #     Args:
-    #         feats (list[torch.Tensor]): Multi-level features, e.g.,
-    #             features produced by FPN.
-    #     Returns:
-    #         tuple(list[dict]): Output results. first index by level, second
-    #         index by layer
-    #     """
-    #     if isinstance(feats, torch.Tensor):
-    #         feats = [feats]
-    #     res = multi_apply(self.forward_single, feats, [metas])
-    #     assert len(res) == 1, 'only support one level features.'
-    #     return res
     
     def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None,lidar_query_feats=None,
                 stage1_pred_delta_rot=None,stage1_pred_delta_trans=None,stage1_active_cam_mask=None,camera_proposal_valid_mask=None,):
