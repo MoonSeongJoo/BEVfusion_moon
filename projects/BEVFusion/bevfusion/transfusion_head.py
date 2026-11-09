@@ -2453,7 +2453,8 @@ class TransFusionHead(nn.Module):
 
             # Residual initialization: 0
             self.coarse_bev_alpha = nn.Parameter(
-                torch.zeros(())
+                # torch.zeros(())
+                torch.tensor(0.1, dtype=torch.float32)
             )
 
         # 카메라 제안(det_xyz)의 3D 좌표를 위한 Positional Embedding (유지)

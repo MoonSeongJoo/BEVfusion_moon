@@ -225,6 +225,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_query_select',
             'rrrf_joint_fresh',
             # Ver2.0
+            'rrrf_coarse_only',    # 신규 추가
             'rrrf_ablation',
         }
 
@@ -245,6 +246,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_decoder_tail',
             'rrrf_query_select',
             'rrrf_joint_fresh',
+            'rrrf_coarse_only',  # 신규 추가
             # Ver2.0
             'rrrf_ablation',
         }
@@ -1425,6 +1427,155 @@ class BEVFusion(Base3DDetector):
 
             return
 
+        # ============================================================
+        # Ver3.0: Coarse Fusion Only Training
+        # ============================================================
+        if stage == 'rrrf_coarse_only':
+
+            head = self.bbox_head
+
+            # --------------------------------------------------------
+            # 1. Architecture verification
+            # --------------------------------------------------------
+
+            if head.rrrf_mode != 'feature_refine':
+                raise RuntimeError(
+                    '[COARSE ONLY] feature_refine required'
+                )
+
+            if not head.rrrf_use_coarse:
+                raise RuntimeError(
+                    '[COARSE ONLY] Coarse Fusion must be enabled'
+                )
+
+            if not head.rrrf_coarse_dual_enabled:
+                raise RuntimeError(
+                    '[COARSE ONLY] Dual-Source must be enabled'
+                )
+
+            if not self.use_corr_aligned_bev:
+                raise RuntimeError(
+                    '[COARSE ONLY] CorrNet BEV must be enabled'
+                )
+
+            if self.coarse_dual_bev_channels != 160:
+                raise RuntimeError(
+                    '[COARSE ONLY] Expected 160ch BEV input'
+                )
+
+            if head.rrrf_query_select_enabled:
+                raise RuntimeError(
+                    '[COARSE ONLY] Query Selector must be disabled'
+                )
+
+            # --------------------------------------------------------
+            # 2. CorrNet BEV Lifter
+            #    CorrNet 2D latent -> 80ch BEV
+            # --------------------------------------------------------
+
+            trainable(self.corr_bev_lifter)
+
+            # --------------------------------------------------------
+            # 3. Coarse 3-Source Feature Adapter
+            #    Camera BEV + CorrNet BEV: 160 -> 128
+            # --------------------------------------------------------
+
+            trainable(head.coarse_bev_adapter)
+
+            # --------------------------------------------------------
+            # 4. Semantic Gate / Alpha
+            # --------------------------------------------------------
+
+            trainable(head.coarse_bev_gate)
+
+            head.coarse_bev_alpha.requires_grad_(True)
+
+            # --------------------------------------------------------
+            # 5. Coarse Cross-Attention
+            # --------------------------------------------------------
+
+            trainable(head.fusion_cross_attention)
+
+            # --------------------------------------------------------
+            # 6. Coarse FFN + LayerNorm
+            # --------------------------------------------------------
+
+            trainable(head.fusion_ffn)
+            trainable(head.fusion_norm1)
+            trainable(head.fusion_norm2)
+
+            # --------------------------------------------------------
+            # 7. Verify trainable parameter names
+            # --------------------------------------------------------
+
+            allowed_prefixes = (
+                'corr_bev_lifter.',
+                'bbox_head.coarse_bev_adapter.',
+                'bbox_head.coarse_bev_gate.',
+                'bbox_head.coarse_bev_alpha',
+                'bbox_head.fusion_cross_attention.',
+                'bbox_head.fusion_ffn.',
+                'bbox_head.fusion_norm1.',
+                'bbox_head.fusion_norm2.',
+            )
+
+            trainable_params = [
+                (name, param)
+                for name, param in self.named_parameters()
+                if param.requires_grad
+            ]
+
+            unexpected = [
+                name
+                for name, param in trainable_params
+                if not name.startswith(allowed_prefixes)
+            ]
+
+            missing = [
+                prefix
+                for prefix in allowed_prefixes
+                if not any(
+                    name.startswith(prefix)
+                    for name, param in trainable_params
+                )
+            ]
+
+            if unexpected or missing:
+                raise RuntimeError(
+                    '[COARSE ONLY] Freeze verification failed: '
+                    f'unexpected={unexpected}, missing={missing}'
+                )
+
+            total_params = sum(
+                p.numel() for p in self.parameters()
+            )
+
+            trainable_count = sum(
+                p.numel() for name, p in trainable_params
+            )
+
+            print(
+                '\n=======================================\n'
+                '[PGFR VER3 COARSE ONLY TRAINING]\n'
+                f'Total Params     : {total_params:,}\n'
+                f'Trainable Params : {trainable_count:,}\n'
+                'LGPC             : FROZEN\n'
+                'BEVFusion        : FROZEN\n'
+                'CorrBEV Lifter   : TRAIN\n'
+                'Coarse Adapter   : TRAIN\n'
+                'Coarse Gate      : TRAIN\n'
+                'Coarse Attention : TRAIN\n'
+                'Refined Fusion   : FROZEN\n'
+                '3D Decoder      : FROZEN\n'
+                'Prediction Head  : FROZEN\n'
+                '=======================================',
+                flush=True,
+            )
+
+            for name, _ in trainable_params:
+                print('[TRAINABLE]', name, flush=True)
+
+            return
 
         # ====================================================
         # E1: Coarse Dual-Source Fine-tuning
@@ -2104,7 +2255,41 @@ class BEVFusion(Base3DDetector):
 
                 self.bbox_head.eval()
             
-            
+            # ========================================================
+            # Ver3.0: Coarse Only Train Mode Restoration
+            # ========================================================
+
+            if stage == 'rrrf_coarse_only':
+
+                head = self.bbox_head
+
+                # Freeze all modules' training behavior first
+                head.eval()
+
+                self.feat_projector.eval()
+
+                # CorrNet BEV Lifter
+                self.corr_bev_lifter.train()
+
+                # Coarse Fusion modules only
+                head.coarse_bev_adapter.train()
+                head.coarse_bev_gate.train()
+
+                head.fusion_cross_attention.train()
+                head.fusion_ffn.train()
+                head.fusion_norm1.train()
+                head.fusion_norm2.train()
+
+                # Verification
+                assert not head.training
+
+                assert not head.decoder[0].training
+
+                assert not head.prediction_heads[0].training
+
+                assert self.corr_bev_lifter.training
+
+                return self
 
             # ========================================================
             # Ver2.0: Ablation Train/Eval Restoration
@@ -10288,6 +10473,7 @@ class BEVFusion(Base3DDetector):
 
             if self.lgpc_train_stage in {
                 'rrrf_joint_fresh',
+                'rrrf_coarse_only',  # 신규 추가
                 'rrrf_ablation',
             }:
 
