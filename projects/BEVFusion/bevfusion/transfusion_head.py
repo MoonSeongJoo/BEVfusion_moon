@@ -2194,6 +2194,16 @@ class TransFusionHead(nn.Module):
         rrrf_coarse_dual_bev_channels=80,
         rrrf_coarse_dual_scale=1.0,
 
+        # NEW: 3-source K/V for all RRRF stages
+        rrrf_3source_all_stages=False,
+
+        # NEW: bypass coarse output during ablation
+        rrrf_ablation_skip_coarse_attention=False,
+
+        # CorrNet BEV is the primary K/V; 2D + Camera BEV is gated auxiliary.
+        # False preserves the original Corr2D-primary formulation.
+        rrrf_corrbev_primary=False,
+
         train_cfg=None,
         test_cfg=None,
         bbox_coder=None,
@@ -2228,6 +2238,37 @@ class TransFusionHead(nn.Module):
         self.rrrf_coarse_dual_scale = float(
             rrrf_coarse_dual_scale
         )
+
+        # NEW: 3-source fusion switch
+        self.rrrf_3source_all_stages = bool(
+            rrrf_3source_all_stages
+        )
+
+        # NEW: coarse ablation switch
+        self.rrrf_ablation_skip_coarse_attention = bool(
+            rrrf_ablation_skip_coarse_attention
+        )
+
+        self.rrrf_corrbev_primary = bool(rrrf_corrbev_primary)
+        if self.rrrf_corrbev_primary:
+            if not self.rrrf_coarse_dual_enabled:
+                raise ValueError(
+                    '[CORRBEV PRIMARY] rrrf_coarse_dual_enabled must be True'
+                )
+            if int(rrrf_coarse_dual_bev_channels) != 160:
+                raise ValueError(
+                    '[CORRBEV PRIMARY] Expected [CameraBEV(80), CorrBEV(80)]'
+                )
+
+        # Configuration validation
+        if (
+            self.rrrf_3source_all_stages
+            and not self.rrrf_coarse_dual_enabled
+        ):
+            raise ValueError(
+                '[RRRF] 3-source requires '
+                'rrrf_coarse_dual_enabled=True'
+            )
 
         # Refined Fusion requires Coarse Fusion.
         if self.rrrf_use_refined and not self.rrrf_use_coarse:
@@ -3429,182 +3470,207 @@ class TransFusionHead(nn.Module):
                     )
                 )
             
-            # ====================================================
-            # E1: Dual-Source Camera Proposal Feature
-            #
-            # Only Coarse uses cam_feat_coarse.
-            # Refined and Local use original cam_proposal_feat.
-            # ====================================================
+            # ============================================================
+            # RRRF 3-source K/V:
+            #   CorrBEV-primary (new) OR Corr2D-primary (legacy)
+            # ============================================================
 
             cam_feat_coarse = cam_proposal_feat
 
             if self.rrrf_coarse_dual_enabled:
+                if coarse_bev_feats is None or coarse_bev_valid is None:
+                    raise RuntimeError('[DUAL] Camera/Corr BEV features missing')
+                if coarse_bev_feats.shape[:2] != (B_cam, Np):
+                    raise RuntimeError('[DUAL] Proposal feature shape mismatch')
+                if coarse_bev_valid.shape != (B_cam, Np):
+                    raise RuntimeError('[DUAL] Proposal validity shape mismatch')
 
-                if (
-                    coarse_bev_feats is None
-                    or coarse_bev_valid is None
-                ):
-                    raise RuntimeError(
-                        '[DUAL] Camera BEV features missing'
-                    )
+                # Input from BEVFusion:
+                # [CameraBEV (first 80ch), CorrNetBEV (last 80ch)].
+                bev_pair = coarse_bev_feats.to(cam_proposal_feat.dtype)
 
-                if coarse_bev_feats.shape[:2] != (
-                    B_cam, Np
-                ):
-                    raise RuntimeError(
-                        '[DUAL] Proposal shape mismatch'
-                    )
-
-                if coarse_bev_valid.shape != (
-                    B_cam, Np
-                ):
-                    raise RuntimeError(
-                        '[DUAL] Valid mask shape mismatch'
-                    )
-
-                # ------------------------------------
-                # 1. Camera BEV semantic adapter
-                # ------------------------------------
-
-                bev_sem = self.coarse_bev_adapter(
-                    coarse_bev_feats.to(
-                        cam_proposal_feat.dtype
-                    )
-                )
-
-                # [B, Np, 128]
-
-                # ------------------------------------
-                # 2. Proposal-wise semantic gate
-                # ------------------------------------
-
-                gate_input = torch.cat(
-                    [
-                        cam_proposal_feat,
-                        bev_sem,
-                    ],
-                    dim=-1,
-                )
-
-                gate = torch.sigmoid(
-                    self.coarse_bev_gate(gate_input)
-                )
-
-                # [B, Np, 1]
-
-                # ------------------------------------
-                # 3. BEV sampling valid mask
-                # ------------------------------------
-
-                valid_bev = coarse_bev_valid.to(
-                    device=gate.device,
-                    dtype=gate.dtype,
-                ).unsqueeze(-1)
-
-                if self.rrrf_mode == 'feature_refine':
-
-                    valid_bev = (
-                        valid_bev
-                        * proposal_valid[:, :, None].to(
-                            gate.dtype
-                        )
-                    )
-
-                # ------------------------------------
-                # 4. Semantic residual
-                # ------------------------------------
-
-                gamma = torch.tanh(
-                    self.coarse_bev_alpha
-                )
-
-                delta_sem = (
-                    self.rrrf_coarse_dual_scale
-                    * gamma
-                    * gate
-                    * bev_sem
-                    * valid_bev
-                )
-
-                # ------------------------------------
-                # 5. Final Coarse camera K/V
-                # ------------------------------------
-
-                cam_feat_coarse = (
-                    cam_proposal_feat + delta_sem
-                )
-
-                if self.training:
-
-                    if not hasattr(self, '_dual_debug_step'):
-                        self._dual_debug_step = 0
-
-                    self._dual_debug_step += 1
-
-                    if self._dual_debug_step % 100 == 0:
-
-                        corr_abs = (
-                            cam_proposal_feat.detach()
-                            .abs().mean().item()
+                if self.rrrf_corrbev_primary:
+                    if bev_pair.shape[-1] != 160:
+                        raise RuntimeError(
+                            f'[CORRBEV PRIMARY] Expected 160ch, got {bev_pair.shape[-1]}'
                         )
 
-                        bev_abs = (
-                            bev_sem.detach()
-                            .abs().mean().item()
-                        )
+                    cam_bev, corr_bev = bev_pair.split(80, dim=-1)
+                    zeros80 = torch.zeros_like(cam_bev)
 
-                        delta_abs = (
-                            delta_sem.detach()
-                            .abs().mean().item()
-                        )
+                    # Reuse the pretrained 160 -> 128 adapter. Each forward
+                    # isolates one BEV source, keeping P1 parameter keys/shapes.
+                    # Subtract adapter(0) so a zero-valued CorrBEV produces
+                    # exactly zero anchor even when the adapter has biases.
+                    zero_reference = self.coarse_bev_adapter(
+                        bev_pair.new_zeros(1, 1, 160)
+                    )
+                    corr_anchor = (
+                        self.coarse_bev_adapter(
+                            torch.cat([zeros80, corr_bev], dim=-1)
+                        ) - zero_reference
+                    )
+                    camera_aux_bev = (
+                        self.coarse_bev_adapter(
+                            torch.cat([cam_bev, zeros80], dim=-1)
+                        ) - zero_reference
+                    )
 
-                        relative_pct = (
-                            100.0 * delta_abs
-                            / (corr_abs + 1e-8)
+                    # The BEV sample must be inside the grid. For feature_refine
+                    # the camera proposal must also be valid. This masks
+                    # unavailable BEV information, but leaves valid Corr2D
+                    # auxiliary evidence usable outside the BEV grid.
+                    bev_valid = coarse_bev_valid.to(
+                        device=cam_proposal_feat.device,
+                        dtype=cam_proposal_feat.dtype,
+                    ).unsqueeze(-1)
+                    if self.rrrf_mode == 'feature_refine':
+                        proposal_mask = proposal_valid.unsqueeze(-1).to(
+                            cam_proposal_feat.dtype
                         )
+                        bev_valid = bev_valid * proposal_mask
+                    else:
+                        proposal_mask = torch.ones_like(bev_valid)
 
+                    # PRIMARY (no gamma/gate on the CorrNet-BEV anchor).
+                    corr_anchor = corr_anchor * bev_valid
+
+                    # AUXILIARY: CorrNet 2D + Camera BEV.
+                    aux_sem = (
+                        cam_proposal_feat + camera_aux_bev * bev_valid
+                    )
+                    gate_input = torch.cat(
+                        [corr_anchor, aux_sem], dim=-1
+                    )
+                    gate = torch.sigmoid(self.coarse_bev_gate(gate_input))
+                    gamma = torch.tanh(self.coarse_bev_alpha)
+                    delta_sem = (
+                        self.rrrf_coarse_dual_scale
+                        * gamma
+                        * gate
+                        * aux_sem
+                        * proposal_mask
+                    )
+
+                    # Final [B, Np, 128] K/V shared by Coarse/Refine/Local.
+                    cam_feat_coarse = corr_anchor + delta_sem
+
+                    if self.coarse_bev_adapter.training:
+                        if not hasattr(self, '_corrbev_primary_debug_step'):
+                            self._corrbev_primary_debug_step = 0
+                        self._corrbev_primary_debug_step += 1
+                        if self._corrbev_primary_debug_step % 100 == 0:
+                            anchor_abs = corr_anchor.detach().abs().mean().item()
+                            aux_abs = aux_sem.detach().abs().mean().item()
+                            delta_abs = delta_sem.detach().abs().mean().item()
+                            relative_pct = 100.0 * delta_abs / (anchor_abs + 1e-8)
+                            print(
+                                '[CORRBEV PRIMARY TRAIN]',
+                                f'alpha={self.coarse_bev_alpha.item():.6f}',
+                                f'gamma={gamma.item():.6f}',
+                                f'gate={gate.detach().mean().item():.4f}',
+                                f'anchor_abs={anchor_abs:.6f}',
+                                f'aux_abs={aux_abs:.6f}',
+                                f'delta_abs={delta_abs:.6f}',
+                                f'aux_to_anchor_pct={relative_pct:.4f}%',
+                                flush=True,
+                            )
+                    if not hasattr(self, '_corrbev_primary_debug_once'):
                         print(
-                            '[DUAL E1 TRAIN]',
-                            f'alpha={self.coarse_bev_alpha.item():.6f}',
-                            f'gamma={gamma.item():.6f}',
-                            f'gate={gate.detach().mean().item():.4f}',
-                            f'corr_abs={corr_abs:.6f}',
-                            f'bev_abs={bev_abs:.6f}',
-                            f'delta_abs={delta_abs:.6f}',
-                            f'relative_pct={relative_pct:.4f}%',
+                            '[CORRBEV PRIMARY K/V]',
+                            'shape=', tuple(cam_feat_coarse.shape),
+                            'valid_bev=', float(bev_valid.detach().mean()),
+                            'gamma=', float(gamma.detach()),
+                            'anchor_abs=', float(corr_anchor.detach().abs().mean()),
+                            'aux_delta_abs=', float(delta_sem.detach().abs().mean()),
                             flush=True,
                         )
+                        self._corrbev_primary_debug_once = True
 
-                # ------------------------------------
-                # 6. Initial debug
-                # ------------------------------------
-
-                if not hasattr(
-                    self,
-                    '_coarse_dual_debug_once'
-                ):
-
-                    print(
-                        '[DUAL E1]',
-                        'corr=', tuple(
-                            cam_proposal_feat.shape
-                        ),
-                        'bev=', tuple(
-                            coarse_bev_feats.shape
-                        ),
-                        'gamma=', float(
-                            gamma.detach()
-                        ),
-                        'sample_valid=', float(
-                            valid_bev.detach().mean()
-                        ),
-                        'delta_abs=', float(
-                            delta_sem.detach().abs().mean()
-                        ),
-                        flush=True,
+                else:
+                    # Backward-compatible CorrNet-2D-primary formulation.
+                    bev_sem = self.coarse_bev_adapter(bev_pair)
+                    gate_input = torch.cat(
+                        [cam_proposal_feat, bev_sem], dim=-1
                     )
+                    gate = torch.sigmoid(self.coarse_bev_gate(gate_input))
+                    valid_bev = coarse_bev_valid.to(
+                        device=gate.device, dtype=gate.dtype
+                    ).unsqueeze(-1)
+                    if self.rrrf_mode == 'feature_refine':
+                        valid_bev = valid_bev * proposal_valid[:, :, None].to(
+                            gate.dtype
+                        )
+                    gamma = torch.tanh(self.coarse_bev_alpha)
+                    delta_sem = (
+                        self.rrrf_coarse_dual_scale
+                        * gamma
+                        * gate
+                        * bev_sem
+                        * valid_bev
+                    )
+                    cam_feat_coarse = cam_proposal_feat + delta_sem
+                    if self.coarse_bev_adapter.training:
+                        if not hasattr(self, '_dual_debug_step'):
+                            self._dual_debug_step = 0
+                        self._dual_debug_step += 1
+                        if self._dual_debug_step % 100 == 0:
+                            corr_abs = cam_proposal_feat.detach().abs().mean().item()
+                            bev_abs = bev_sem.detach().abs().mean().item()
+                            delta_abs = delta_sem.detach().abs().mean().item()
+                            relative_pct = 100.0 * delta_abs / (corr_abs + 1e-8)
+                            print(
+                                '[DUAL E1 TRAIN]',
+                                f'alpha={self.coarse_bev_alpha.item():.6f}',
+                                f'gamma={gamma.item():.6f}',
+                                f'gate={gate.detach().mean().item():.4f}',
+                                f'corr_abs={corr_abs:.6f}',
+                                f'bev_abs={bev_abs:.6f}',
+                                f'delta_abs={delta_abs:.6f}',
+                                f'relative_pct={relative_pct:.4f}%',
+                                flush=True,
+                            )
+                    if not hasattr(self, '_coarse_dual_debug_once'):
+                        print(
+                            '[DUAL E1]',
+                            'corr=', tuple(cam_proposal_feat.shape),
+                            'bev=', tuple(bev_pair.shape),
+                            'gamma=', float(gamma.detach()),
+                            'sample_valid=', float(valid_bev.detach().mean()),
+                            'delta_abs=', float(delta_sem.detach().abs().mean()),
+                            flush=True,
+                        )
+                        self._coarse_dual_debug_once = True
 
-                    self._coarse_dual_debug_once = True
+            # ============================================================
+            # NEW: Share 3-source K/V across RRRF stages
+            # ============================================================
+
+            cam_feat_refined = (
+                cam_feat_coarse
+                if self.rrrf_3source_all_stages
+                else cam_proposal_feat
+            )
+
+            cam_feat_local = (
+                cam_feat_coarse
+                if self.rrrf_3source_all_stages
+                else cam_proposal_feat
+            )
+
+            # Debug: print once
+            if not hasattr(self, '_three_source_kv_once'):
+
+                print(
+                    '[RRRF 3SOURCE K/V]',
+                    'coarse=', tuple(cam_feat_coarse.shape),
+                    'refine=', tuple(cam_feat_refined.shape),
+                    'local=', tuple(cam_feat_local.shape),
+                    'enabled=', self.rrrf_3source_all_stages,
+                    flush=True,
+                )
+
+                self._three_source_kv_once = True
 
             # ============================================================
             # PGFR: Coarse Cross-Attention
@@ -3655,6 +3721,14 @@ class TransFusionHead(nn.Module):
                     coarse_fused_query_feat,
                     lidar_only_query_feat,
                 )
+            
+            # ============================================================
+            # NEW: Coarse Fusion Leave-One-Out Ablation
+            # ============================================================
+
+            if self.rrrf_ablation_skip_coarse_attention:
+
+                coarse_fused_query_feat = lidar_only_query_feat
 
             # --- 시각화용: 중간 퓨전 결과 저장 ---
             # 카메라 퓨전이 있었다면 refined_query_feat, 없었다면 lidar_only_query_feat
@@ -3964,11 +4038,11 @@ class TransFusionHead(nn.Module):
                     ),
 
                     key=(
-                        cam_proposal_feat
+                        cam_feat_refined
                         + cam_proposal_pos_embed_refined
                     ),
 
-                    value=cam_proposal_feat,
+                    value=cam_feat_refined,
 
                     key_padding_mask=rrrf_key_padding_mask,
 
@@ -4090,7 +4164,7 @@ class TransFusionHead(nn.Module):
 
                 query_grid_xy=query_pos,
 
-                camera_feat=cam_proposal_feat,
+                camera_feat=cam_feat_local,
 
                 corrected_cam_xyz_norm=local_proposal_xyz,
 

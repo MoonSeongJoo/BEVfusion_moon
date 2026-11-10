@@ -227,6 +227,7 @@ class BEVFusion(Base3DDetector):
             # Ver2.0
             'rrrf_coarse_only',    # 신규 추가
             'rrrf_ablation',
+            'rrrf_3stage_fixed_head',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -249,6 +250,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_coarse_only',  # 신규 추가
             # Ver2.0
             'rrrf_ablation',
+            'rrrf_3stage_fixed_head',
         }
 
         self.is_rrrf_training_stage = (
@@ -1196,6 +1198,140 @@ class BEVFusion(Base3DDetector):
                 'PredictionHead[0]: TRAIN\n'
                 'LGPC / RRRF V2 / Fusion / Adapter: FROZEN'
             )
+
+            return
+        
+        # ============================================================
+        # NEW: RRRF 3-Stage Training
+        # Freeze Official BEVFusion Decoder + Detection Head
+        # ============================================================
+
+        if stage == 'rrrf_3stage_fixed_head':
+
+            head = self.bbox_head
+
+            # 1. Configuration validation
+            if not (
+                head.rrrf_mode == 'feature_refine'
+                and head.query_source == 'fused'
+                and head.rrrf_use_coarse
+                and head.rrrf_use_refined
+                and head.rrrf_query_select_enabled
+                and head.rrrf_coarse_dual_enabled
+                and not head.rrrf_adapter_enabled
+                and self.use_corr_aligned_bev
+                and self.coarse_dual_bev_channels == 160
+                and head.num_decoder_layers == 1
+            ):
+                raise RuntimeError(
+                    '[RRRF FIXED] Invalid training configuration'
+                )
+
+            # 2. Trainable modules
+            trainable_modules = [
+
+                # CorrNet BEV feature generator
+                self.corr_bev_lifter,
+
+                # 3-source semantic adapter
+                head.coarse_bev_adapter,
+                head.coarse_bev_gate,
+
+                # Coarse Fusion
+                head.fusion_cross_attention,
+                head.fusion_ffn,
+                head.fusion_norm1,
+                head.fusion_norm2,
+
+                # Shared positional embedding
+                head.camera_proposal_pos_embedding,
+                head.bev_query_pos_embedding,
+
+                # Refine Fusion
+                head.refined_attention,
+                head.refined_ffn,
+                head.refined_norm1,
+                head.refined_norm2,
+
+                # Local Proposal Fusion
+                head.rrrf_query_selector,
+            ]
+
+            for module in trainable_modules:
+                trainable(module)
+
+            # 3-source residual strength parameter
+            head.coarse_bev_alpha.requires_grad_(True)
+
+            # 3. Strict trainable parameter verification
+            allowed = (
+                'corr_bev_lifter.',
+                'bbox_head.coarse_bev_adapter.',
+                'bbox_head.coarse_bev_gate.',
+                'bbox_head.coarse_bev_alpha',
+                'bbox_head.fusion_cross_attention.',
+                'bbox_head.fusion_ffn.',
+                'bbox_head.fusion_norm1.',
+                'bbox_head.fusion_norm2.',
+                'bbox_head.camera_proposal_pos_embedding.',
+                'bbox_head.bev_query_pos_embedding.',
+                'bbox_head.refined_attention.',
+                'bbox_head.refined_ffn.',
+                'bbox_head.refined_norm1.',
+                'bbox_head.refined_norm2.',
+                'bbox_head.rrrf_query_selector.',
+            )
+
+            active = [
+                n for n, p in self.named_parameters()
+                if p.requires_grad
+            ]
+
+            unexpected = [
+                n for n in active
+                if not n.startswith(allowed)
+            ]
+
+            missing = [
+                prefix for prefix in allowed
+                if not any(n.startswith(prefix) for n in active)
+            ]
+
+            if unexpected or missing:
+                raise RuntimeError(
+                    f'[RRRF FIXED] unexpected={unexpected[:20]}, '
+                    f'missing={missing}'
+                )
+
+            # 4. Official Decoder and Heads must remain frozen
+            assert all(
+                not p.requires_grad
+                for p in head.decoder.parameters()
+            )
+
+            assert all(
+                not p.requires_grad
+                for p in head.prediction_heads.parameters()
+            )
+
+            assert all(
+                not p.requires_grad
+                for p in head.heatmap_head.parameters()
+            )
+
+            assert all(
+                not p.requires_grad
+                for p in head.shared_conv.parameters()
+            )
+
+            print(
+                '[RRRF FIXED] Trainable tensors:',
+                len(active),
+                flush=True
+            )
+
+            for name in active:
+                print('[RRRF TRAINABLE]', name, flush=True)
 
             return
         
@@ -2288,6 +2424,89 @@ class BEVFusion(Base3DDetector):
                 assert not head.prediction_heads[0].training
 
                 assert self.corr_bev_lifter.training
+
+                return self
+            
+            # ============================================================
+            # NEW: RRRF 3-Stage Train Mode Restoration
+            # ============================================================
+
+            if stage == 'rrrf_3stage_fixed_head':
+
+                head = self.bbox_head
+
+                # NEW: Full RRRF training configuration guard
+                if not head.rrrf_corrbev_primary:
+                    raise RuntimeError(
+                        '[RRRF FIXED] CorrNet BEV must be primary K/V'
+                    )
+
+                if not head.rrrf_3source_all_stages:
+                    raise RuntimeError(
+                        '[RRRF FIXED] 3-source all stages must be ON'
+                    )
+
+                if (
+                    head.rrrf_ablation_skip_coarse_attention
+                    or head.rrrf_ablation_skip_refined_attention
+                    or head.rrrf_ablation_identity_geometry
+                ):
+                    raise RuntimeError(
+                        '[RRRF FIXED] Ablation bypass must be OFF during training'
+                    )
+
+                if head.rrrf_query_select_scale == 0.0:
+                    raise RuntimeError(
+                        '[RRRF FIXED] Local Fusion scale must be nonzero'
+                    )
+
+                if head.rrrf_coarse_dual_scale == 0.0:
+                    raise RuntimeError(
+                        '[RRRF FIXED] 3-source fusion scale must be nonzero'
+                    )
+
+                if self.corr_bev_feature_scale == 0.0:
+                    raise RuntimeError(
+                        '[RRRF FIXED] CorrNet BEV must be active'
+                    )
+
+                # Keep original BEVFusion blocks in eval mode
+                self.feat_projector.eval()
+                head.eval()
+
+                # CorrNet BEV feature generator
+                self.corr_bev_lifter.train()
+
+                # Enable RRRF modules
+                train_modules = (
+
+                    head.coarse_bev_adapter,
+                    head.coarse_bev_gate,
+
+                    head.fusion_cross_attention,
+                    head.fusion_ffn,
+                    head.fusion_norm1,
+                    head.fusion_norm2,
+
+                    head.camera_proposal_pos_embedding,
+                    head.bev_query_pos_embedding,
+
+                    head.refined_attention,
+                    head.refined_ffn,
+                    head.refined_norm1,
+                    head.refined_norm2,
+
+                    head.rrrf_query_selector,
+                )
+
+                for module in train_modules:
+                    module.train()
+
+                # Official BEVFusion remains in eval mode
+                assert not head.decoder[0].training
+                assert not head.prediction_heads[0].training
+                assert not head.shared_conv.training
+                assert not head.heatmap_head.training
 
                 return self
 
@@ -10475,6 +10694,7 @@ class BEVFusion(Base3DDetector):
                 'rrrf_joint_fresh',
                 'rrrf_coarse_only',  # 신규 추가
                 'rrrf_ablation',
+                'rrrf_3stage_fixed_head',
             }:
 
                 required = {
