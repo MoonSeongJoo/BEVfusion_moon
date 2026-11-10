@@ -2203,6 +2203,8 @@ class TransFusionHead(nn.Module):
         # CorrNet BEV is the primary K/V; 2D + Camera BEV is gated auxiliary.
         # False preserves the original Corr2D-primary formulation.
         rrrf_corrbev_primary=False,
+        use_corr_decoder_memory=False,
+        corr_decoder_memory_channels=80,
 
         train_cfg=None,
         test_cfg=None,
@@ -2388,6 +2390,70 @@ class TransFusionHead(nn.Module):
             padding=1,
             bias=bias,
         )
+
+        # ============================================================
+        # NEW: Dual-Path CorrBEV Decoder Memory Fusion
+        # ============================================================
+
+        self.use_corr_decoder_memory = bool(
+            use_corr_decoder_memory
+        )
+
+        self.corr_decoder_memory_channels = int(
+            corr_decoder_memory_channels
+        )
+
+        if self.use_corr_decoder_memory:
+
+            # --------------------------------------------------------
+            # 1. CorrBEV Projection
+            #    80ch -> 128ch
+            # --------------------------------------------------------
+
+            self.corr_memory_proj = nn.Conv2d(
+                in_channels=self.corr_decoder_memory_channels,
+                out_channels=hidden_channel,
+                kernel_size=1,
+                bias=False,
+            )
+
+            # --------------------------------------------------------
+            # 2. Memory Gate
+            #    [Original BEV, CorrBEV Projection]
+            #    256ch -> 128ch
+            # --------------------------------------------------------
+
+            self.corr_memory_gate = nn.Conv2d(
+                in_channels=hidden_channel * 2,
+                out_channels=hidden_channel,
+                kernel_size=1,
+                bias=True,
+            )
+
+            # --------------------------------------------------------
+            # 3. Independent Decoder Memory Beta
+            # --------------------------------------------------------
+
+            self.corr_memory_beta = nn.Parameter(
+                torch.zeros(())
+            )
+
+            # --------------------------------------------------------
+            # 4. Initialization
+            # --------------------------------------------------------
+
+            nn.init.xavier_uniform_(
+                self.corr_memory_proj.weight
+            )
+
+            nn.init.zeros_(
+                self.corr_memory_gate.weight
+            )
+
+            nn.init.constant_(
+                self.corr_memory_gate.bias,
+                -2.0
+            )
 
         layers = []
         layers.append(
@@ -3071,6 +3137,111 @@ class TransFusionHead(nn.Module):
 
         return pred_delta_6dof
 
+    def build_decoder_memory(
+        self,
+        bev_feat,
+        corr_bev_full,
+    ):
+        """
+        Dual-Path CorrBEV Decoder Memory Fusion
+
+        bev_feat:
+            [B, 128, H, W]
+            Original BEVFusion shared_conv output
+
+        corr_bev_full:
+            [B, 80, H, W]
+            LGPC-corrected CorrNet BEV
+
+        Return:
+            [B, 128, H, W]
+        """
+
+        # ========================================================
+        # 0. Disable Mode
+        # ========================================================
+
+        if not self.use_corr_decoder_memory:
+            return bev_feat
+
+        if corr_bev_full is None:
+            raise RuntimeError(
+                '[MEMORY] corr_bev_full is required'
+            )
+
+        # ========================================================
+        # 1. Shape Check
+        # ========================================================
+
+        if corr_bev_full.ndim != 4 or (
+            corr_bev_full.shape[0] != bev_feat.shape[0]
+            or corr_bev_full.shape[1]
+            != self.corr_decoder_memory_channels
+            or corr_bev_full.shape[2:] != bev_feat.shape[2:]
+        ):
+
+            raise RuntimeError(
+                '[MEMORY] BEV grid/channel mismatch: '
+                f'base={tuple(bev_feat.shape)}, '
+                f'corr={tuple(corr_bev_full.shape)}'
+            )
+
+        # ========================================================
+        # 2. Device / Dtype Alignment
+        # ========================================================
+
+        corr_bev_full = corr_bev_full.to(
+            device=bev_feat.device,
+            dtype=bev_feat.dtype,
+        )
+
+        # ========================================================
+        # 3. CorrBEV Projection
+        # ========================================================
+
+        corr_proj = self.corr_memory_proj(
+            corr_bev_full
+        )
+
+        # [B, 128, H, W]
+
+        # ========================================================
+        # 4. Memory Gate
+        # ========================================================
+
+        gate_input = torch.cat(
+            [bev_feat, corr_proj],
+            dim=1,
+        )
+
+        # [B, 256, H, W]
+
+        gate = torch.sigmoid(
+            self.corr_memory_gate(gate_input)
+        )
+
+        # [B, 128, H, W]
+
+        # ========================================================
+        # 5. Learnable Beta
+        # ========================================================
+
+        beta = torch.tanh(
+            self.corr_memory_beta
+        )
+
+        # ========================================================
+        # 6. Decoder Memory Fusion
+        # ========================================================
+
+        decoder_memory = (
+            bev_feat
+            + beta * gate * corr_proj
+        )
+
+        return decoder_memory
+
+
     def forward_single(
         self,
         inputs,
@@ -3086,6 +3257,7 @@ class TransFusionHead(nn.Module):
         camera_proposal_valid_mask=None,
         coarse_bev_feats=None,
         coarse_bev_valid=None,
+        corr_bev_full=None,
     ):
         """Forward function for CenterPoint.
         Args:
@@ -4236,27 +4408,65 @@ class TransFusionHead(nn.Module):
                 + self.rrrf_adapter_scale * delta_feat
             )
 
-        # --- 3. Transformer Decoder 정제 ---
+        # ============================================================
+        # NEW: Full CorrBEV Decoder Memory Fusion
+        # ============================================================
+
+        decoder_memory = self.build_decoder_memory(
+            bev_feat=fusion_feat,
+            corr_bev_full=corr_bev_full,
+        )
+
+        decoder_memory_flatten = decoder_memory.flatten(2)
+
+        # ============================================================
+        # 3. Transformer Decoder
+        # ============================================================
+
+        # 기존 RRRF Query 그대로 유지
         decoder_input_feat = refined_query_feat
-        
+
         ret_dicts = []
-        current_query_pos = query_pos # 초기 위치로 시작
+        current_query_pos = query_pos
+
         for i in range(self.num_decoder_layers):
+
             decoder_output_feat = self.decoder[i](
+
+                # Q: Original RRRF Refined Query
                 decoder_input_feat,
-                key=fusion_feat_flatten,
+
+                # NEW: Corrected Decoder K/V
+                key=decoder_memory_flatten,
+
+                # Unchanged Positional Embeddings
                 query_pos=current_query_pos,
                 key_pos=bev_pos
             )
-            
-            res_layer = self.prediction_heads[i](decoder_output_feat)
-            predicted_center = res_layer['center'] + current_query_pos.permute(0, 2, 1)
+
+            # --------------------------------------------------------
+            # 기존 Prediction Head 이하 코드는 그대로 유지
+            # --------------------------------------------------------
+
+            res_layer = self.prediction_heads[i](
+                decoder_output_feat
+            )
+
+            predicted_center = (
+                res_layer['center']
+                + current_query_pos.permute(0, 2, 1)
+            )
+
             res_layer['center'] = predicted_center
             ret_dicts.append(res_layer)
 
-            # 다음 레이어를 위해 특징과 위치 업데이트
-            decoder_input_feat = decoder_output_feat 
-            current_query_pos = predicted_center.detach().clone().permute(0, 2, 1)
+            decoder_input_feat = decoder_output_feat
+
+            current_query_pos = (
+                predicted_center.detach()
+                .clone()
+                .permute(0, 2, 1)
+            )
 
         # --- 시각화용: 최종 디코더 출력 특징 저장 ---
         final_query_feat_for_vis = decoder_output_feat
@@ -4319,7 +4529,7 @@ class TransFusionHead(nn.Module):
         return [new_res]
     
     def forward(self, feats, det_xyz=None, det_feats=None, metas=None,batch_gt_instances_3d=None,lidar_query_feats=None,
-                stage1_pred_delta_rot=None,stage1_pred_delta_trans=None,stage1_active_cam_mask=None,camera_proposal_valid_mask=None,coarse_bev_feats=None,coarse_bev_valid=None,):
+                stage1_pred_delta_rot=None,stage1_pred_delta_trans=None,stage1_active_cam_mask=None,camera_proposal_valid_mask=None,coarse_bev_feats=None,coarse_bev_valid=None,corr_bev_full=None,):
         if isinstance(feats, torch.Tensor):
             feats = [feats]
 
@@ -4368,17 +4578,12 @@ class TransFusionHead(nn.Module):
             # NEW
             [coarse_bev_feats],
             [coarse_bev_valid],
+            [corr_bev_full],
         )
         
         assert len(res) == 1, 'only support one level features.'
         # return res
         return res
-
-    # def predict(self, batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=None,):
-    #     # self()는 forward를 호출. 이제 모든 인자를 올바르게 전달합니다.
-    #     preds_dicts = self(batch_feats, det_xyz, det_feats, batch_input_metas,lidar_query_feats=lidar_query_feats)
-    #     res = self.predict_by_feat(preds_dicts, batch_input_metas)
-    #     return res
     
     def predict(
         self,
@@ -4394,6 +4599,7 @@ class TransFusionHead(nn.Module):
         camera_proposal_valid_mask=None,
         coarse_bev_feats=None,
         coarse_bev_valid=None,
+        corr_bev_full=None,
     ):
 
         preds_dicts = self(
@@ -4419,6 +4625,7 @@ class TransFusionHead(nn.Module):
             
             coarse_bev_feats=coarse_bev_feats,
             coarse_bev_valid=coarse_bev_valid,
+            corr_bev_full=corr_bev_full,
         )
 
 
@@ -5434,6 +5641,7 @@ class TransFusionHead(nn.Module):
         camera_proposal_valid_mask=None,
         coarse_bev_feats=None,
         coarse_bev_valid=None,
+        corr_bev_full=None,
     ):
         """Loss function for CenterHead.
 
@@ -5471,6 +5679,7 @@ class TransFusionHead(nn.Module):
                 camera_proposal_valid_mask,
             coarse_bev_feats=coarse_bev_feats,
             coarse_bev_valid=coarse_bev_valid,
+            corr_bev_full=corr_bev_full,
         )
         
         loss = self.loss_by_feat(

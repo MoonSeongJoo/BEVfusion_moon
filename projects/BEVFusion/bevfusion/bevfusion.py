@@ -228,6 +228,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_coarse_only',    # 신규 추가
             'rrrf_ablation',
             'rrrf_3stage_fixed_head',
+            'rrrf_dualpath_joint',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -251,6 +252,7 @@ class BEVFusion(Base3DDetector):
             # Ver2.0
             'rrrf_ablation',
             'rrrf_3stage_fixed_head',
+            'rrrf_dualpath_joint',
         }
 
         self.is_rrrf_training_stage = (
@@ -1198,6 +1200,206 @@ class BEVFusion(Base3DDetector):
                 'PredictionHead[0]: TRAIN\n'
                 'LGPC / RRRF V2 / Fusion / Adapter: FROZEN'
             )
+
+            return
+        
+
+        # ============================================================
+        # NEW: RRRF + Transformer Decoder Joint Training
+        # ============================================================
+
+        if stage == 'rrrf_dualpath_joint':
+
+            head = self.bbox_head
+
+            # --------------------------------------------------------
+            # 1. Architecture Validation
+            # --------------------------------------------------------
+
+            valid = (
+                head.rrrf_mode == 'feature_refine'
+                and head.query_source == 'fused'
+                and head.rrrf_use_coarse
+                and head.rrrf_use_refined
+                and head.rrrf_query_select_enabled
+                and head.rrrf_coarse_dual_enabled
+                and head.rrrf_3source_all_stages
+                and head.rrrf_corrbev_primary
+                and not head.rrrf_adapter_enabled
+                and not head.rrrf_ablation_skip_coarse_attention
+                and not head.rrrf_ablation_skip_refined_attention
+                and not head.rrrf_ablation_identity_geometry
+                and self.use_corr_aligned_bev
+                and self.coarse_dual_bev_channels == 160
+                and head.num_decoder_layers == 1
+                and head.use_corr_decoder_memory
+            )
+
+            if not valid:
+                raise RuntimeError(
+                    '[DUALPATH JOINT] Invalid configuration'
+                )
+            
+            # --------------------------------------------------------
+            # 2. Trainable Modules
+            # --------------------------------------------------------
+
+            train_modules = (
+
+                # CorrNet BEV Feature Generator
+                self.corr_bev_lifter,
+
+                # Coarse Semantic Fusion
+                head.coarse_bev_adapter,
+                head.coarse_bev_gate,
+
+                # Coarse Cross Attention
+                head.fusion_cross_attention,
+                head.fusion_ffn,
+                head.fusion_norm1,
+                head.fusion_norm2,
+
+                # Position Embeddings
+                head.camera_proposal_pos_embedding,
+                head.bev_query_pos_embedding,
+
+                # Refined Cross Attention
+                head.refined_attention,
+                head.refined_ffn,
+                head.refined_norm1,
+                head.refined_norm2,
+
+                # Local Proposal Fusion
+                head.rrrf_query_selector,
+
+                # NEW: Decoder Memory
+                head.corr_memory_proj,
+                head.corr_memory_gate,
+
+                # NEW: Transformer Decoder
+                head.decoder[0],
+            )
+
+            for module in train_modules:
+                trainable(module)
+
+            # Scalar Learning Parameters
+            head.coarse_bev_alpha.requires_grad_(True)
+            head.corr_memory_beta.requires_grad_(True)
+
+            # --------------------------------------------------------
+            # 3. Strict Freeze Verification
+            # --------------------------------------------------------
+
+            allowed = (
+                'corr_bev_lifter.',
+
+                'bbox_head.coarse_bev_adapter.',
+                'bbox_head.coarse_bev_gate.',
+                'bbox_head.coarse_bev_alpha',
+
+                'bbox_head.fusion_cross_attention.',
+                'bbox_head.fusion_ffn.',
+                'bbox_head.fusion_norm1.',
+                'bbox_head.fusion_norm2.',
+
+                'bbox_head.camera_proposal_pos_embedding.',
+                'bbox_head.bev_query_pos_embedding.',
+
+                'bbox_head.refined_attention.',
+                'bbox_head.refined_ffn.',
+                'bbox_head.refined_norm1.',
+                'bbox_head.refined_norm2.',
+
+                'bbox_head.rrrf_query_selector.',
+
+                'bbox_head.corr_memory_proj.',
+                'bbox_head.corr_memory_gate.',
+                'bbox_head.corr_memory_beta',
+
+                'bbox_head.decoder.0.',
+            )
+
+            active = [
+                name
+                for name, p in self.named_parameters()
+                if p.requires_grad
+            ]
+
+            unexpected = [
+                name
+                for name in active
+                if not name.startswith(allowed)
+            ]
+
+            missing = [
+                prefix
+                for prefix in allowed
+                if not any(
+                    name.startswith(prefix)
+                    for name in active
+                )
+            ]
+
+            if unexpected or missing:
+                raise RuntimeError(
+                    f'[DUALPATH JOINT] '
+                    f'unexpected={unexpected[:20]}, '
+                    f'missing={missing}'
+                )
+            
+            # --------------------------------------------------------
+            # 4. Verify Frozen Modules
+            # --------------------------------------------------------
+
+            frozen_modules = (
+
+                head.prediction_heads,
+                head.heatmap_head,
+                head.shared_conv,
+
+                self.feat_projector,
+
+                self.corr,
+                self.z_estimator,
+                self.calib_head,
+            )
+
+            for module in frozen_modules:
+
+                assert all(
+                    not p.requires_grad
+                    for p in module.parameters()
+                )
+
+            # --------------------------------------------------------
+            # 5. Print Trainable Parameters
+            # --------------------------------------------------------
+
+            nparams = sum(
+                p.numel()
+                for p in self.parameters()
+                if p.requires_grad
+            )
+
+            print(
+                '[DUALPATH JOINT] Trainable Parameters:',
+                nparams,
+                flush=True,
+            )
+
+            print(
+                '[DUALPATH JOINT] Trainable Tensors:',
+                len(active),
+                flush=True,
+            )
+
+            for name in active:
+                print(
+                    '[JOINT TRAINABLE]',
+                    name,
+                    flush=True,
+                )
 
             return
         
@@ -2424,6 +2626,71 @@ class BEVFusion(Base3DDetector):
                 assert not head.prediction_heads[0].training
 
                 assert self.corr_bev_lifter.training
+
+                return self
+            
+            # ============================================================
+            # NEW: Dual-Path RRRF + Decoder Train Mode
+            # ============================================================
+
+            if stage == 'rrrf_dualpath_joint':
+
+                head = self.bbox_head
+
+                # Existing pretrained components: Eval
+                self.feat_projector.eval()
+
+                # Freeze parent Head by default
+                head.eval()
+
+                # --------------------------------------------------------
+                # Trainable Modules
+                # --------------------------------------------------------
+
+                train_modules = (
+
+                    self.corr_bev_lifter,
+
+                    head.coarse_bev_adapter,
+                    head.coarse_bev_gate,
+
+                    head.fusion_cross_attention,
+                    head.fusion_ffn,
+                    head.fusion_norm1,
+                    head.fusion_norm2,
+
+                    head.camera_proposal_pos_embedding,
+                    head.bev_query_pos_embedding,
+
+                    head.refined_attention,
+                    head.refined_ffn,
+                    head.refined_norm1,
+                    head.refined_norm2,
+
+                    head.rrrf_query_selector,
+
+                    # NEW: Decoder Memory
+                    head.corr_memory_proj,
+                    head.corr_memory_gate,
+
+                    # NEW: Transformer Decoder
+                    head.decoder[0],
+                )
+
+                for module in train_modules:
+                    module.train()
+
+                # --------------------------------------------------------
+                # Verification
+                # --------------------------------------------------------
+
+                assert head.decoder[0].training
+
+                assert not head.prediction_heads[0].training
+
+                assert not head.heatmap_head.training
+
+                assert not head.shared_conv.training
 
                 return self
             
@@ -10038,7 +10305,8 @@ class BEVFusion(Base3DDetector):
             # ---------------------------------------------
             # 3. Create CorrNet BEV
             # ---------------------------------------------
-
+            corr_bev = None
+            
             if coarse_dual:
 
                 feats, camera_bev_for_rrrf = feat_result
@@ -10608,6 +10876,7 @@ class BEVFusion(Base3DDetector):
                                 camera_proposal_valid_mask= camera_proposal_valid_mask,
                                 coarse_bev_feats=coarse_bev_feats,
                                 coarse_bev_valid=coarse_bev_valid,
+                                corr_bev_full=corr_bev,
                             )
             
             # --- ✨ 2. 손실과 예측값 분리 ---
@@ -10695,6 +10964,7 @@ class BEVFusion(Base3DDetector):
                 'rrrf_coarse_only',  # 신규 추가
                 'rrrf_ablation',
                 'rrrf_3stage_fixed_head',
+                'rrrf_dualpath_joint',
             }:
 
                 required = {
@@ -12139,6 +12409,8 @@ class BEVFusion(Base3DDetector):
             lidar_query_feats = None
 
         # 3. Build CorrNet Aligned BEV
+        corr_bev = None
+        
         if coarse_dual:
 
             if use_corr:
@@ -12238,9 +12510,6 @@ class BEVFusion(Base3DDetector):
 
         # torch.cuda.synchronize() # 이전 연산 완료 보장
         # s2_start.record()
-        
-        # results_list_3d = self.bbox_head.predict(
-        #     feats, det_xyz_proc, det_feat_proc, batch_input_metas)
 
         stage1_active_cam_mask = torch.zeros(
             (
@@ -12336,6 +12605,7 @@ class BEVFusion(Base3DDetector):
                 camera_proposal_valid_mask,
             coarse_bev_feats=coarse_bev_feats,
             coarse_bev_valid=coarse_bev_valid,
+            corr_bev_full=corr_bev,
         )
         
         results = self.add_pred_to_datasample(batch_data_samples,
