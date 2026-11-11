@@ -229,6 +229,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_ablation',
             'rrrf_3stage_fixed_head',
             'rrrf_dualpath_joint',
+            'rrrf_dualpath_det_head',
         }
 
         if self.lgpc_train_stage not in valid_lgpc_train_stages:
@@ -253,6 +254,7 @@ class BEVFusion(Base3DDetector):
             'rrrf_ablation',
             'rrrf_3stage_fixed_head',
             'rrrf_dualpath_joint',
+            'rrrf_dualpath_det_head',
         }
 
         self.is_rrrf_training_stage = (
@@ -1208,9 +1210,16 @@ class BEVFusion(Base3DDetector):
         # NEW: RRRF + Transformer Decoder Joint Training
         # ============================================================
 
-        if stage == 'rrrf_dualpath_joint':
+        if stage in (
+            'rrrf_dualpath_joint',
+            'rrrf_dualpath_det_head',
+        ):
 
             head = self.bbox_head
+
+            train_det_head = (
+                stage == 'rrrf_dualpath_det_head'
+            )
 
             # --------------------------------------------------------
             # 1. Architecture Validation
@@ -1287,6 +1296,22 @@ class BEVFusion(Base3DDetector):
             head.coarse_bev_alpha.requires_grad_(True)
             head.corr_memory_beta.requires_grad_(True)
 
+            # NEW: Final 3D Prediction Head
+            if train_det_head:
+
+                trainable(
+                    head.prediction_heads[0]
+                )
+
+                # Keep BatchNorm running statistics frozen
+                for module in head.prediction_heads[0].modules():
+
+                    if isinstance(
+                        module,
+                        nn.modules.batchnorm._BatchNorm
+                    ):
+                        module.eval()
+
             # --------------------------------------------------------
             # 3. Strict Freeze Verification
             # --------------------------------------------------------
@@ -1320,6 +1345,11 @@ class BEVFusion(Base3DDetector):
                 'bbox_head.decoder.0.',
             )
 
+            if train_det_head:
+                allowed += (
+                    'bbox_head.prediction_heads.0.',
+                )
+
             active = [
                 name
                 for name, p in self.named_parameters()
@@ -1348,18 +1378,21 @@ class BEVFusion(Base3DDetector):
                     f'missing={missing}'
                 )
             
+
             # --------------------------------------------------------
             # 4. Verify Frozen Modules
             # --------------------------------------------------------
 
             frozen_modules = (
 
-                head.prediction_heads,
+                # Official Detection Proposal Generator
                 head.heatmap_head,
                 head.shared_conv,
 
+                # Fixed Camera Feature Projector
                 self.feat_projector,
 
+                # Stage-1 LGPC
                 self.corr,
                 self.z_estimator,
                 self.calib_head,
@@ -1370,6 +1403,27 @@ class BEVFusion(Base3DDetector):
                 assert all(
                     not p.requires_grad
                     for p in module.parameters()
+                )
+
+            # --------------------------------------------------------
+            # NEW: Final Prediction Head Verification
+            # --------------------------------------------------------
+
+            if train_det_head:
+
+                # Prediction Head must be trainable
+                assert all(
+                    p.requires_grad
+                    for p in head.prediction_heads[0].parameters()
+                )
+
+            else:
+
+                # Original DualPath Joint Stage
+                # Prediction Head must remain frozen
+                assert all(
+                    not p.requires_grad
+                    for p in head.prediction_heads.parameters()
                 )
 
             # --------------------------------------------------------
@@ -2633,9 +2687,17 @@ class BEVFusion(Base3DDetector):
             # NEW: Dual-Path RRRF + Decoder Train Mode
             # ============================================================
 
-            if stage == 'rrrf_dualpath_joint':
+            if stage in (
+                'rrrf_dualpath_joint',
+                'rrrf_dualpath_det_head',
+            ):
 
                 head = self.bbox_head
+
+                # NEW
+                train_det_head = (
+                    stage == 'rrrf_dualpath_det_head'
+                )
 
                 # Existing pretrained components: Eval
                 self.feat_projector.eval()
@@ -2680,16 +2742,49 @@ class BEVFusion(Base3DDetector):
                 for module in train_modules:
                     module.train()
 
+
+                # ============================================================
+                # NEW: Final 3D Prediction Head Train Mode
+                # ============================================================
+
+                if train_det_head:
+
+                    # Enable Prediction Head training
+                    head.prediction_heads[0].train()
+
+                    # Keep BatchNorm running statistics frozen
+                    for module in head.prediction_heads[0].modules():
+
+                        if isinstance(
+                            module,
+                            nn.modules.batchnorm._BatchNorm
+                        ):
+                            module.eval()
+
                 # --------------------------------------------------------
                 # Verification
                 # --------------------------------------------------------
 
                 assert head.decoder[0].training
 
-                assert not head.prediction_heads[0].training
+                # NEW: Prediction Head stage-dependent verification
+                assert (
+                    head.prediction_heads[0].training
+                    == train_det_head
+                )
 
+                # BatchNorm running statistics must be frozen
+                assert all(
+                    not module.training
+                    for module in head.prediction_heads[0].modules()
+                    if isinstance(
+                        module,
+                        nn.modules.batchnorm._BatchNorm
+                    )
+                )
+
+                # Original proposal generator remains frozen
                 assert not head.heatmap_head.training
-
                 assert not head.shared_conv.training
 
                 return self
@@ -10965,6 +11060,7 @@ class BEVFusion(Base3DDetector):
                 'rrrf_ablation',
                 'rrrf_3stage_fixed_head',
                 'rrrf_dualpath_joint',
+                'rrrf_dualpath_det_head',
             }:
 
                 required = {
