@@ -55,13 +55,22 @@ model = dict(
 train_cfg = dict(
     _delete_=True,
     type='IterBasedTrainLoop',
-    max_iters=81000,
-    val_interval=999999,
+    max_iters=20000,
+    val_interval=2000,
 )
 
-val_cfg = None
-val_dataloader = None
-val_evaluator = None
+val_cfg = dict(
+    _delete_=True,
+    type='ValLoop'
+)
+
+val_dataloader = dict(
+    _delete_=True,
+    **_base_.test_dataloader
+)
+
+val_evaluator = _base_.test_evaluator
+
 
 # ------------------------------------------------------------
 # Optimizer
@@ -140,7 +149,7 @@ randomness = dict(
 
 train_dataloader = dict(
     batch_size=1,
-    num_workers=8,
+    num_workers=12,
     persistent_workers=False,
 )
 
@@ -154,8 +163,7 @@ model_wrapper_cfg = dict(
 # ------------------------------------------------------------
 
 load_from = (
-    'data/weights/ablation_v2/'
-    'PGFR_Ablation_P0.pth'
+    '/workspace/mmdetection3d/data/weights/ablation_v2/PGFR_Ablation_P1.pth'
 )
 
 resume = False
@@ -165,6 +173,12 @@ work_dir = 'work_dirs/ablation_v2_B'
 # ------------------------------------------------------------
 # Logging / Checkpoint
 # ------------------------------------------------------------
+
+randomness = dict(
+    seed=2026,
+    deterministic=False,
+    diff_rank_seed=False,
+)
 
 default_hooks = dict(
 
@@ -176,9 +190,38 @@ default_hooks = dict(
     checkpoint=dict(
         _delete_=True,
         type='CheckpointHook',
+
         by_epoch=False,
+
+        # 매 2000 Iteration 저장
         interval=2000,
+
+        max_keep_ckpts=5,
         save_last=True,
-        max_keep_ckpts=12,
+
+        # NEW: NDS 최고 성능 체크포인트 저장
+        save_best='NDS',
+
+        # NDS가 클수록 좋은 성능
+        rule='greater',
     ),
 )
+
+# ============================================================
+# NEW: NDS Target Early Stopping
+# ============================================================
+
+custom_hooks = [
+    dict(
+        type='StopOnNDSThresholdHook',
+
+        # nuScenes Detection Score
+        metric_key='NDS',
+
+        # Target: 70.69%
+        threshold=0.7069,
+
+        # Execute AFTER CheckpointHook
+        priority='LOWEST',
+    ),
+]
